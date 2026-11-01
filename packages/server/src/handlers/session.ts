@@ -1,5 +1,6 @@
 import { Instance } from "@opencode/core/instance/service"
 import { Session } from "@opencode/core/session"
+import { AquanoxTrace } from "@opencode/core/session/aquanox-trace"
 import { SessionStats } from "@opencode/core/session/stats"
 import { SessionTitle } from "@opencode/core/session/title"
 import { SessionTransfer } from "@opencode/core/session/transfer"
@@ -108,7 +109,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 title: ctx.payload.title,
                 agent: ctx.payload.agent,
                 model: ctx.payload.model,
-                metadata: ctx.payload.metadata,
+                metadata: AquanoxTrace.mergeHeaderMetadata(ctx.request.headers, ctx.payload.metadata),
                 permissions: ctx.payload.permissions,
                 ...(ctx.payload.parentID === undefined
                   ? { location: ctx.payload.location ?? { directory: AbsolutePath.make(process.cwd()) } }
@@ -249,7 +250,11 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           }
           if (ctx.payload.metadata !== undefined)
             yield* session
-              .setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
+              .setMetadata({
+                sessionID: ctx.params.sessionID,
+                metadata:
+                  AquanoxTrace.mergeHeaderMetadata(ctx.request.headers, ctx.payload.metadata) ?? ctx.payload.metadata,
+              })
               .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           if (ctx.payload.permissions !== undefined)
             yield* session
@@ -298,7 +303,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 files: ctx.payload.files,
                 agents: ctx.payload.agents,
                 skills: ctx.payload.skills,
-                metadata: ctx.payload.metadata,
+                metadata: AquanoxTrace.mergeHeaderMetadata(ctx.request.headers, ctx.payload.metadata),
                 delivery: ctx.payload.delivery,
                 resume: ctx.payload.resume,
               })

@@ -2,7 +2,7 @@ export * as SessionContext from "./context.js"
 
 import { Model } from "../model.js"
 import { Permission } from "../permission.js"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { Agent } from "../agent.js"
 import { CodeModeInstructions } from "../codemode/instructions.js"
 import { Database } from "../database/database.js"
@@ -29,6 +29,7 @@ export interface Selection {
   readonly session: SessionSchema.Info
   readonly agent: Agent.Selection & { readonly info: Agent.Info }
   readonly instructions: Instructions.List
+  readonly volatileInstructions?: Instructions.List
   readonly tools: Tool.Snapshot
 }
 
@@ -69,6 +70,32 @@ export interface Interface {
 
 /** Location-scoped model-context loader for durable Session Steps. */
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionContext") {}
+
+interface EpochReminderState {
+  readonly reminderText: string
+  readonly initialIsoDate: string
+}
+
+const epochReminderCache = new Map<string, EpochReminderState>()
+const frozenInitialCache = new Map<string, string>()
+
+export function resetEpochCache(): void {
+  epochReminderCache.clear()
+  frozenInitialCache.clear()
+}
+
+function formatDateIso(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0")
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function parseIsoFromDateValue(val: unknown): string {
+  if (typeof val === "string") {
+    const d = new Date(val)
+    if (!isNaN(d.getTime())) return formatDateIso(d)
+  }
+  return formatDateIso(new Date())
+}
 
 const layer = Layer.effect(
   Service,
@@ -146,21 +173,27 @@ const layer = Layer.effect(
         },
         { concurrency: "unbounded" },
       )
+      const isVolatile = (source: Instructions.Source) =>
+        source.key === "core/date" || source.key === "core/environment"
+      const staticBuiltins = loaded.builtins.filter((s) => !isVolatile(s))
+      const volatileBuiltins = loaded.builtins.filter(isVolatile)
+
       return {
         session,
         agent: { ...agent, info: agent.info },
         // Ordered from most to least shared across sessions so the baseline stays a reusable
-        // prompt-cache prefix: user-level catalog and guidance, then project instructions, then
-        // the date and environment, which vary by day and directory.
+        // prompt-cache prefix: user-level catalog and guidance, then project instructions,
+        // while volatile date and environment are relocated to the first user message.
         instructions: Instructions.combine([
           CodeModeInstructions.make(loaded.tools.codeModeCatalog),
           loaded.mcp,
           loaded.references,
           loaded.skills,
           loaded.discovery,
-          loaded.builtins,
+          staticBuiltins,
           loaded.entries,
         ]),
+        volatileInstructions: volatileBuiltins,
         tools: loaded.tools,
       }
     })
@@ -173,12 +206,102 @@ const layer = Layer.effect(
         selection.instructions,
         model.ref,
       )
+
+      // Find first user or synthetic message to anchor the epoch
+      const firstUserIndex = history.entries.findIndex(
+        (e) => e.message.type === "user" || e.message.type === "synthetic",
+      )
+      const firstUserEntry = firstUserIndex >= 0 ? history.entries[firstUserIndex] : undefined
+      const epochKey = `${selection.session.id}:${firstUserEntry?.message.id ?? "epoch0"}`
+
+      // Prefix invariance: freeze the rendered initial instructions (<｜System｜>) per session epoch
+      // so dynamic per-step loaded instructions never mutate <｜System｜> mid-session.
+      let initial = frozenInitialCache.get(epochKey)
+      if (initial === undefined) {
+        initial = history.initial
+        frozenInitialCache.set(epochKey, initial)
+        if (frozenInitialCache.size > 256) {
+          const oldest = frozenInitialCache.keys().next().value
+          if (oldest !== undefined) frozenInitialCache.delete(oldest)
+        }
+      }
+
+      let currentObservedDate: unknown = undefined
+      let cachedReminder = epochReminderCache.get(epochKey)
+      if (selection.volatileInstructions && selection.volatileInstructions.length > 0) {
+        const observed = yield* Instructions.read(selection.volatileInstructions)
+        const values: Record<string, Schema.Json> = {}
+        for (const entry of observed) {
+          if (entry.value !== Instructions.unavailable && entry.value !== Instructions.removed) {
+            values[entry.key] = entry.value
+            if (entry.key === "core/date") currentObservedDate = entry.value
+          }
+        }
+        if (!cachedReminder) {
+          const reminderText = Instructions.renderInitial(selection.volatileInstructions, values)
+          const initialIsoDate = parseIsoFromDateValue(values["core/date"])
+          cachedReminder = { reminderText, initialIsoDate }
+          epochReminderCache.set(epochKey, cachedReminder)
+          if (epochReminderCache.size > 256) {
+            const oldest = epochReminderCache.keys().next().value
+            if (oldest !== undefined) epochReminderCache.delete(oldest)
+          }
+        }
+      }
+
+      const reminderText = cachedReminder?.reminderText ?? ""
+      const initialIsoDate = cachedReminder?.initialIsoDate ?? ""
+      const liveIsoDate = parseIsoFromDateValue(currentObservedDate)
+
+      // Identify the tail user message (for date rollover reminder on new user turns)
+      let lastUserIndex = -1
+      for (let i = history.entries.length - 1; i >= 0; i--) {
+        const t = history.entries[i]?.message.type
+        if (t === "user" || t === "synthetic") {
+          lastUserIndex = i
+          break
+        }
+      }
+
+      let injected = false
+      const messages = history.entries.map((entry, index) => {
+        const msg = entry.message
+        if (!injected && (msg.type === "user" || msg.type === "synthetic") && reminderText.length > 0) {
+          injected = true
+          const reminderBlock = `<system-reminder>\n${reminderText}\n</system-reminder>`
+          return {
+            ...msg,
+            text: msg.text ? `${reminderBlock}\n\n${msg.text}` : reminderBlock,
+          }
+        }
+
+        // Emit date rollover reminder ONLY on the tail user message on a new turn when live date differs
+        if (
+          index === lastUserIndex &&
+          lastUserIndex > firstUserIndex &&
+          initialIsoDate.length > 0 &&
+          liveIsoDate !== initialIsoDate &&
+          (msg.type === "user" || msg.type === "synthetic")
+        ) {
+          const rolloverTag = `[Date rollover: ${liveIsoDate}]`
+          const alreadyTagged = msg.text?.includes("[Date rollover:")
+          if (!alreadyTagged) {
+            return {
+              ...msg,
+              text: msg.text ? `${rolloverTag}\n\n${msg.text}` : rolloverTag,
+            }
+          }
+        }
+
+        return msg
+      })
+
       return {
         session: selection.session,
         agent: selection.agent,
         model,
-        initial: history.initial,
-        messages: history.entries.map((entry) => entry.message),
+        initial,
+        messages,
         tools: selection.tools,
       }
     })

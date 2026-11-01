@@ -182,7 +182,7 @@ describe("ReadTool", () => {
         encoding: "utf8",
         mime: "text/plain",
       })
-      expect(execution.content).toEqual([{ type: "text", text: "Read file README.md, lines 1-1\n1: hello" }])
+      expect(execution.content).toEqual([{ type: "text", text: "Read file README.md, lines 1-1\nhello" }])
       expect(assertions).toMatchObject([{ sessionID, action: "read", resources: ["README.md"], save: ["*"] }])
       expect(readCalls).toEqual([
         {
@@ -767,7 +767,7 @@ describe("ReadTool", () => {
 
       expect(result).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: `Read file ${recovered}, lines 1-1\n1: hello` }],
+        content: [{ type: "text", text: `Read file ${recovered}, lines 1-1\nhello` }],
       })
       expect(assertions).toMatchObject([
         { action: "read", resources: [requested] },
@@ -1002,12 +1002,205 @@ describe("ReadTool", () => {
       expect(result.content).toEqual([
         {
           type: "text",
-          text: "Read file large.txt, lines 2-2\n2: hello\n[Output truncated. Continue reading with offset: 3]",
+          text: "Read file large.txt, lines 2-2\nhello\n[Output truncated. Continue reading with offset: 3]",
         },
       ])
       expect(readCalls).toEqual([
         { input: AbsolutePath.make(path.join(process.cwd(), "large.txt")), page: { offset: 2, limit: 1 } },
       ])
+    }),
+  )
+
+  it.effect("includes line numbers when lineNumbers: true", () =>
+    Effect.gen(function* () {
+      readResult = {
+        type: "file",
+        uri: "file:///README.md",
+        name: "README.md",
+        content: "alpha\nbeta",
+        encoding: "utf8",
+        mime: "text/plain",
+      }
+      const registry = yield* Tool.Service
+
+      const result = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-lines",
+          name: "read",
+          input: { path: "README.md", lineNumbers: true },
+        },
+      })
+      expect(result).toMatchObject({
+        status: "completed",
+        content: [{ type: "text", text: "Read file README.md, lines 1-2\n1: alpha\n2: beta" }],
+      })
+    }),
+  )
+
+  it.effect("reads multiple files and ranges concurrently in batch mode", () =>
+    Effect.gen(function* () {
+      readOverride = (input, _resource, page) => {
+        const p = input.toString()
+        if (p.endsWith("a.txt")) {
+          return Effect.succeed({
+            type: "file",
+            uri: "file:///a.txt",
+            name: "a.txt",
+            content: "alpha line",
+            encoding: "utf8",
+            mime: "text/plain",
+          })
+        }
+        if (p.endsWith("b.txt")) {
+          return Effect.succeed(
+            new ReadToolFileSystem.TextPage({
+              type: "text-page",
+              content: "beta line",
+              mime: "text/plain",
+              offset: page?.offset ?? 1,
+              truncated: false,
+                          }),
+          )
+        }
+        return Effect.succeed({
+          type: "file",
+          uri: "file:///default.txt",
+          name: "default.txt",
+          content: "content",
+          encoding: "utf8",
+          mime: "text/plain",
+        })
+      }
+      const registry = yield* Tool.Service
+
+      const result = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-batch",
+          name: "read",
+          input: {
+            batch: ["a.txt", { path: "b.txt", offset: 5, limit: 10 }],
+          },
+        },
+      })
+      expect(result.status).toBe("completed")
+      if (result.status !== "completed") return
+      expect(result.content).toEqual([
+        { type: "text", text: "Read file a.txt, lines 1-1\nalpha line" },
+        { type: "text", text: "Read file b.txt, lines 5-5\nbeta line" },
+      ])
+      expect(Array.isArray(result.output)).toBe(true)
+      expect(result.output).toHaveLength(2)
+    }),
+  )
+
+  it.effect("enforces authorization on batch items", () =>
+    Effect.gen(function* () {
+      deniedResource = "forbidden.txt"
+      const registry = yield* Tool.Service
+
+      const result = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-batch-denied",
+          name: "read",
+          input: {
+            batch: ["allowed.txt", "forbidden.txt"],
+          },
+        },
+      })
+      expect(result.status).toBe("error")
+    }),
+  )
+
+  it.effect("applies lossless compaction when compact: true", () =>
+    Effect.gen(function* () {
+      readOverride = (input) => {
+        const p = input.toString()
+        if (p.endsWith("style.css")) {
+          return Effect.succeed({
+            type: "file",
+            uri: "file:///style.css",
+            name: "style.css",
+            content: "/* comment */\n\n.btn {\n  color: red;\n  margin: 0;\n}\n\n",
+            encoding: "utf8",
+            mime: "text/css",
+          })
+        }
+        if (p.endsWith("icon.svg")) {
+          const longPath = "M10 80 Q 52.5 10, 95 80 T 180 80 M10 80 Q 52.5 10, 95 80 T 180 80 M10 80"
+          return Effect.succeed({
+            type: "file",
+            uri: "file:///icon.svg",
+            name: "icon.svg",
+            content: `<svg>\n  <path d="${longPath}" />\n\n</svg>`,
+            encoding: "utf8",
+            mime: "image/svg+xml",
+          })
+        }
+        return Effect.succeed({
+          type: "file",
+          uri: "file:///test.txt",
+          name: "test.txt",
+          content: "hello   \n\nworld\n",
+          encoding: "utf8",
+          mime: "text/plain",
+        })
+      }
+      const registry = yield* Tool.Service
+
+      const cssResult = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-compact-css",
+          name: "read",
+          input: { path: "style.css", compact: true },
+        },
+      })
+      expect(cssResult).toMatchObject({
+        status: "completed",
+        content: [{ type: "text", text: "Read file style.css, lines 1-1\n.btn { color: red; margin: 0; }" }],
+      })
+
+      const svgResult = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-compact-svg",
+          name: "read",
+          input: { path: "icon.svg", compact: true },
+        },
+      })
+      expect(svgResult.status).toBe("completed")
+      if (svgResult.status !== "completed") return
+      const svgText = (svgResult.content as any)[0].text
+      expect(svgText).toContain('d="[path:72c]"')
+      expect(svgText).not.toContain("\n\n")
+
+      const defaultResult = yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: {
+          type: "tool-call",
+          id: "call-default-no-compact",
+          name: "read",
+          input: { path: "test.txt", compact: false },
+        },
+      })
+      expect(defaultResult).toMatchObject({
+        status: "completed",
+        content: [{ type: "text", text: "Read file test.txt, lines 1-3\nhello   \n\nworld" }],
+      })
     }),
   )
 })

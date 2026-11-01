@@ -69,6 +69,39 @@ export const messageToText = (message: SessionMessage.Info | SessionStored.User)
   }
 }
 
+/**
+ * Full token-budget representation of a message for compaction `keep` / `tailTokens` sizing.
+ * Unlike `messageToText` (which formats `<recent-context>` without `<think>` and truncates tool outputs to 1,250 chars),
+ * `messageToBudgetText` accounts for `reasoning` (`<think>`) text and full untruncated tool/shell outputs so verbose
+ * thinking traces and large tool results cannot silently under-count retained tail tokens.
+ */
+export const messageToBudgetText = (message: SessionMessage.Info | SessionStored.User): string => {
+  switch (message.type) {
+    case "assistant":
+      return message.content
+        .flatMap((part) => {
+          if (part.type === "text") return [`[Assistant]: ${part.text}`]
+          if (part.type === "reasoning") return part.text ? [`[Assistant thinking]: ${part.text}`] : []
+
+          const input = typeof part.state.input === "string" ? part.state.input : JSON.stringify(part.state.input)
+          const call = `[Assistant tool call]: ${part.name}(${input})`
+          if (part.state.status === "completed") {
+            return [call, `[Tool result]: ${serializeToolContent(part.state.content)}`]
+          }
+          if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error.message}`]
+          return [call]
+        })
+        .join("\n")
+
+    case "shell":
+      if (message.metadata?.background === true) return ""
+      return `[Shell]: ${message.command}\n${message.output?.output ?? ""}`
+
+    default:
+      return messageToText(message)
+  }
+}
+
 export const truncateToolOutput = (value: string) => {
   if (value.length <= TOOL_OUTPUT_MAX_CHARS) return value
 

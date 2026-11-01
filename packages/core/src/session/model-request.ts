@@ -32,6 +32,7 @@ import { PluginHooks } from "../plugin/hooks.js"
 import { QuestionTool } from "../tool/plugin/question.js"
 import { Tool } from "../tool.js"
 import { SessionAffinity } from "./affinity.js"
+import { AquanoxTrace } from "./aquanox-trace.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
@@ -79,6 +80,9 @@ export interface Input {
   readonly webSocket?: "session"
   /** Prompt size, measured by the provider or estimated. The default output limit leaves room for it. */
   readonly inputTokens?: { readonly measured: number; readonly estimated: number }
+  /** Dynamic per-request JSON body fields overlaid via `request.http.body` (e.g. `id_slot`, `reasoning_budget_tokens`). */
+  readonly httpBody?: Record<string, unknown>
+  readonly aquanox?: AquanoxTrace.RequestTraceContext
 }
 
 /** The default output limit: the catalog limit, fitted to the room the prompt leaves in the context window. */
@@ -146,12 +150,16 @@ const mediaBytes = (media: Media.Asset) => {
   return 0
 }
 
+const unsupportedPartsMemo = new WeakMap<Message, Message>()
+
 /** Replaces media with the returned text; messages without replacements are returned unchanged. */
 const replaceMedia = (
   messages: LLMRequest["messages"],
   replace: (media: { mime: string; name: string | undefined; bytes: () => number }) => string | undefined,
 ) =>
   messages.map((message) => {
+    const cached = unsupportedPartsMemo.get(message)
+    if (cached) return cached
     const content = message.content.map((part) => {
       if (part.type === "media") {
         const text = replace({ mime: part.media.mediaType, name: part.filename, bytes: () => mediaBytes(part.media) })
@@ -168,9 +176,11 @@ const replaceMedia = (
         ? part
         : { ...part, result: { ...result, value } }
     })
-    return content.every((part, index) => part === message.content[index])
+    const transformed = content.every((part, index) => part === message.content[index])
       ? message
       : new Message({ ...message, content })
+    unsupportedPartsMemo.set(message, transformed)
+    return transformed
   })
 
 export const unsupportedParts = (
@@ -274,9 +284,49 @@ export const layer = Layer.effect(
       const generation = Object.fromEntries(entries.filter(([k]) => GENERATION_KEYS.has(k))) as GenerationOptionsFields
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
       const affinity = SessionAffinity.get(session)
+      const emitAquanoxHeaders =
+        AquanoxTrace.isEnabled() || AquanoxTrace.hasExplicitCorrelation(session.id, session.metadata)
+      const fallbackCorr = emitAquanoxHeaders ? AquanoxTrace.resolveSessionCorrelationSync(session) : undefined
+      const aquanoxCorr = emitAquanoxHeaders ? (input.aquanox ?? fallbackCorr) : undefined
+      const aquanoxThinking = emitAquanoxHeaders
+        ? (model.ref.variant ?? input.aquanox?.thinkingMode ?? fallbackCorr?.thinkingMode ?? null)
+        : null
+      const aquanoxParentSpan = input.aquanox?.parentSpanId ?? AquanoxTrace.getActiveStepSpan(session.id)
+      const aquanoxHeaders: Record<string, string> = aquanoxCorr
+        ? {
+            "x-aquanox-conversation-id": aquanoxCorr.conversationId,
+            "x-aquanox-root-session-id": aquanoxCorr.rootSessionId,
+            "x-aquanox-session-id": session.id,
+            ...(session.parentID ? { "x-aquanox-parent-session-id": session.parentID } : {}),
+            ...(aquanoxParentSpan ? { "x-aquanox-parent-span-id": aquanoxParentSpan } : {}),
+            "x-aquanox-agent": input.agent,
+            "x-aquanox-request-kind": kind,
+            "x-aquanox-model": `${model.ref.providerID}/${model.ref.id}`,
+            ...(aquanoxThinking ? { "x-aquanox-thinking-mode": aquanoxThinking } : {}),
+          }
+        : {}
+      const sessionKwargs =
+        session.metadata && typeof session.metadata === "object" && "chat_template_kwargs" in session.metadata
+          ? ((session.metadata as Record<string, unknown>).chat_template_kwargs as Record<string, unknown> | undefined)
+          : undefined
+      const sessionEffort = sessionKwargs?.reasoning_effort
+      const effectiveHttpBody = {
+        ...(sessionKwargs
+          ? {
+              chat_template_kwargs: sessionKwargs,
+              ...(typeof sessionEffort === "number"
+                ? { reasoning_effort: "" }
+                : typeof sessionEffort === "string"
+                  ? { reasoning_effort: sessionEffort }
+                  : {}),
+            }
+          : {}),
+        ...(input.httpBody ?? {}),
+      }
       const base = LLM.request({
         model: model.model,
         http: {
+          ...(Object.keys(effectiveHttpBody).length > 0 ? { body: effectiveHttpBody } : {}),
           headers: {
             "x-opencode-session-id": session.id,
             ...(session.parentID ? { "x-opencode-parent-session-id": session.parentID } : {}),
@@ -287,6 +337,7 @@ export const layer = Layer.effect(
             "x-opencode-project": session.projectID,
             "x-opencode-session": affinity,
             "x-opencode-client": app.name,
+            ...aquanoxHeaders,
           },
         },
         // TODO: Persist cache lineage so nested forks reuse the root session's cache key.

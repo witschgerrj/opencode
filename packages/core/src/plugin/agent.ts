@@ -8,11 +8,12 @@ const PROMPT_EXPLORE = `You are a file search specialist. You excel at thoroughl
 
 Guidelines:
 - Your role is EXCLUSIVELY to search and analyze
-- Parallelize independent tool calls for searches and reads whenever possible
+- Shell execution is disabled; use native glob, grep, and read tools exclusively
+- Parallelize independent tool calls for searches and reads whenever possible, and use read with batch and compact: true for fast multi-file discovery
 - Adapt your search approach based on the thoroughness level specified by the caller
-- Return file paths as absolute paths in your final response
+- Return file paths as absolute paths with exact line ranges in your final response
 - You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
-- Shell commands MUST be read-only. NEVER run commands that write files or change system state
+- Once discovery is complete, call request_synthesis({}) and immediately emit a concise (<= 2,000 tokens) structured report
 
 Complete the user's search request efficiently and report your findings clearly.`
 
@@ -68,6 +69,7 @@ export const Plugin = define({
         item.permissions.push(
           { action: "question", resource: "*", effect: "deny" },
           { action: "subagent", resource: "*", effect: "deny" },
+          { action: "request_synthesis", resource: "*", effect: "allow" },
         )
       })
 
@@ -79,7 +81,7 @@ export const Plugin = define({
         item.mode = "subagent"
         item.permissions.push(
           { action: "*", resource: "*", effect: "deny" },
-          { action: "shell", resource: "*", effect: "allow" },
+          { action: "shell", resource: "*", effect: "deny" },
           { action: "grep", resource: "*", effect: "allow" },
           { action: "glob", resource: "*", effect: "allow" },
           { action: "webfetch", resource: "*", effect: "allow" },
@@ -88,6 +90,7 @@ export const Plugin = define({
           { action: "read", resource: "*.env", effect: "ask" },
           { action: "read", resource: "*.env.*", effect: "ask" },
           { action: "read", resource: "*.env.example", effect: "allow" },
+          { action: "request_synthesis", resource: "*", effect: "allow" },
           { action: "subagent", resource: "*", effect: "deny" },
           { action: "external_directory", resource: "*", effect: "allow" },
         )

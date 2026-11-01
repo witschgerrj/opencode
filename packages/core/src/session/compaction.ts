@@ -27,11 +27,13 @@ import { Model } from "../model.js"
 import { State } from "../state.js"
 import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
+import { AquanoxTrace } from "./aquanox-trace.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
 import type { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
+import { SessionSlotLease } from "./slot-lease.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import { SessionRecentText } from "./recent-text.js"
@@ -279,11 +281,11 @@ export const layer = Layer.effect(
             .resolve({ ...context.session, model: agent.model }, catalog.available)
             .pipe(Effect.orElseSucceed(() => undefined)))) ??
         context.model
-      const ceiling = calculateCeiling(model.limit, buffer)
+      const ceiling = calculateCeiling(model.limit, buffer, model.ref.providerID)
       // An unknown window never triggers auto compaction, but the compaction request still needs a size to aim for.
       const cap = Number.isFinite(ceiling)
         ? ceiling
-        : calculateCeiling({ ...model.limit, context: UNKNOWN_WINDOW }, buffer)
+        : calculateCeiling({ ...model.limit, context: UNKNOWN_WINDOW }, buffer, model.ref.providerID)
       return { context: model === context.model ? context : { ...context, model }, cap }
     })
 
@@ -295,7 +297,7 @@ export const layer = Layer.effect(
       if (trigger.reason !== "manual" && !settings.auto) return { status: "skipped" }
       if (
         trigger.reason === "auto" &&
-        !due(context, calculateCeiling(context.model.limit, settings.buffer), trigger.estimate)
+        !due(context, calculateCeiling(context.model.limit, settings.buffer, context.model.ref.providerID), trigger.estimate)
       )
         return { status: "skipped" }
       const held = precomputed.get(context.session.id)
@@ -313,6 +315,73 @@ export const layer = Layer.effect(
       // opens here, before any wait, so a background summary still being written shows as a running compaction.
       if (trigger.reason !== "manual")
         yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto" })
+      const traceEnabled = AquanoxTrace.isEnabled()
+      const compactCorr = traceEnabled ? AquanoxTrace.resolveSessionCorrelationSync(selected.context.session) : undefined
+      const compactSpanId = traceEnabled ? AquanoxTrace.newSpanId("sp_oc_compact") : undefined
+      const compactParentSpanId = compactCorr
+        ? (AquanoxTrace.getActiveTurnSpan(context.session.id) ?? compactCorr.parentTurnSpanId)
+        : null
+      const compactStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
+      const compactModelLabel = `${selected.context.model.ref.providerID}/${selected.context.model.ref.id}`
+      const compactThinkingMode = selected.context.model.ref.variant ?? compactCorr?.thinkingMode ?? null
+      if (compactCorr && compactSpanId) {
+        AquanoxTrace.setActiveCompactSpan(context.session.id, compactSpanId)
+        yield* AquanoxTrace.postTraceIngest({
+          span: {
+            spanId: compactSpanId,
+            conversationId: compactCorr.conversationId,
+            parentSpanId: compactParentSpanId,
+            rootSessionId: compactCorr.rootSessionId,
+            sessionId: context.session.id,
+            parentSessionId: compactCorr.parentSessionId,
+            layer: "opencode",
+            kind: "llm.compact",
+            name: `compact (${trigger.reason})`,
+            status: "running",
+            startUs: compactStartUs,
+            model: compactModelLabel,
+            thinkingMode: compactThinkingMode,
+            agentName: selected.context.agent.id,
+            isSubagent: compactCorr.isSubagent,
+            contextWindowLimit: selected.context.model.limit.context > 0 ? selected.context.model.limit.context : null,
+            attributes: { reason: trigger.reason, native },
+          },
+        })
+      }
+      const emitCompactEnd = (status: "ok" | "error" | "cancelled") => {
+        if (!compactCorr || !compactSpanId) return Effect.void
+        if (AquanoxTrace.getActiveCompactSpan(context.session.id) === compactSpanId) {
+          AquanoxTrace.setActiveCompactSpan(context.session.id, null)
+        }
+        const compactEndUs = AquanoxTrace.nowUs()
+        const metrics = AquanoxTrace.usageMetrics(
+          spent.get(context.session.id)?.tokens,
+          selected.context.model.limit.context,
+        )
+        return AquanoxTrace.postTraceIngest({
+          span: {
+            spanId: compactSpanId,
+            conversationId: compactCorr.conversationId,
+            parentSpanId: compactParentSpanId,
+            rootSessionId: compactCorr.rootSessionId,
+            sessionId: context.session.id,
+            parentSessionId: compactCorr.parentSessionId,
+            layer: "opencode",
+            kind: "llm.compact",
+            name: `compact (${trigger.reason})`,
+            status,
+            startUs: compactStartUs,
+            endUs: compactEndUs,
+            durationMs: AquanoxTrace.durationMs(compactStartUs, compactEndUs),
+            model: compactModelLabel,
+            thinkingMode: compactThinkingMode,
+            agentName: selected.context.agent.id,
+            isSubagent: compactCorr.isSubagent,
+            ...metrics,
+            attributes: { reason: trigger.reason, native },
+          },
+        })
+      }
       const swapped = held ? yield* usePrecomputed(selected, held, budget, settings) : undefined
       const compaction = swapped
         ? Effect.succeed(swapped)
@@ -323,6 +392,12 @@ export const layer = Layer.effect(
         Effect.matchEffect({
           onSuccess: (result) => publish(selected, result),
           onFailure: (failure) => publish(selected, failure),
+        }),
+        Effect.onExit((exit) => {
+          if (Exit.isFailure(exit)) {
+            return emitCompactEnd(Exit.hasInterrupts(exit) ? "cancelled" : "error")
+          }
+          return emitCompactEnd(exit.value.status === "failed" ? "error" : "ok")
         }),
       )
     })
@@ -342,11 +417,17 @@ export const layer = Layer.effect(
       if (!settings.precompute || !settings.auto) return
       const context = yield* load
       if (context.model.compaction?.type === "native") return
-      const ceiling = calculateCeiling(context.model.limit, settings.buffer)
+      const isDeepSeekLocal = String(context.model.ref.providerID) === "deepseek-local"
+      const ceiling = calculateCeiling(context.model.limit, settings.buffer, context.model.ref.providerID)
       if (!Number.isFinite(ceiling)) return
       const estimate = given ?? estimatePrompt(context)
       if (due(context, ceiling, estimate)) return
-      if (total(estimate) < ceiling * PRECOMPUTE_RATIO) return
+      if (isDeepSeekLocal) {
+        const floor = Math.floor(0.85 * (context.model.limit.context || 393_216))
+        if (total(estimate) < floor) return
+      } else {
+        if (total(estimate) < ceiling * PRECOMPUTE_RATIO) return
+      }
 
       const anchorIndex = context.messages.findLastIndex((message) => hasMeasuredPrompt(message, context.model.ref))
       const anchor = context.messages[anchorIndex]
@@ -837,6 +918,16 @@ export const layer = Layer.effect(
       webSocket?: "session",
     ) => {
       const base = transcript(context, messages)
+      const traceActive =
+        AquanoxTrace.isEnabled() || AquanoxTrace.hasExplicitCorrelation(context.session.id, context.session.metadata)
+      const corr = traceActive ? AquanoxTrace.resolveSessionCorrelationSync(context.session) : undefined
+      const defaultBody = context.model.model.route.defaults.http?.body
+      const localSlotBudgeted =
+        String(context.model.ref.providerID) === "deepseek-local" ||
+        (defaultBody !== undefined &&
+          typeof defaultBody === "object" &&
+          defaultBody !== null &&
+          "reasoning_budget_tokens" in defaultBody)
       return requests.compaction({
         session: context.session,
         agent: context.agent.id,
@@ -846,6 +937,27 @@ export const layer = Layer.effect(
         messages: base.messages,
         webSocket,
         inputTokens: { measured: budget, estimated: 0 },
+        ...(localSlotBudgeted
+          ? {
+              httpBody: {
+                id_slot: SessionSlotLease.acquire(context.session.id, Boolean(context.session.parentID)),
+                reasoning_budget_tokens: 2048,
+              },
+            }
+          : {}),
+        ...(corr
+          ? {
+              aquanox: {
+                conversationId: corr.conversationId,
+                rootSessionId: corr.rootSessionId,
+                parentSpanId:
+                  AquanoxTrace.getActiveCompactSpan(context.session.id) ??
+                  AquanoxTrace.getActiveTurnSpan(context.session.id) ??
+                  corr.parentTurnSpanId,
+                thinkingMode: context.model.ref.variant ?? corr.thinkingMode,
+              },
+            }
+          : {}),
       })
     }
 
@@ -957,7 +1069,9 @@ const heldIndex = (held: Precomputed, context: SessionContext.Loaded) => {
 
 /** Estimated text a swapped-in summary keeps verbatim: every message from `index` on. */
 const tailTokens = (context: SessionContext.Loaded, index: number) =>
-  Token.estimate(context.messages.slice(index).map(SessionRecentText.messageToText).filter(Boolean).join("\n\n"))
+  Token.estimate(
+    context.messages.slice(index).map(SessionRecentText.messageToBudgetText).filter(Boolean).join("\n\n"),
+  )
 
 const tailLimit = (keep: number, budget: number) =>
   Math.min(Math.max(keep * 2, PRECOMPUTED_TAIL_MIN), Math.floor(budget * PRECOMPUTED_TAIL_SHARE))
@@ -983,8 +1097,9 @@ const transcript = (context: SessionContext.Loaded, messages: ReadonlyArray<Sess
  */
 const splitConversation = (messages: ReadonlyArray<SessionMessage.Info>, keep: number) => {
   const entries = messages.flatMap((message) => {
+    const budgetText = SessionRecentText.messageToBudgetText(message)
     const text = SessionRecentText.messageToText(message)
-    return text ? [{ message, text }] : []
+    return text || budgetText ? [{ message, text: budgetText || text }] : []
   })
   if (entries.length === 0) return undefined
 
@@ -998,7 +1113,12 @@ const splitConversation = (messages: ReadonlyArray<SessionMessage.Info>, keep: n
 const withoutTail = (request: LLMRequest, from: SessionMessage.ID | undefined) => {
   const index = from === undefined ? -1 : request.messages.findIndex((message) => message.id === from)
   if (index < 0) return request
-  return LLMRequest.update(request, { messages: request.messages.slice(0, index) })
+  // Never split an assistant tool-call message from its trailing `role: "tool"` result messages.
+  let end = index
+  while (end < request.messages.length && request.messages[end]?.role === "tool") {
+    end++
+  }
+  return LLMRequest.update(request, { messages: request.messages.slice(0, end) })
 }
 
 const recentStart = (
@@ -1130,14 +1250,28 @@ export const estimatePrompt = (context: SessionContext.Loaded): Estimate => {
  * `RESERVE_MIN` when that is more. A summary request that must be shrunk is aimed at the same size. A window too small
  * to give up `RESERVE_MIN` keeps `RESERVE_SHARE`.
  */
-const calculateCeiling = (limit: SessionContext.Loaded["model"]["limit"], buffer: number | undefined) => {
+export const calculateCeiling = (
+  limit: SessionContext.Loaded["model"]["limit"],
+  buffer: number | undefined,
+  providerID?: string,
+) => {
   // Unknown limits are reported as 0. An unknown input limit falls back to the context window; with no window at
   // all, only a provider rejection can limit the request.
   const window = limit.input || limit.context
   if (window <= 0) return Number.POSITIVE_INFINITY
-  // A buffer that leaves no room, such as one set for a larger model, is ignored.
-  if (buffer !== undefined && buffer < window) return window - buffer
-  return window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
+  let ceiling =
+    buffer !== undefined && buffer < window
+      ? window - buffer
+      : window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
+  // Ensure deepseek-local never triggers premature < 320K compaction below 0.85 * contextLimit (~334K of 393,216)
+  if (String(providerID) === "deepseek-local" && (limit.context > 0 || (limit.input ?? 0) > 0)) {
+    const contextLimit = limit.context || limit.input || 393_216
+    const floor = Math.floor(0.85 * contextLimit)
+    if (ceiling < floor) {
+      ceiling = floor
+    }
+  }
+  return ceiling
 }
 
 /**

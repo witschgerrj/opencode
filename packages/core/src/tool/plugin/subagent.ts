@@ -3,18 +3,94 @@ export * as SubagentTool from "./subagent.js"
 import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
-import { Effect, Predicate, Schema } from "effect"
+import { Effect, Exit, Predicate, Schema } from "effect"
 import { Agent } from "../../agent.js"
 import { Config } from "../../config.js"
 import { Job } from "../../job.js"
 import { Model } from "../../model.js"
 import { Permission } from "../../permission.js"
 import { Session } from "../../session.js"
+import { AquanoxTrace } from "../../session/aquanox-trace.js"
 import { SessionSchema } from "../../session/schema.js"
+import { SessionSlotLease } from "../../session/slot-lease.js"
 import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
+
+/**
+ * When spawning a child sub-agent without an explicit tool-call `model` override or `agent.model`,
+ * binds the child session's variant to `#subagent-high` (if configured on the model) or `#high`
+ * (if `#subagent-high` is not yet configured), preventing sub-agents from inheriting Root's `#max`.
+ */
+export const bindChildSubagentModel = (
+  parentModel: Model.Ref | undefined,
+  available: ReadonlyArray<Model.Info>,
+): Model.Ref | undefined => {
+  if (parentModel === undefined) return undefined
+  const catalogModel = available.find((m) => m.providerID === parentModel.providerID && m.id === parentModel.id)
+  if (catalogModel === undefined || catalogModel.variants.length === 0) return parentModel
+  const hasSubagentHigh = catalogModel.variants.some((v) => String(v.id) === "subagent-high")
+  if (hasSubagentHigh) {
+    return Model.Ref.make({
+      providerID: parentModel.providerID,
+      id: parentModel.id,
+      variant: Model.VariantID.make("subagent-high"),
+    })
+  }
+  const hasHigh = catalogModel.variants.some((v) => String(v.id) === "high")
+  if (hasHigh) {
+    return Model.Ref.make({
+      providerID: parentModel.providerID,
+      id: parentModel.id,
+      variant: Model.VariantID.make("high"),
+    })
+  }
+  return parentModel
+}
+
+/**
+ * Resolves the parent session's reasoning_effort from metadata, model variant overlay, or default,
+ * ensuring child subagents inherit the exact reasoning_effort and match token 8 of <｜System｜> 100%.
+ */
+export const resolveParentReasoningEffort = (
+  parent: SessionSchema.Info,
+  available: ReadonlyArray<Model.Info>,
+): number | string | undefined => {
+  if (parent.metadata && typeof parent.metadata === "object") {
+    const parentMeta = parent.metadata as Record<string, unknown>
+    const metaKwargs = parentMeta.chat_template_kwargs as Record<string, unknown> | undefined
+    if (metaKwargs && (typeof metaKwargs.reasoning_effort === "number" || typeof metaKwargs.reasoning_effort === "string")) {
+      return metaKwargs.reasoning_effort
+    }
+  }
+  if (parent.model) {
+    const catalog = available.find(
+      (m) => m.providerID === parent.model?.providerID && m.id === parent.model?.id,
+    )
+    if (catalog) {
+      const parentVar = catalog.variants.find((v) => v.id === parent.model?.variant)
+      const varBody = parentVar?.body as Record<string, unknown> | undefined
+      const varKwargs = varBody?.chat_template_kwargs as Record<string, unknown> | undefined
+      if (typeof varKwargs?.reasoning_effort === "number" || typeof varKwargs?.reasoning_effort === "string") {
+        return varKwargs.reasoning_effort
+      }
+      const varSettings = parentVar?.settings as Record<string, unknown> | undefined
+      if (typeof varSettings?.reasoningEffort === "string" && varSettings.reasoningEffort.length > 0) {
+        return varSettings.reasoningEffort
+      }
+      const modelBody = catalog.body as Record<string, unknown> | undefined
+      const modelKwargs = modelBody?.chat_template_kwargs as Record<string, unknown> | undefined
+      if (typeof modelKwargs?.reasoning_effort === "number" || typeof modelKwargs?.reasoning_effort === "string") {
+        return modelKwargs.reasoning_effort
+      }
+    }
+  }
+  if (parent.model && String(parent.model.providerID) === "deepseek-local") {
+    return 85
+  }
+  return undefined
+}
 
 const backgroundResult = (sessionID: SessionSchema.ID) => ({
   sessionID,
@@ -116,6 +192,7 @@ export const Plugin = {
                 )
               let current = parent
               let depth = 0
+              AquanoxTrace.recordFromSession(parent)
               while (current.parentID) {
                 depth++
                 current = yield* sessions
@@ -125,6 +202,7 @@ export const Plugin = {
                       (error) => new ToolFailure({ message: `Parent session not found: ${current.parentID}`, error }),
                     ),
                   )
+                AquanoxTrace.recordFromSession(current)
               }
               const limit = Config.latest(yield* config.entries(), "experimental")?.subagent_depth ?? 1
               if (depth >= limit)
@@ -181,7 +259,42 @@ export const Plugin = {
                 )
               }
 
-              const model = override ?? agent.model ?? parent.model
+              const availableModels = yield* models.available()
+              const model =
+                override ?? agent.model ?? bindChildSubagentModel(parent.model, availableModels)
+              const isDeepSeekLocal = model !== undefined && String(model.providerID) === "deepseek-local"
+              const sharesParentSystemPrefix = String(agent.id) === String(parent.agent)
+              const inheritedReasoningEffort =
+                isDeepSeekLocal && sharesParentSystemPrefix
+                  ? resolveParentReasoningEffort(parent, availableModels)
+                  : undefined
+
+              const traceEnabled = AquanoxTrace.isEnabled()
+              const propagateMeta =
+                traceEnabled || AquanoxTrace.hasExplicitCorrelation(parent.id, parent.metadata)
+              const parentCorr = propagateMeta ? AquanoxTrace.resolveSessionCorrelationSync(parent) : undefined
+              const subSpanId = propagateMeta ? AquanoxTrace.newSpanId("sp_oc_sub") : undefined
+              const parentToolSpanId = `sp_oc_tool_${context.sessionID}_${context.id}`
+              const childThinkingMode = model?.variant ?? parentCorr?.thinkingMode ?? null
+              const inheritedKwargs =
+                inheritedReasoningEffort !== undefined
+                  ? { chat_template_kwargs: { reasoning_effort: inheritedReasoningEffort } }
+                  : {}
+              const childMetadata: any = {
+                ...(existing?.metadata ?? parent.metadata ?? {}),
+                ...inheritedKwargs,
+                ...(parentCorr && subSpanId
+                  ? {
+                      aquanoxConversationId: parentCorr.conversationId,
+                      aquanoxRootSessionId: parentCorr.rootSessionId,
+                      aquanoxParentSpanId: subSpanId,
+                      ...(childThinkingMode ? { aquanoxThinkingMode: childThinkingMode } : {}),
+                    }
+                  : {}),
+              }
+              if (existing !== undefined) {
+                yield* sessions.setMetadata({ sessionID: existing.id, metadata: childMetadata }).pipe(Effect.ignore)
+              }
               const child =
                 existing ??
                 (yield* sessions
@@ -190,70 +303,174 @@ export const Plugin = {
                     title: input.description,
                     agent: agent.id,
                     model,
+                    metadata: childMetadata,
                   })
                   .pipe(
                     Effect.mapError(
                       (error) => new ToolFailure({ message: `Parent session not found: ${context.sessionID}`, error }),
                     ),
                   ))
+              if (parentCorr && subSpanId) {
+                AquanoxTrace.recordSubagentBinding({
+                  childSessionId: child.id,
+                  parentSessionId: context.sessionID,
+                  conversationId: parentCorr.conversationId,
+                  rootSessionId: parentCorr.rootSessionId,
+                  subSpanId,
+                  thinkingMode: childThinkingMode,
+                })
+              }
 
               const background = input.background === true
+              const subStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
+              const subModelLabel = model ? `${model.providerID}/${model.id}` : null
+              const subSpanName = input.description
+                ? `subagent: ${agent.id} (${input.description})`
+                : `subagent: ${agent.id}`
+              if (traceEnabled && parentCorr && subSpanId) {
+                yield* AquanoxTrace.postTraceIngest({
+                  sessionBinding: {
+                    sessionId: child.id,
+                    conversationId: parentCorr.conversationId,
+                    rootSessionId: parentCorr.rootSessionId,
+                    parentSessionId: context.sessionID,
+                    parentSpanId: subSpanId,
+                    agentName: agent.id,
+                    isSubagent: true,
+                    title: input.description || child.title || null,
+                  },
+                  span: {
+                    spanId: subSpanId,
+                    conversationId: parentCorr.conversationId,
+                    parentSpanId: parentToolSpanId,
+                    rootSessionId: parentCorr.rootSessionId,
+                    sessionId: context.sessionID,
+                    parentSessionId: parent.parentID ?? null,
+                    layer: "opencode",
+                    kind: "subagent.invoke",
+                    name: subSpanName,
+                    status: "running",
+                    startUs: subStartUs,
+                    model: subModelLabel,
+                    thinkingMode: childThinkingMode,
+                    agentName: agent.id,
+                    isSubagent: true,
+                    subagentSessionId: child.id,
+                    attributes: {
+                      background,
+                      resumed: existing !== undefined,
+                      description: input.description,
+                    },
+                  },
+                })
+              }
               yield* context.progress({ sessionID: child.id, status: "running" })
 
-              // Standard prompt admission outside the job: Job.start joining a running child skips
-              // its run effect, and the default wake starts an idle child or steers a running one.
-              yield* sessions
-                .prompt({
-                  sessionID: child.id,
-                  text:
-                    existing === undefined
-                      ? ["You are a subagent spawned by another session.", input.prompt].join("\n")
-                      : input.prompt,
-                  ...(background && existing === undefined ? { resume: false } : {}),
-                })
-                .pipe(
-                  Effect.mapError(
-                    (error) => new ToolFailure({ message: `Failed to prompt subagent: ${child.id}`, error }),
+              const preleasedSlot = model !== undefined && String(model.providerID) === "deepseek-local"
+              if (preleasedSlot) {
+                SessionSlotLease.acquire(child.id, true)
+              }
+              let jobStarted = false
+
+              return yield* Effect.gen(function* () {
+                // Standard prompt admission outside the job: Job.start joining a running child skips
+                // its run effect, and the default wake starts an idle child or steers a running one.
+                yield* sessions
+                  .prompt({
+                    sessionID: child.id,
+                    text:
+                      existing === undefined
+                        ? ["You are a subagent spawned by another session.", input.prompt].join("\n")
+                        : input.prompt,
+                    ...(background && existing === undefined ? { resume: false } : {}),
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ToolFailure({ message: `Failed to prompt subagent: ${child.id}`, error }),
+                    ),
+                  )
+
+                const recovery = {
+                  kind: "subagent" as const,
+                  parentSessionID: context.sessionID,
+                  childSessionID: child.id,
+                  agent: agent.name,
+                  description: input.description,
+                }
+                yield* subagents.start(recovery)
+                jobStarted = true
+
+                if (background) {
+                  yield* subagents.background(recovery)
+                  return backgroundResult(child.id)
+                }
+
+                const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
+                      discard: true,
+                    }),
                   ),
                 )
-
-              const recovery = {
-                kind: "subagent" as const,
-                parentSessionID: context.sessionID,
-                childSessionID: child.id,
-                agent: agent.name,
-                description: input.description,
-              }
-              yield* subagents.start(recovery)
-
-              if (background) {
-                yield* subagents.background(recovery)
-                return backgroundResult(child.id)
-              }
-
-              const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
-                Effect.onInterrupt(() =>
-                  Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
-                    discard: true,
-                  }),
-                ),
+                if (result?.type === "backgrounded") {
+                  yield* subagents.notify(recovery, result.info.started_at)
+                  return backgroundResult(child.id)
+                }
+                if (preleasedSlot) {
+                  SessionSlotLease.release(child.id)
+                }
+                // Failure surfaces keep the sessionID visible so the model can continue the child.
+                if (result?.info.status === "error")
+                  return yield* new ToolFailure({
+                    message: `Subagent failed (sessionID: ${child.id}): ${result.info.error ?? "unknown error"}`,
+                  })
+                if (result?.info.status === "cancelled")
+                  return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${child.id})` })
+                return {
+                  sessionID: child.id,
+                  status: "completed" as const,
+                  output: result?.info.output ?? SubagentCompletion.NO_TEXT,
+                }
+              }).pipe(
+                Effect.onExit((exit) => {
+                  if (preleasedSlot && Exit.isFailure(exit) && (!jobStarted || !background)) {
+                    SessionSlotLease.release(child.id)
+                  }
+                  if (!traceEnabled || !parentCorr || !subSpanId) return Effect.void
+                  const subEndUs = AquanoxTrace.nowUs()
+                  let status: "ok" | "error" | "cancelled" = "ok"
+                  if (Exit.isFailure(exit)) {
+                    status = Exit.hasInterrupts(exit) ? "cancelled" : "error"
+                  }
+                  return AquanoxTrace.postTraceIngest({
+                    span: {
+                      spanId: subSpanId,
+                      conversationId: parentCorr.conversationId,
+                      parentSpanId: parentToolSpanId,
+                      rootSessionId: parentCorr.rootSessionId,
+                      sessionId: context.sessionID,
+                      parentSessionId: parent.parentID ?? null,
+                      layer: "opencode",
+                      kind: "subagent.invoke",
+                      name: subSpanName,
+                      status,
+                      startUs: subStartUs,
+                      endUs: subEndUs,
+                      durationMs: AquanoxTrace.durationMs(subStartUs, subEndUs),
+                      model: subModelLabel,
+                      thinkingMode: childThinkingMode,
+                      agentName: agent.id,
+                      isSubagent: true,
+                      subagentSessionId: child.id,
+                      attributes: {
+                        background: Exit.isSuccess(exit) ? exit.value.status === "running" : background,
+                        resumed: existing !== undefined,
+                        description: input.description,
+                      },
+                    },
+                  })
+                }),
               )
-              if (result?.type === "backgrounded") {
-                yield* subagents.notify(recovery, result.info.started_at)
-                return backgroundResult(child.id)
-              }
-              // Failure surfaces keep the sessionID visible so the model can continue the child.
-              if (result?.info.status === "error")
-                return yield* new ToolFailure({
-                  message: `Subagent failed (sessionID: ${child.id}): ${result.info.error ?? "unknown error"}`,
-                })
-              if (result?.info.status === "cancelled")
-                return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${child.id})` })
-              return {
-                sessionID: child.id,
-                status: "completed" as const,
-                output: result?.info.output ?? SubagentCompletion.NO_TEXT,
-              }
             }).pipe(
               Effect.map((output) => ({
                 output,

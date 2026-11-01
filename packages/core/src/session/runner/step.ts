@@ -10,6 +10,7 @@ import {
   type ToolCall,
 } from "@opencode/ai/effect"
 import type { Agent } from "@opencode/schema/agent"
+import type { RelativePath } from "@opencode/schema/schema"
 import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { Bus } from "../../bus.js"
@@ -18,6 +19,7 @@ import { Snapshot } from "../../snapshot.js"
 import { Tool } from "../../tool.js"
 import { ToolOutput } from "../../tool-output.js"
 import { QuestionTool } from "../../tool/plugin/question.js"
+import { AquanoxTrace } from "../aquanox-trace.js"
 import { StepFailedError } from "../error.js"
 import { SessionEvent } from "../event.js"
 import { SessionMessage } from "../message.js"
@@ -42,6 +44,49 @@ export type Outcome = Data.TaggedEnum<{
 }>
 export const Outcome = Data.taggedEnum<Outcome>()
 
+interface CachedSessionSnapshot {
+  readonly hash: Snapshot.ID
+  readonly timestampMs: number
+}
+
+const lastCleanSessionSnapshot = new Map<string, CachedSessionSnapshot>()
+const MAX_CACHED_SNAPSHOTS = 128
+const SNAPSHOT_CACHE_TTL_MS = 120_000
+
+function recordCleanSnapshot(sessionID: string, hash: Snapshot.ID): void {
+  lastCleanSessionSnapshot.set(sessionID, { hash, timestampMs: Date.now() })
+  if (lastCleanSessionSnapshot.size > MAX_CACHED_SNAPSHOTS) {
+    const oldest = lastCleanSessionSnapshot.keys().next().value
+    if (oldest !== undefined) lastCleanSessionSnapshot.delete(oldest)
+  }
+}
+
+export function clearSnapshotCache(): void {
+  lastCleanSessionSnapshot.clear()
+}
+
+export function getCachedSnapshot(sessionID: string): Snapshot.ID | undefined {
+  return lastCleanSessionSnapshot.get(sessionID)?.hash
+}
+
+const READ_ONLY_TOOLS = new Set([
+  "read",
+  "grep",
+  "glob",
+  "ls",
+  "list",
+  "skill",
+  "todowrite",
+  "todoread",
+  "question",
+  "ask_question",
+  "websearch",
+  "webfetch",
+  "codesearch",
+  "lsp",
+  "request_synthesis",
+])
+
 interface Input {
   readonly isLocationClosed: () => boolean
   readonly sessionID: SessionSchema.ID
@@ -57,6 +102,17 @@ interface Input {
   readonly recoverContinuation: boolean
   /** The runner owns compaction policy; the attempt invokes it only before durable output. */
   readonly recoverOverflow: Effect.Effect<boolean>
+  readonly aquanox?: {
+    readonly stepSpanId: string
+    readonly parentSpanId: string | null
+    readonly conversationId: string
+    readonly rootSessionId: string
+    readonly parentSessionId: string | null
+    readonly isSubagent: boolean
+    readonly thinkingMode: string | null
+    readonly stepNumber: number
+    readonly onMetrics?: (metrics: ReturnType<typeof AquanoxTrace.usageMetrics>) => void
+  }
 }
 
 const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
@@ -71,9 +127,47 @@ export const make = Effect.gen(function* () {
   const toolOutput = yield* ToolOutput.Service
 
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
-    // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started,
-    // so it is captured while the provider request is in flight instead of delaying it.
-    const pendingStartSnapshot = yield* snapshots.capture().pipe(Effect.forkScoped)
+    const aq = input.aquanox
+    const traceEnabled = Boolean(aq && AquanoxTrace.isEnabled())
+    const stepStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
+    let firstTokenUs: number | null = null
+    let latestUsage: SessionUsage.Recorded | undefined
+    const modelLabel = `${input.model.ref.providerID}/${input.model.ref.id}`
+    if (aq && traceEnabled) {
+      AquanoxTrace.setActiveStepSpan(input.sessionID, aq.stepSpanId)
+      yield* Effect.forkDetach(
+        AquanoxTrace.postTraceIngest({
+          span: {
+            spanId: aq.stepSpanId,
+            conversationId: aq.conversationId,
+            parentSpanId: aq.parentSpanId,
+            rootSessionId: aq.rootSessionId,
+            sessionId: input.sessionID,
+            parentSessionId: aq.parentSessionId,
+            layer: "opencode",
+            kind: "llm.step",
+            name: `llm step #${aq.stepNumber} (${input.agent})`,
+            status: "running",
+            startUs: stepStartUs,
+            model: modelLabel,
+            thinkingMode: aq.thinkingMode,
+            agentName: input.agent,
+            isSubagent: aq.isSubagent,
+            contextWindowLimit: input.model.limit.context > 0 ? input.model.limit.context : null,
+            attributes: { step: aq.stepNumber },
+          },
+        }).pipe(Effect.ignore),
+      )
+    }
+    // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started.
+    // Dirty-gated snapshot carry-forward: if last clean snapshot exists within TTL, reuse immediately (0 process spawns).
+    const cachedEntry = lastCleanSessionSnapshot.get(input.sessionID)
+    const nowMs = Date.now()
+    const canReuseStartSnapshot =
+      cachedEntry !== undefined && nowMs - cachedEntry.timestampMs < SNAPSHOT_CACHE_TTL_MS
+    const pendingStartSnapshot = canReuseStartSnapshot
+      ? yield* Effect.succeed(cachedEntry.hash).pipe(Effect.forkScoped)
+      : yield* snapshots.capture().pipe(Effect.forkScoped)
     const publisher = createLLMEventPublisher(bus, {
       sessionID: input.sessionID,
       assistantMessageID: input.assistantMessageID,
@@ -88,7 +182,12 @@ export const make = Effect.gen(function* () {
       readonly fiber: Fiber.Fiber<void, Permission.DeclinedError | QuestionTool.CancelledError>
     }> = []
     const interruptTools = Effect.suspend(() => Fiber.interruptAll(toolRuns.map((run) => run.fiber)))
+    let sawMutatingTool = false
     const executeTool = (call: ToolCall) => {
+      const toolName = String(call.name ?? "").toLowerCase()
+      if (!READ_ONLY_TOOLS.has(toolName)) {
+        sawMutatingTool = true
+      }
       if (input.prepared.request.toolChoice?.type === "none")
         return new Tool.Error({ message: "Tools are disabled after the maximum agent steps" })
       return input.prepared.executeTool({
@@ -119,17 +218,80 @@ export const make = Effect.gen(function* () {
             return
           }
           yield* publisher.publish(event)
+          if (traceEnabled && firstTokenUs === null && publisher.record().outputStarted) {
+            firstTokenUs = AquanoxTrace.nowUs()
+          }
           if (event.type !== "tool-call" || event.providerExecuted) return
+          const toolSpanId = `sp_oc_tool_${input.sessionID}_${event.id}`
+          const toolStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
           toolRuns.push({
             call: event,
             fiber: yield* Effect.uninterruptibleMask((restore) =>
-              restore(executeTool(event)).pipe(
-                Effect.flatMap(toolOutput.truncate),
-                Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
-                Effect.catchTag("Tool.Error", (error) =>
-                  publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
-                ),
-              ),
+              Effect.gen(function* () {
+                if (aq && traceEnabled) {
+                  yield* AquanoxTrace.postTraceIngest({
+                    span: {
+                      spanId: toolSpanId,
+                      conversationId: aq.conversationId,
+                      parentSpanId: aq.stepSpanId,
+                      rootSessionId: aq.rootSessionId,
+                      sessionId: input.sessionID,
+                      parentSessionId: aq.parentSessionId,
+                      layer: "opencode",
+                      kind: "tool.call",
+                      name: `tool: ${event.name}`,
+                      status: "running",
+                      startUs: toolStartUs,
+                      model: modelLabel,
+                      thinkingMode: aq.thinkingMode,
+                      agentName: input.agent,
+                      isSubagent: aq.isSubagent,
+                      attributes: { toolName: event.name, toolCallId: event.id },
+                    },
+                  })
+                }
+                let toolStatus: "ok" | "error" | "cancelled" = "ok"
+                const emitToolEnd = (status: "ok" | "error" | "cancelled") => {
+                  if (!aq || !traceEnabled) return Effect.void
+                  const toolEndUs = AquanoxTrace.nowUs()
+                  return AquanoxTrace.postTraceIngest({
+                    span: {
+                      spanId: toolSpanId,
+                      conversationId: aq.conversationId,
+                      parentSpanId: aq.stepSpanId,
+                      rootSessionId: aq.rootSessionId,
+                      sessionId: input.sessionID,
+                      parentSessionId: aq.parentSessionId,
+                      layer: "opencode",
+                      kind: "tool.call",
+                      name: `tool: ${event.name}`,
+                      status,
+                      startUs: toolStartUs,
+                      endUs: toolEndUs,
+                      durationMs: AquanoxTrace.durationMs(toolStartUs, toolEndUs),
+                      model: modelLabel,
+                      thinkingMode: aq.thinkingMode,
+                      agentName: input.agent,
+                      isSubagent: aq.isSubagent,
+                      attributes: { toolName: event.name, toolCallId: event.id },
+                    },
+                  })
+                }
+                yield* restore(executeTool(event)).pipe(
+                  Effect.flatMap(toolOutput.truncate),
+                  Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
+                  Effect.catchTag("Tool.Error", (error) => {
+                    toolStatus = "error"
+                    return publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid)
+                  }),
+                  Effect.onExit((exit) => {
+                    if (Exit.isFailure(exit)) {
+                      return emitToolEnd(Exit.hasInterrupts(exit) ? "cancelled" : "error")
+                    }
+                    return emitToolEnd(toolStatus)
+                  }),
+                )
+              }),
             ).pipe(Effect.forkScoped),
           })
         }),
@@ -234,16 +396,26 @@ export const make = Effect.gen(function* () {
         const record = publisher.record()
         if (record.finish || record.failure) {
           const startSnapshot = yield* Fiber.join(pendingStartSnapshot)
-          const snapshot = yield* snapshots.capture()
-          const files =
-            startSnapshot && snapshot
-              ? startSnapshot === snapshot
-                ? []
-                : yield* snapshots
-                    .files({ from: startSnapshot, to: snapshot })
-                    .pipe(Effect.orElseSucceed(() => undefined))
-              : undefined
+          let snapshot: Snapshot.ID | undefined
+          let files: ReadonlyArray<RelativePath> | undefined
+          if (!sawMutatingTool && startSnapshot) {
+            snapshot = startSnapshot
+            files = []
+            recordCleanSnapshot(input.sessionID, snapshot)
+          } else {
+            snapshot = yield* snapshots.capture()
+            files =
+              startSnapshot && snapshot
+                ? startSnapshot === snapshot
+                  ? []
+                  : yield* snapshots
+                      .files({ from: startSnapshot, to: snapshot })
+                      .pipe(Effect.orElseSucceed(() => undefined))
+                : undefined
+            if (snapshot) recordCleanSnapshot(input.sessionID, snapshot)
+          }
           const usage = record.finish ? SessionUsage.record(record.finish.usage, input.model.cost) : undefined
+          if (usage) latestUsage = usage
           if (record.failure) yield* publisher.publishStepFailure({ ...usage, snapshot, files })
           if (record.finish && usage && !record.failure)
             yield* bus.publish(SessionEvent.Step.Ended, {
@@ -279,6 +451,53 @@ export const make = Effect.gen(function* () {
         const needsContinuation = input.prepared.request.toolChoice?.type !== "none" && record.needsContinuation
         if (record.finish?.finish === "length") return Outcome.OutputLimit({ needsContinuation })
         return Outcome.Completed({ needsContinuation })
+      }),
+    ).pipe(
+      Effect.onExit((exit) => {
+        if (!aq || !traceEnabled) return Effect.void
+        if (AquanoxTrace.getActiveStepSpan(input.sessionID) === aq.stepSpanId) {
+          AquanoxTrace.setActiveStepSpan(input.sessionID, null)
+        }
+        const stepEndUs = AquanoxTrace.nowUs()
+        const metrics = AquanoxTrace.usageMetrics(latestUsage?.tokens, input.model.limit.context)
+        aq.onMetrics?.(metrics)
+        let status: "ok" | "error" | "cancelled" = "ok"
+        if (Exit.isFailure(exit)) {
+          status = Exit.hasInterrupts(exit) ? "cancelled" : "error"
+        } else if (
+          exit.value._tag === "Retry" ||
+          exit.value._tag === "Continue" ||
+          exit.value._tag === "RecoverFull"
+        ) {
+          status = "error"
+        }
+        return AquanoxTrace.postTraceIngest({
+          span: {
+            spanId: aq.stepSpanId,
+            conversationId: aq.conversationId,
+            parentSpanId: aq.parentSpanId,
+            rootSessionId: aq.rootSessionId,
+            sessionId: input.sessionID,
+            parentSessionId: aq.parentSessionId,
+            layer: "opencode",
+            kind: "llm.step",
+            name: `llm step #${aq.stepNumber} (${input.agent})`,
+            status,
+            startUs: stepStartUs,
+            endUs: stepEndUs,
+            durationMs: AquanoxTrace.durationMs(stepStartUs, stepEndUs),
+            model: modelLabel,
+            thinkingMode: aq.thinkingMode,
+            agentName: input.agent,
+            isSubagent: aq.isSubagent,
+            ...metrics,
+            ttftMs: firstTokenUs !== null ? AquanoxTrace.durationMs(stepStartUs, firstTokenUs) : null,
+            attributes: {
+              step: aq.stepNumber,
+              ...(Exit.isSuccess(exit) ? { outcome: exit.value._tag } : {}),
+            },
+          },
+        })
       }),
     )
   }, Effect.scoped)

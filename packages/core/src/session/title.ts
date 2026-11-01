@@ -3,12 +3,13 @@ export * as SessionTitle from "./title.js"
 import { isDeepStrictEqual } from "node:util"
 import { LLMClient, LLMEvent, Message, SystemPart } from "@opencode/ai/effect"
 import type { Agent } from "@opencode/schema/agent"
-import { Context, DateTime, Effect, Layer, Stream } from "effect"
+import { Context, DateTime, Effect, Exit, Layer, Stream } from "effect"
 import { Database } from "../database/database.js"
 import { Bus } from "../bus.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { isExactRootFallback } from "@opencode/util/session-title-fallback"
 import { llmClient } from "../effect/app-node-platform.js"
+import { AquanoxTrace } from "./aquanox-trace.js"
 import { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
@@ -68,18 +69,70 @@ export const layer = Layer.effect(
             })
           : Effect.void,
       )
+      const traceEnabled = AquanoxTrace.isEnabled()
+      const traceHeadersActive =
+        traceEnabled || AquanoxTrace.hasExplicitCorrelation(input.session.id, input.session.metadata)
+      const titleCorr = traceHeadersActive
+        ? yield* AquanoxTrace.resolveSessionCorrelation(store, input.session)
+        : undefined
+      const titleSpanId = traceHeadersActive ? AquanoxTrace.newSpanId("sp_oc_title") : undefined
+      const titleThinkingMode = input.model.ref.variant ?? titleCorr?.thinkingMode ?? null
+      const titleModelLabel = `${input.model.ref.providerID}/${input.model.ref.id}`
+      const titleParentSpanId = titleCorr
+        ? (AquanoxTrace.getActiveTurnSpan(input.session.id) ?? titleCorr.parentTurnSpanId)
+        : null
       const prepared = yield* context.request.title({
         session: input.session,
         agent: input.agent.id,
         model: input.model,
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
         messages: [Message.user(input.text)],
+        ...(String(input.model.ref.providerID) === "deepseek-local"
+          ? { httpBody: { id_slot: 2, reasoning_budget_tokens: 64 } }
+          : {}),
+        ...(titleCorr && titleSpanId
+          ? {
+              aquanox: {
+                conversationId: titleCorr.conversationId,
+                rootSessionId: titleCorr.rootSessionId,
+                parentSpanId: titleSpanId,
+                thinkingMode: titleThinkingMode,
+              },
+            }
+          : {}),
       })
       if (prepared.event.result !== undefined) return prepared.event.result
+      const titleStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
+      let firstTokenUs: number | null = null
+      if (traceEnabled && titleCorr && titleSpanId) {
+        yield* AquanoxTrace.postTraceIngest({
+          span: {
+            spanId: titleSpanId,
+            conversationId: titleCorr.conversationId,
+            parentSpanId: titleParentSpanId,
+            rootSessionId: titleCorr.rootSessionId,
+            sessionId: input.session.id,
+            parentSessionId: titleCorr.parentSessionId,
+            layer: "opencode",
+            kind: "llm.title",
+            name: `title (${input.agent.id})`,
+            status: "running",
+            startUs: titleStartUs,
+            model: titleModelLabel,
+            thinkingMode: titleThinkingMode,
+            agentName: input.agent.id,
+            isSubagent: titleCorr.isSubagent,
+            contextWindowLimit: input.model.limit.context > 0 ? input.model.limit.context : null,
+          },
+        })
+      }
       yield* llm.stream(prepared.request, prepared.options).pipe(
         Stream.runForEach((event) => {
           if (LLMEvent.is.providerError(event)) failed = true
-          if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
+          if (LLMEvent.is.textDelta(event)) {
+            if (traceEnabled && firstTokenUs === null) firstTokenUs = AquanoxTrace.nowUs()
+            chunks.push(event.text)
+          }
           if (LLMEvent.is.stepFinish(event)) {
             const step = SessionUsage.record(event.usage, input.model.cost)
             usage = usage ? SessionUsage.add(usage, step) : step
@@ -92,6 +145,41 @@ export const layer = Layer.effect(
           }),
         ),
         Effect.onInterrupt(() => recordUsage.pipe(Effect.asVoid)),
+        Effect.onExit((exit) => {
+          if (!traceEnabled || !titleCorr || !titleSpanId) return Effect.void
+          const titleEndUs = AquanoxTrace.nowUs()
+          const metrics = AquanoxTrace.usageMetrics(usage?.tokens, input.model.limit.context)
+          const status: "ok" | "error" | "cancelled" = Exit.isFailure(exit)
+            ? Exit.hasInterrupts(exit)
+              ? "cancelled"
+              : "error"
+            : failed
+              ? "error"
+              : "ok"
+          return AquanoxTrace.postTraceIngest({
+            span: {
+              spanId: titleSpanId,
+              conversationId: titleCorr.conversationId,
+              parentSpanId: titleParentSpanId,
+              rootSessionId: titleCorr.rootSessionId,
+              sessionId: input.session.id,
+              parentSessionId: titleCorr.parentSessionId,
+              layer: "opencode",
+              kind: "llm.title",
+              name: `title (${input.agent.id})`,
+              status,
+              startUs: titleStartUs,
+              endUs: titleEndUs,
+              durationMs: AquanoxTrace.durationMs(titleStartUs, titleEndUs),
+              model: titleModelLabel,
+              thinkingMode: titleThinkingMode,
+              agentName: input.agent.id,
+              isSubagent: titleCorr.isSubagent,
+              ...metrics,
+              ttftMs: firstTokenUs !== null ? AquanoxTrace.durationMs(titleStartUs, firstTokenUs) : null,
+            },
+          })
+        }),
       )
       yield* recordUsage
       if (failed) return

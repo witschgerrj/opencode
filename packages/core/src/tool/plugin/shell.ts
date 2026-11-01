@@ -93,6 +93,100 @@ const toolResult = (output: Output) => {
   }
 }
 
+
+export function patchNodeTestCommand(cmd: string): string {
+  if (/\b(?:NODE_V8_COVERAGE|c8|nyc|istanbul)\b/.test(cmd)) return cmd
+  const nodeTestPattern = /(\bnode\b[^\n;|&]*\s--test)(?=\s|$)(?!\s*--test-force-exit)/g
+  return cmd.replace(nodeTestPattern, (_m, p1) => `${p1} --test-force-exit`)
+}
+
+export function foldPassingTapOutput(rawOutput: string, exitCode?: number): string {
+  if (exitCode !== 0) return rawOutput
+  if (rawOutput.length <= 4096) return rawOutput
+  const failureRegex = /\bnot ok\b|\bFAIL(?:ED)?\b|✖|\bERR_[A-Z0-9_]+|AssertionError|Error:/
+  if (failureRegex.test(rawOutput)) return rawOutput
+
+  const lines = rawOutput.split("\n")
+  const isSummaryLine = (line: string) =>
+    /^(?:TAP version\b|1\.\.\d+|[#ℹ] (?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b)/.test(line.trim())
+  const isPassingTestLine = (line: string) =>
+    /^(?:ok \d+ - |[ \t]*✔ )/.test(line)
+
+  type Block = { type: "summary" | "test" | "other"; lines: string[] }
+  const blocks: Block[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (isSummaryLine(line)) {
+      blocks.push({ type: "summary", lines: [line] })
+      i++
+    } else if (isPassingTestLine(line)) {
+      const testLines = [line]
+      i++
+      if (i < lines.length && /^[ \t]*---[ \t]*$/.test(lines[i])) {
+        testLines.push(lines[i])
+        i++
+        while (i < lines.length && !/^[ \t]*\.\.\.[ \t]*$/.test(lines[i])) {
+          testLines.push(lines[i])
+          i++
+        }
+        if (i < lines.length && /^[ \t]*\.\.\.[ \t]*$/.test(lines[i])) {
+          testLines.push(lines[i])
+          i++
+        }
+      }
+      blocks.push({ type: "test", lines: testLines })
+    } else if (/^[ \t]*# Subtest:/.test(line) && i + 1 < lines.length && isPassingTestLine(lines[i + 1])) {
+      const testLines = [line, lines[i + 1]]
+      i += 2
+      if (i < lines.length && /^[ \t]*---[ \t]*$/.test(lines[i])) {
+        testLines.push(lines[i])
+        i++
+        while (i < lines.length && !/^[ \t]*\.\.\.[ \t]*$/.test(lines[i])) {
+          testLines.push(lines[i])
+          i++
+        }
+        if (i < lines.length && /^[ \t]*\.\.\.[ \t]*$/.test(lines[i])) {
+          testLines.push(lines[i])
+          i++
+        }
+      }
+      blocks.push({ type: "test", lines: testLines })
+    } else {
+      blocks.push({ type: "other", lines: [line] })
+      i++
+    }
+  }
+
+  const testIndices: number[] = []
+  for (let idx = 0; idx < blocks.length; idx++) {
+    if (blocks[idx].type === "test") testIndices.push(idx)
+  }
+
+  const KEEP_HEAD = 3
+  const KEEP_TAIL = 3
+  if (testIndices.length <= KEEP_HEAD + KEEP_TAIL) return rawOutput
+
+  const foldIndices = testIndices.slice(KEEP_HEAD, testIndices.length - KEEP_TAIL)
+  const foldedCount = foldIndices.length
+  const foldSet = new Set(foldIndices)
+
+  const resultLines: string[] = []
+  let foldedMarkerInserted = false
+  for (let idx = 0; idx < blocks.length; idx++) {
+    if (foldSet.has(idx)) {
+      if (!foldedMarkerInserted) {
+        resultLines.push(`[Folded ${foldedCount} passing test lines; exit code 0, 0 failures]`)
+        foldedMarkerInserted = true
+      }
+    } else {
+      resultLines.push(...blocks[idx].lines)
+    }
+  }
+
+  return resultLines.join("\n")
+}
+
 const backgroundResult = (shellID: string, file: string) => ({
   output: `Command moved to the background (shell ID: ${shellID}).\nOutput is streaming to: ${file}`,
   shellID,
@@ -198,11 +292,12 @@ export const Plugin = {
           output: Output,
           execute: (input, context) =>
             Effect.gen(function* () {
+              const command = patchNodeTestCommand(input.command)
               const timeout = input.background === true ? (input.timeout ?? 0) : (input.timeout ?? DEFAULT_TIMEOUT_MS)
               let finalTimeout = timeout
               const info = yield* shell.create(
                 {
-                  command: input.command,
+                  command,
                   cwd: input.workdir,
                   timeout,
                   shell: yield* compatibleShell,
@@ -224,11 +319,12 @@ export const Plugin = {
                 const result = yield* shell.result(info)
                 if (!result.capture) return yield* new Shell.NotFoundError({ id: info.id })
                 const output = ShellResult.output(result)
+                const text = output.timeout
+                  ? `${output.output}\n\nCommand exceeded timeout of ${finalTimeout} ms. Retry with a larger timeout if the command is expected to take longer.`
+                  : output.output
                 return {
                   ...output,
-                  output: output.timeout
-                    ? `${output.output}\n\nCommand exceeded timeout of ${finalTimeout} ms. Retry with a larger timeout if the command is expected to take longer.`
-                    : output.output,
+                  output: foldPassingTapOutput(text, output.exit),
                   status: "completed" as const,
                 }
               }).pipe(

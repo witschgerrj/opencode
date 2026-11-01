@@ -9,10 +9,11 @@ import { Location } from "./location.js"
 import { LocationServiceMap } from "./location-service-map.js"
 import { SessionEvent } from "./session/event.js"
 import { SessionExecution } from "./session/execution.js"
+import type { SessionSchema } from "./session/schema.js"
 import { SessionStore } from "./session/store.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 
-const isSessionEvent = Schema.is(SessionEvent.Durable)
+const isSessionEvent = Schema.is(SessionEvent.All)
 
 export class Service extends Context.Service<Service, {}>()("@opencode/LocationActivity") {}
 
@@ -73,18 +74,26 @@ export function layer(options: { readonly timeToLive?: Duration.Input; readonly 
           ),
         )
         if (expired.length === 0) return
-        // Waiting on a question, a long tool call, or a background job emits no durable activity.
-        const owners = [
+        // Waiting on a question, a long tool call, or a foreground/background child job emits no durable activity.
+        const runningJobs = yield* jobs.running ?? jobs.runningBackground
+        const ownerIDs = new Set([
           ...(yield* execution.active),
-          ...(yield* jobs.runningBackground).flatMap((recovery) =>
+          ...runningJobs.flatMap((recovery) =>
             recovery.kind === "shell" ? [recovery.sessionID] : [recovery.childSessionID, recovery.parentSessionID],
           ),
-        ]
-        const occupied = new Set(
-          (yield* Effect.forEach(owners, (sessionID) => sessions.get(sessionID))).flatMap((session) =>
-            session ? [key(session.location)] : [],
-          ),
-        )
+        ])
+        const occupied = new Set<string>()
+        const seenSessions = new Set<string>()
+        for (const sessionID of ownerIDs) {
+          let currentID: SessionSchema.ID | undefined = sessionID
+          while (currentID !== undefined && !seenSessions.has(currentID)) {
+            seenSessions.add(currentID)
+            const session: SessionSchema.Info | undefined = yield* sessions.get(currentID)
+            if (!session) break
+            occupied.add(key(session.location))
+            currentID = session.parentID
+          }
+        }
         yield* Effect.forEach(
           expired,
           (entry) => {

@@ -19,6 +19,7 @@ import {
   PromptConflictError,
   SyntheticConflictError,
 } from "./error.js"
+import { AquanoxTrace } from "./aquanox-trace.js"
 import { SessionEvent } from "./event.js"
 import { SessionExecution } from "./execution.js"
 import { SessionInbox } from "./inbox.js"
@@ -86,7 +87,8 @@ export const make = Effect.fn("Session.make")(function* () {
     sessionID: SessionSchema.ID,
     input: { metadata: SessionSchema.Metadata },
   ) {
-    yield* get(sessionID)
+    const existing = yield* get(sessionID)
+    AquanoxTrace.recordFromMetadata(sessionID, input.metadata, existing.parentID)
     yield* bus.publish(SessionEvent.MetadataUpdated, { sessionID, metadata: input.metadata })
   })
   const setPermissions = Effect.fn("Session.setPermissions")(function* (
@@ -156,6 +158,14 @@ export const make = Effect.fn("Session.make")(function* () {
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const session = yield* get(sessionID)
+        const aquanoxMeta = AquanoxTrace.extractAquanoxMetadata(input.metadata)
+        if (Object.keys(aquanoxMeta).length > 0) {
+          AquanoxTrace.recordFromMetadata(session.id, aquanoxMeta, session.parentID)
+          yield* bus.publish(SessionEvent.MetadataUpdated, {
+            sessionID: session.id,
+            metadata: { ...(session.metadata ?? {}), ...aquanoxMeta },
+          })
+        }
         const messageID = input.id ?? SessionMessage.ID.create()
         const admitted = yield* Effect.gen(function* () {
           const existing = yield* admission.reconcile({

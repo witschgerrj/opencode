@@ -133,6 +133,7 @@ export interface Interface {
   readonly backgroundAll: (input: BackgroundAllInput) => Effect.Effect<Info[]>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
   readonly pendingBackground: Effect.Effect<readonly Background[]>
+  readonly running: Effect.Effect<readonly Recovery[]>
   readonly runningBackground: Effect.Effect<readonly Recovery[]>
   readonly completeBackground: (notificationID: SessionMessage.ID) => Effect.Effect<void>
 }
@@ -450,6 +451,13 @@ export const make = Effect.gen(function* () {
     return recovered
   }).pipe(Effect.withSpan("Job.pendingBackground"))
 
+  const running: Interface["running"] = SynchronizedRef.get(state.jobs).pipe(
+    Effect.map((jobs) =>
+      [...jobs.values()].flatMap((job) => (job.info.status === "running" && job.recovery ? [job.recovery] : [])),
+    ),
+    Effect.withSpan("Job.running"),
+  )
+
   const runningBackground: Interface["runningBackground"] = SynchronizedRef.get(state.jobs).pipe(
     Effect.map((jobs) =>
       [...jobs.values()].flatMap((job) =>
@@ -481,6 +489,7 @@ export const make = Effect.gen(function* () {
     backgroundAll,
     cancel,
     pendingBackground,
+    running,
     runningBackground,
     completeBackground,
   })

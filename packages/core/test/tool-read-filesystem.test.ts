@@ -105,7 +105,7 @@ describe("ReadTool text serialization", () => {
         const result = yield* ReadToolFileSystem.read(current.environment, file, "lines.txt", input.page)
 
         expect(result).toMatchObject(input.output)
-        expect(ReadTool.toModelContent("lines.txt", undefined, result)).toBe(input.model)
+        expect(ReadTool.toModelContent("lines.txt", undefined, result, { lineNumbers: true })).toBe(input.model)
       }),
     )
   })

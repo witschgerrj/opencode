@@ -323,9 +323,7 @@ export const Plugin = {
         if (usePatch) {
           delete event.tools.edit
           delete event.tools.write
-          return
         }
-        delete event.tools.patch
       })
     yield* ctx.session.hook("context", hook)
     yield* ctx.session.hook("compaction", hook)

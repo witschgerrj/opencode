@@ -152,6 +152,13 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
   }
 }
 
+const hasSignedOrEncryptedReasoning = (native: Record<string, unknown> | undefined) =>
+  native !== undefined && ("itemId" in native || "reasoningEncryptedContent" in native || "signature" in native)
+
+const isLocalPlaintextReasoning = (model: Model.Ref, native: Record<string, unknown> | undefined) =>
+  !hasSignedOrEncryptedReasoning(native) &&
+  (String(model.providerID) === "deepseek-local" || (native !== undefined && "reasoningField" in native))
+
 const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
   const sameProvider = message.model.providerID === model.providerID
   const sameModel = sameProvider && message.model.id === model.id
@@ -171,18 +178,34 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
         },
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
-    if (item.type === "reasoning")
-      return reuseProviderMetadata && !reasoningInterrupted
-        ? [
-            {
-              type: "reasoning",
-              text: item.text,
-              providerMetadata: providerMetadata(providerMetadataKey, item.native),
-            },
-          ]
-        : item.text.length > 0
-          ? [{ type: message.error === undefined && !reasoningInterrupted ? "reasoning" : "text", text: item.text }]
+    // For local/plain-text reasoning models (`deepseek-local` / `reasoning_content`), preserve
+    // `{ type: "reasoning" }` across same-model error/interrupted turns so historical `<think>`
+    // prefixes in KV caches (`llama_kv_cache_dsv4`) are never rewritten into plain text.
+    if (item.type === "reasoning") {
+      if (reuseProviderMetadata && !reasoningInterrupted) {
+        return [
+          {
+            type: "reasoning",
+            text: item.text,
+            providerMetadata: providerMetadata(providerMetadataKey, item.native),
+          },
+        ]
+      }
+      if (sameModel && isLocalPlaintextReasoning(model, item.native)) {
+        return item.text.length > 0
+          ? [
+              {
+                type: "reasoning",
+                text: item.text,
+                providerMetadata: providerMetadata(providerMetadataKey, item.native),
+              },
+            ]
           : []
+      }
+      return item.text.length > 0
+        ? [{ type: message.error === undefined && !reasoningInterrupted ? "reasoning" : "text", text: item.text }]
+        : []
+    }
     // Call-side metadata is model-scoped proof of generation (Gemini thought
     // signatures, OpenAI encrypted reasoning): only the producing model may
     // replay it.
