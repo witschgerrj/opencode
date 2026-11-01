@@ -17,6 +17,7 @@ import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
+export const MAX_SUBAGENT_DEPTH = 2
 
 /**
  * When spawning a child sub-agent without an explicit tool-call `model` override or `agent.model`,
@@ -204,11 +205,15 @@ export const Plugin = {
                   )
                 AquanoxTrace.recordFromSession(current)
               }
-              const limit = Config.latest(yield* config.entries(), "experimental")?.subagent_depth ?? 1
-              if (depth >= limit)
-                return yield* new ToolFailure({
-                  message: `Subagent depth limit reached (${limit}). Increase "experimental.subagent_depth" to allow nested subagents.`,
-                })
+              const configuredLimit = Config.latest(yield* config.entries(), "experimental")?.subagent_depth
+              const limit = configuredLimit ?? MAX_SUBAGENT_DEPTH
+              if (depth >= limit) {
+                const message =
+                  limit === MAX_SUBAGENT_DEPTH
+                    ? `Maximum subagent nesting depth (${MAX_SUBAGENT_DEPTH}) reached. Complete this task directly or coordinate with peers via send_message.`
+                    : `Subagent depth limit reached (${limit}). Increase "experimental.subagent_depth" to allow nested subagents.`
+                return yield* new ToolFailure({ message })
+              }
               const agent = yield* agents.resolve(input.agent)
               if (agent === undefined) return yield* new ToolFailure({ message: `Unknown agent: ${input.agent}` })
               if (agent.mode === "primary")

@@ -51,6 +51,7 @@ describe("OptimizePlugin", () => {
     expect(OptimizePlugin.Plugins.map((plugin) => plugin.id)).toEqual([
       "opencode.prompt.openai",
       "opencode.prompt.anthropic",
+      "opencode.prompt.deepseek",
       "opencode.prompt.kimi",
       "opencode.prompt.arcee",
       "opencode.prompt.meta",

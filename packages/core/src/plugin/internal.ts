@@ -77,7 +77,14 @@ import { QuestionTool } from "../tool/plugin/question.js"
 import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
 import { RequestSynthesisTool } from "../tool/plugin/request-synthesis.js"
+import { ArtifactTool } from "../tool/plugin/artifact.js"
+import { HeadlessBrowserTool } from "../tool/plugin/headless-browser.js"
+import { LspTool } from "../tool/plugin/lsp.js"
+import { ManageTaskTool } from "../tool/plugin/manage-task.js"
+import { MemoryTool } from "../tool/plugin/memory.js"
+import { ScheduleTool } from "../tool/plugin/schedule.js"
 import { SendMessageTool } from "../tool/plugin/send-message.js"
+import { SnapshotTool } from "../tool/plugin/snapshot-tool.js"
 import { ShellTool } from "../tool/plugin/shell.js"
 import { SkillTool } from "../tool/plugin/skill.js"
 import { SubagentTool } from "../tool/plugin/subagent.js"
@@ -241,7 +248,14 @@ const pre = [
   QuestionTool.Plugin,
   ReadTool.Plugin,
   RequestSynthesisTool.Plugin,
+  ArtifactTool.Plugin,
+  HeadlessBrowserTool.Plugin,
+  LspTool.Plugin,
+  ManageTaskTool.Plugin,
+  MemoryTool.Plugin,
+  ScheduleTool.Plugin,
   SendMessageTool.Plugin,
+  SnapshotTool.Plugin,
   ShellTool.Plugin,
   SkillTool.Plugin,
   SubagentTool.Plugin,

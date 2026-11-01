@@ -222,7 +222,7 @@ describe("Agent", () => {
     }),
   )
 
-  it.effect("denies the subagent tool for built-in subagents", () =>
+  it.effect("denies subagent for explore while allowing bounded subagent and autonomy tools on general", () =>
     Effect.gen(function* () {
       const agent = yield* Agent.Service
       yield* AgentPlugin.Plugin.effect(
@@ -231,15 +231,22 @@ describe("Agent", () => {
         }),
       )
 
-      yield* Effect.forEach(["general", "explore"], (id) =>
-        Effect.gen(function* () {
-          const info = yield* agent.get(Agent.ID.make(id))
-          if (!info) throw new Error(`expected built-in agent: ${id}`)
-          expect(info.mode).toBe("subagent")
-          expect(info.permissions).toContainEqual({ action: "subagent", resource: "*", effect: "deny" })
-          expect(Permission.evaluate("subagent", "*", info.permissions).effect).toBe("deny")
-        }),
-      )
+      const explore = yield* agent.get(Agent.ID.make("explore"))
+      if (!explore) throw new Error("expected built-in agent: explore")
+      expect(explore.mode).toBe("subagent")
+      expect(explore.permissions).toContainEqual({ action: "subagent", resource: "*", effect: "deny" })
+      expect(Permission.evaluate("subagent", "*", explore.permissions).effect).toBe("deny")
+      for (const action of ["skill", "lsp", "memory", "headless_browser", "manage_task", "snapshot"]) {
+        expect(Permission.evaluate(action, "*", explore.permissions).effect).toBe("allow")
+      }
+
+      const general = yield* agent.get(Agent.ID.make("general"))
+      if (!general) throw new Error("expected built-in agent: general")
+      expect(general.mode).toBe("subagent")
+      expect(Permission.evaluate("subagent", "*", general.permissions).effect).toBe("allow")
+      for (const action of ["manage_task", "snapshot", "memory", "schedule", "lsp", "headless_browser", "render_artifact"]) {
+        expect(Permission.evaluate(action, "*", general.permissions).effect).toBe("allow")
+      }
     }),
   )
 })

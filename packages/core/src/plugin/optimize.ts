@@ -12,6 +12,7 @@ import PROMPT_KIMI from "./system-prompt/kimi.txt"
 import PROMPT_META from "./system-prompt/meta.txt"
 import PROMPT_TRINITY from "./system-prompt/trinity.txt"
 import PROMPT_ANTHROPIC from "./system-prompt/anthropic.txt"
+import PROMPT_DEEPSEEK from "./system-prompt/deepseek.txt"
 
 export const OpenAIPlugin = make("opencode.prompt.openai", (model) => {
   const id = model.id.toLowerCase()
@@ -26,6 +27,12 @@ export const AnthropicPlugin = make(
     if (!id.includes("claude")) return undefined
     return PROMPT_ANTHROPIC
   },
+  "append",
+)
+
+export const DeepSeekPlugin = make(
+  "opencode.prompt.deepseek",
+  (model) => (model.id.toLowerCase().includes("deepseek") ? PROMPT_DEEPSEEK : undefined),
   "append",
 )
 
@@ -59,7 +66,7 @@ export const MetaPlugin = make("opencode.prompt.meta", (model) => {
   return PROMPT_META.replaceAll("{{MODEL_NAME}}", model.name)
 })
 
-export const Plugins = [OpenAIPlugin, AnthropicPlugin, KimiPlugin, ArceePlugin, MetaPlugin] as const
+export const Plugins = [OpenAIPlugin, AnthropicPlugin, DeepSeekPlugin, KimiPlugin, ArceePlugin, MetaPlugin] as const
 
 const models = new WeakMap<SessionHooks["context"], Model.Info>()
 

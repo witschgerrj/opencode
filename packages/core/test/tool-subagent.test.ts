@@ -318,7 +318,7 @@ describe("SubagentTool", () => {
     ),
   )
 
-  it.live("prevents subagents from launching subagents by default", () =>
+  it.live("prevents subagents from launching subagents beyond MAX_SUBAGENT_DEPTH by default", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
@@ -329,13 +329,14 @@ describe("SubagentTool", () => {
           const sessions = yield* Session.Service
           const root = yield* sessions.create({ location })
           const parent = yield* sessions.create({ parentID: root.id, title: "parent" })
-          yield* withSubagent(parent.location)
+          const child = yield* sessions.create({ parentID: parent.id, title: "child" })
+          yield* withSubagent(child.location)
           const locations = yield* LocationServiceMap.Service
-          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(child.location)))
 
           expect(
             yield* executeTool(registry, {
-              sessionID: parent.id,
+              sessionID: child.id,
               ...toolIdentity,
               call: {
                 type: "tool-call",
@@ -348,10 +349,10 @@ describe("SubagentTool", () => {
             status: "error",
             error: {
               type: "tool.execution",
-              message: expect.stringContaining("Subagent depth limit reached (1)"),
+              message: expect.stringContaining("Maximum subagent nesting depth (2) reached"),
             },
           })
-          expect((yield* sessions.list({ parentID: parent.id })).data).toHaveLength(0)
+          expect((yield* sessions.list({ parentID: child.id })).data).toHaveLength(0)
         }),
       ),
     ),

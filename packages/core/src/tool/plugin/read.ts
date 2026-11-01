@@ -1,4 +1,10 @@
 import { createHash } from "crypto"
+import nodeFs from "node:fs"
+import nodeFsp from "node:fs/promises"
+import os from "os"
+import { execFile } from "child_process"
+import { promisify } from "util"
+const execFileAsync = promisify(execFile)
 export * as ReadTool from "./read.js"
 
 import type { Context } from "@opencode/plugin/effect/plugin"
@@ -13,6 +19,8 @@ import { AbsolutePath } from "../../schema.js"
 import { ReadToolFileSystem } from "../read-filesystem.js"
 import { Environment } from "../../environment/index.js"
 import { Tool } from "../../tool.js"
+import { Session } from "../../session.js"
+import { Model } from "../../model.js"
 
 export const name = "read"
 const FILENAME = "AGENTS.md"
@@ -28,6 +36,9 @@ const BatchItemStruct = Schema.Struct({
   }),
   force: Schema.optional(Schema.Boolean).annotate({
     description: "Bypass duplicate-slice session deduplication cache (default: false)",
+  }),
+  pages: Schema.optionalKey(Schema.String).annotate({
+    description: "Optional 1-based page range when reading PDF files (e.g. '1-4' or '2,3'). Defaults to '1-4'.",
   }),
 })
 
@@ -57,6 +68,9 @@ export const Input = Schema.Struct({
   }),
   batch: Schema.optional(Schema.Array(BatchItem)).annotate({
     description: "Batch of files or directories to read concurrently",
+  }),
+  pages: Schema.optionalKey(Schema.String).annotate({
+    description: "Optional 1-based page range when reading PDF files (e.g. '1-4' or '2,3'). Defaults to '1-4'.",
   }),
 })
 
@@ -112,6 +126,32 @@ class SessionReadDedupCache {
 
 export const sessionReadDedupCache = new SessionReadDedupCache()
 
+export function parsePdfPages(pagesStr?: string): { first: number; last: number } {
+  if (!pagesStr || typeof pagesStr !== "string" || pagesStr.trim().length === 0) {
+    return { first: 1, last: 4 }
+  }
+  const trimmed = pagesStr.trim()
+  const rangeMatch = /^(\d+)\s*[-–—]\s*(\d+)$/.exec(trimmed)
+  if (rangeMatch) {
+    const f = Math.max(1, parseInt(rangeMatch[1], 10))
+    const l = Math.max(f, parseInt(rangeMatch[2], 10))
+    return { first: f, last: l }
+  }
+  const commaMatch = /^(\d+)\s*,\s*(\d+)$/.exec(trimmed)
+  if (commaMatch) {
+    const p1 = Math.max(1, parseInt(commaMatch[1], 10))
+    const p2 = Math.max(1, parseInt(commaMatch[2], 10))
+    return { first: Math.min(p1, p2), last: Math.max(p1, p2) }
+  }
+  const singleMatch = /^(\d+)$/.exec(trimmed)
+  if (singleMatch) {
+    const p = Math.max(1, parseInt(singleMatch[1], 10))
+    return { first: p, last: p }
+  }
+  return { first: 1, last: 4 }
+}
+
+
 export const Plugin = {
   id: "opencode.tool.read",
   effect: Effect.fn("ReadTool.Plugin")(function* (ctx: Context) {
@@ -120,6 +160,127 @@ export const Plugin = {
     const sessionInstructions = yield* SessionInstructions.Service
     const fs = yield* FSUtil.Service
     const location = yield* Location.Service
+
+    const renderPdfBridge = (
+      targetPath: string,
+      absolutePath: string | undefined,
+      pagesArg?: string,
+      sessionID?: string,
+    ): Effect.Effect<Tool.Content[] | undefined> =>
+      Effect.gen(function* () {
+        if (!absolutePath || !nodeFs.existsSync(absolutePath)) return undefined
+        const hasPdftotext = nodeFs.existsSync("/usr/bin/pdftotext")
+        const hasPdftoppm = nodeFs.existsSync("/usr/bin/pdftoppm")
+        if (!hasPdftotext && !hasPdftoppm) return undefined
+
+        let nativePdf = false
+        let supportsImage = true
+        if (sessionID) {
+          const sessionService = yield* Effect.serviceOption(Session.Service)
+          if (sessionService._tag === "Some") {
+            const session = yield* sessionService.value
+              .get(Session.ID.make(sessionID))
+              .pipe(Effect.orElseSucceed(() => undefined))
+            if (session && session.model) {
+              let capabilities: Model.Capabilities | undefined
+              const modelService = yield* Effect.serviceOption(Model.Service)
+              if (modelService._tag === "Some") {
+                const available = yield* modelService.value.available().pipe(Effect.orElseSucceed(() => []))
+                const info = available.find(
+                  (m) => m.providerID === session.model?.providerID && m.id === session.model?.id,
+                )
+                capabilities = info?.capabilities
+              }
+              if (!capabilities) {
+                const listed = yield* ctx.model.list().pipe(Effect.orElseSucceed(() => ({ data: [] })))
+                const info = listed.data.find(
+                  (m) => m.providerID === session.model?.providerID && m.id === session.model?.id,
+                )
+                capabilities = info?.capabilities
+              }
+              if (capabilities?.input && Array.isArray(capabilities.input)) {
+                if (capabilities.input.includes("pdf")) {
+                  nativePdf = true
+                }
+                supportsImage = capabilities.input.includes("image")
+              }
+            }
+          }
+        }
+
+        if (nativePdf) return undefined
+
+        const { first, last } = parsePdfPages(pagesArg)
+        const endPage = Math.min(last, first + 3)
+
+        let extractedText = ""
+        if (hasPdftotext) {
+          extractedText = yield* Effect.promise(async () => {
+            try {
+              const { stdout } = await execFileAsync("/usr/bin/pdftotext", [
+                "-f",
+                String(first),
+                "-l",
+                String(endPage),
+                "-layout",
+                absolutePath,
+                "-",
+              ], { maxBuffer: 10 * 1024 * 1024 })
+              return stdout.slice(0, 32768)
+            } catch {
+              return ""
+            }
+          })
+        }
+
+        const renderedImages: Array<{ pageNum: number; base64: string }> = []
+        if (hasPdftoppm && supportsImage) {
+          const images = yield* Effect.promise(async () => {
+            const tempDir = await nodeFsp.mkdtemp(join(os.tmpdir(), "opencode-pdf-render-"))
+            const imgs: Array<{ pageNum: number; base64: string }> = []
+            try {
+              await execFileAsync("/usr/bin/pdftoppm", [
+                "-png",
+                "-r",
+                "144",
+                "-f",
+                String(first),
+                "-l",
+                String(endPage),
+                absolutePath,
+                join(tempDir, "page"),
+              ])
+              const files = await nodeFsp.readdir(tempDir)
+              const pngFiles = files.filter((f) => f.endsWith(".png")).sort()
+              for (let i = 0; i < pngFiles.length && i < 4; i++) {
+                const pngPath = join(tempDir, pngFiles[i]!)
+                const data = await nodeFsp.readFile(pngPath)
+                imgs.push({ pageNum: first + i, base64: data.toString("base64") })
+              }
+            } catch {
+              // Ignore ppm errors
+            } finally {
+              await nodeFsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+            }
+            return imgs
+          })
+          renderedImages.push(...images)
+        }
+
+        if (extractedText.length === 0 && renderedImages.length === 0) return undefined
+
+        const header = `PDF text preview (${basename(targetPath)}, pages ${first}-${endPage}):\n\n${extractedText.trim().length > 0 ? extractedText.trim() : "(No extractable text found on these pages)"}`
+        const result: Tool.Content[] = [
+          { type: "text", text: header },
+          ...renderedImages.map((img) => ({
+            type: "file" as const,
+            uri: `data:image/png;base64,${img.base64}`,
+            mime: "image/png" as const,
+            name: `${basename(targetPath)}-page-${img.pageNum}.png`,
+          })),
+        ]
+        return result
+      })
 
     yield* ctx.tool
       .transform((editor) =>
@@ -213,7 +374,7 @@ export const Plugin = {
                 }
                 const itemPath = item.filePath ?? item.path
                 if (!itemPath) throw new Error("batch item missing filePath or path")
-                return { path: itemPath, offset: item.offset, limit: item.limit, force: item.force }
+                return { path: itemPath, offset: item.offset, limit: item.limit, force: item.force, pages: item.pages }
               }
 
               if (input.batch && input.batch.length > 0) {
@@ -228,6 +389,18 @@ export const Plugin = {
                 const contents: Tool.Content[] = []
                 for (const r of results) {
                   const itemObj = items.find((it) => it.path === r.path)
+                  if (r.output.type === "file" && r.output.mime === "application/pdf") {
+                    const bridgeContent = yield* renderPdfBridge(
+                      r.path,
+                      (r as any).target?.absolute,
+                      itemObj?.pages ?? input.pages,
+                      context.sessionID,
+                    ).pipe(Effect.orElseSucceed(() => undefined))
+                    if (bridgeContent) {
+                      contents.push(...bridgeContent)
+                      continue
+                    }
+                  }
                   const mc = toModelContent(r.path, r.offset, r.output, {
                     lineNumbers: input.lineNumbers,
                     compact: input.compact,
@@ -255,6 +428,21 @@ export const Plugin = {
               }
 
               const result = yield* executeSingle(targetPath, input.offset, input.limit)
+              if (result.output.type === "file" && result.output.mime === "application/pdf") {
+                const bridgeContent = yield* renderPdfBridge(
+                  result.path,
+                  result.target?.absolute,
+                  input.pages,
+                  context.sessionID,
+                ).pipe(Effect.orElseSucceed(() => undefined))
+                if (bridgeContent) {
+                  return {
+                    output: result.output,
+                    content: bridgeContent,
+                    metadata: { truncated: false },
+                  }
+                }
+              }
               return {
                 output: result.output,
                 content: toModelContent(result.path, input.offset, result.output, {

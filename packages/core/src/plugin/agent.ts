@@ -8,7 +8,7 @@ const PROMPT_EXPLORE = `You are a file search specialist. You excel at thoroughl
 
 Guidelines:
 - Your role is EXCLUSIVELY to search and analyze
-- Shell execution is disabled; use native glob, grep, and read tools exclusively
+- Shell execution is disabled; use native glob, grep, read, lsp (symbols/definition/references/hover/diagnostics), skill, memory, and headless_browser tools exclusively
 - Parallelize independent tool calls for searches and reads whenever possible, and use read with batch and compact: true for fast multi-file discovery
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths with exact line ranges in your final response
@@ -69,9 +69,15 @@ export const Plugin = define({
         item.mode = "subagent"
         item.permissions.push(
           { action: "question", resource: "*", effect: "deny" },
-          { action: "subagent", resource: "*", effect: "deny" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
           { action: "send_message", resource: "*", effect: "allow" },
+          { action: "lsp", resource: "*", effect: "allow" },
+          { action: "memory", resource: "*", effect: "allow" },
+          { action: "headless_browser", resource: "*", effect: "allow" },
+          { action: "manage_task", resource: "*", effect: "allow" },
+          { action: "snapshot", resource: "*", effect: "allow" },
+          { action: "schedule", resource: "*", effect: "allow" },
+          { action: "render_artifact", resource: "*", effect: "allow" },
         )
       })
 
@@ -94,6 +100,14 @@ export const Plugin = define({
           { action: "read", resource: "*.env.example", effect: "allow" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
           { action: "send_message", resource: "*", effect: "allow" },
+          { action: "skill", resource: "*", effect: "allow" },
+          { action: "lsp", resource: "*", effect: "allow" },
+          { action: "memory", resource: "*", effect: "allow" },
+          { action: "headless_browser", resource: "*", effect: "allow" },
+          { action: "manage_task", resource: "*", effect: "allow" },
+          { action: "snapshot", resource: "*", effect: "allow" },
+          { action: "opencode_models", resource: "*", effect: "allow" },
+          { action: "opencode_worktree_list", resource: "*", effect: "allow" },
           { action: "subagent", resource: "*", effect: "deny" },
           { action: "external_directory", resource: "*", effect: "allow" },
         )
