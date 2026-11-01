@@ -17,7 +17,7 @@ import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
-export const MAX_SUBAGENT_DEPTH = 2
+export const MAX_SUBAGENT_DEPTH = 3
 
 /**
  * When spawning a child sub-agent without an explicit tool-call `model` override or `agent.model`,
@@ -265,12 +265,44 @@ export const Plugin = {
               }
 
               const availableModels = yield* models.available()
-              const model =
-                override ?? agent.model ?? bindChildSubagentModel(parent.model, availableModels)
+              let resolvedModel: Model.Ref | undefined
+              if (override !== undefined) {
+                resolvedModel = override
+              } else if (agent.model !== undefined) {
+                const isAgentModelAvailable = availableModels.some(
+                  (m) => m.providerID === agent.model!.providerID && m.id === agent.model!.id,
+                )
+                if (!isAgentModelAvailable) {
+                  // Fall back automatically when agent.model points to an unavailable provider/model
+                  resolvedModel = bindChildSubagentModel(parent.model, availableModels)
+                } else if (String(agent.model.providerID) === "deepseek-local" && agent.model.variant === undefined) {
+                  // Upgrade deepseek-local without variant so #subagent-high applies
+                  resolvedModel = bindChildSubagentModel(agent.model, availableModels)
+                } else {
+                  resolvedModel = agent.model
+                }
+              } else {
+                resolvedModel = bindChildSubagentModel(parent.model, availableModels)
+              }
+
+              const model = resolvedModel
               const isDeepSeekLocal = model !== undefined && String(model.providerID) === "deepseek-local"
-              const sharesParentSystemPrefix = String(agent.id) === String(parent.agent)
+
+              const childCatalog = isDeepSeekLocal
+                ? availableModels.find((m) => m.providerID === model?.providerID && m.id === model?.id)
+                : undefined
+              const childVariant = childCatalog?.variants.find((v) => v.id === model?.variant)
+              // SAFETY: variant body and settings may contain custom configuration
+              const childVarBody = childVariant?.body as Record<string, unknown> | undefined
+              const childVarKwargs = childVarBody?.chat_template_kwargs as Record<string, unknown> | undefined
+              const childVarSettings = childVariant?.settings as Record<string, unknown> | undefined
+              const childHasExplicitBudget =
+                childVarKwargs?.reasoning_effort !== undefined ||
+                (typeof childVarSettings?.reasoningEffort === "string" && childVarSettings.reasoningEffort.length > 0) ||
+                typeof childVarBody?.reasoning_budget_tokens === "number"
+
               const inheritedReasoningEffort =
-                isDeepSeekLocal && sharesParentSystemPrefix
+                isDeepSeekLocal && !childHasExplicitBudget
                   ? resolveParentReasoningEffort(parent, availableModels)
                   : undefined
 
@@ -410,10 +442,16 @@ export const Plugin = {
                   return backgroundResult(child.id)
                 }
 
+                SessionSlotLease.release(context.sessionID)
                 const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
                   Effect.onInterrupt(() =>
                     Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
                       discard: true,
+                    }),
+                  ),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      SessionSlotLease.acquire(context.sessionID, Boolean(parent.parentID))
                     }),
                   ),
                 )

@@ -276,6 +276,10 @@ export const Input = Schema.Struct({
   fullPage: Schema.Boolean.annotate({
     description: "Whether screenshot should capture the entire scrollable page height (default: false).",
   }).pipe(optional),
+  keyframesMs: Schema.Array(NonNegativeInt).annotate({
+    description:
+      "Optional list of timestamps in ms (e.g. [0, 250, 500, 1000], max 8) to capture a multi-frame PNG sequence for visual motion verification.",
+  }).pipe(optional),
 })
 export type Input = typeof Input.Type
 
@@ -397,12 +401,42 @@ export const Plugin = {
                   const sid = sId || sessionId
 
                   if (input.action === "render_html") {
-                    // Abort all network requests to guarantee 100% air-gapped sandboxing
+                    // Air-gapped sandboxing with offline local bundle support
                     if (
                       !reqUrl.startsWith("data:") &&
                       !reqUrl.startsWith("blob:") &&
                       !reqUrl.startsWith("about:")
                     ) {
+                      let matchedLib: string | undefined
+                      for (const libName of ["three.min.js", "three.module.js", "gsap.min.js"]) {
+                        if (reqUrl.endsWith(`/__local_lib__/${libName}`) || reqUrl.endsWith(`/${libName}`)) {
+                          matchedLib = libName
+                          break
+                        }
+                      }
+                      if (matchedLib) {
+                        const libPath = path.join("/usr/local/share/aquanox-web-libs", matchedLib)
+                        if (fs.existsSync(libPath)) {
+                          try {
+                            const buf = fs.readFileSync(libPath)
+                            await client.send(
+                              "Fetch.fulfillRequest",
+                              {
+                                requestId: params.requestId,
+                                responseCode: 200,
+                                responseHeaders: [
+                                  { name: "Content-Type", value: "application/javascript; charset=utf-8" },
+                                ],
+                                body: buf.toString("base64"),
+                              },
+                              sid,
+                            )
+                            return
+                          } catch {
+                            // ignore and proceed to block
+                          }
+                        }
+                      }
                       await client.send(
                         "Fetch.failRequest",
                         { requestId: params.requestId, errorReason: "BlockedByClient" },
@@ -480,7 +514,16 @@ export const Plugin = {
                   )
                 }
 
-                const waitMs = Math.min(10000, Math.max(0, input.waitMs ?? 500))
+                const sortedKeyframes =
+                  input.keyframesMs && input.keyframesMs.length > 0
+                    ? [...new Set(input.keyframesMs)]
+                        .map((t) => Math.min(15000, Math.max(0, t)))
+                        .sort((a, b) => a - b)
+                        .slice(0, 8)
+                    : []
+
+                const defaultWait = sortedKeyframes.length > 0 ? 0 : 500
+                const waitMs = Math.min(10000, Math.max(0, input.waitMs ?? defaultWait))
                 if (waitMs > 0) {
                   yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, waitMs)))
                 }
@@ -610,20 +653,48 @@ export const Plugin = {
                   interactiveElements: [],
                 }
 
-                // Screenshot
-                let screenshotBase64: string | undefined
+                // Screenshot(s)
+                const capturedFrames: Array<{ name: string; base64: string }> = []
                 if (input.screenshot !== false) {
-                  const shot = yield* Effect.tryPromise(() =>
-                    client.send(
-                      "Page.captureScreenshot",
-                      {
-                        format: "png",
-                        captureBeyondViewport: Boolean(input.fullPage),
-                      },
-                      sessionId,
-                    ),
-                  )
-                  screenshotBase64 = shot.data
+                  if (sortedKeyframes.length > 0) {
+                    let elapsed = 0
+                    for (const t of sortedKeyframes) {
+                      const delta = Math.max(0, t - elapsed)
+                      if (delta > 0) {
+                        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, delta)))
+                        elapsed += delta
+                      }
+                      const shot = yield* Effect.tryPromise(() =>
+                        client.send(
+                          "Page.captureScreenshot",
+                          {
+                            format: "png",
+                            captureBeyondViewport: Boolean(input.fullPage),
+                          },
+                          sessionId,
+                        ),
+                      )
+                      capturedFrames.push({
+                        name: `browser-frame-${t}ms.png`,
+                        base64: shot.data,
+                      })
+                    }
+                  } else {
+                    const shot = yield* Effect.tryPromise(() =>
+                      client.send(
+                        "Page.captureScreenshot",
+                        {
+                          format: "png",
+                          captureBeyondViewport: Boolean(input.fullPage),
+                        },
+                        sessionId,
+                      ),
+                    )
+                    capturedFrames.push({
+                      name: "browser-screenshot.png",
+                      base64: shot.data,
+                    })
+                  }
                 }
 
                 const out: Output = {
@@ -634,7 +705,7 @@ export const Plugin = {
                   headings: extracted.headings,
                   interactiveElements: extracted.interactiveElements,
                   consoleErrors,
-                  screenshotCaptured: Boolean(screenshotBase64),
+                  screenshotCaptured: capturedFrames.length > 0,
                 }
 
                 const lines = [
@@ -660,13 +731,16 @@ export const Plugin = {
                   ...(out.textPreview ? ["\n#### Text Preview:", out.textPreview] : []),
                 ]
 
-                const content: any[] = [{ type: "text", text: lines.join("\n") }]
-                if (screenshotBase64) {
+                type ContentPart =
+                  | { type: "text"; text: string }
+                  | { type: "file"; uri: string; mime: string; name: string }
+                const content: ContentPart[] = [{ type: "text", text: lines.join("\n") }]
+                for (const frame of capturedFrames) {
                   content.push({
                     type: "file",
-                    uri: `data:image/png;base64,${screenshotBase64}`,
+                    uri: `data:image/png;base64,${frame.base64}`,
                     mime: "image/png",
-                    name: "browser-screenshot.png",
+                    name: frame.name,
                   })
                 }
 

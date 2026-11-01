@@ -928,7 +928,7 @@ export const layer = Layer.effect(
           typeof defaultBody === "object" &&
           defaultBody !== null &&
           "reasoning_budget_tokens" in defaultBody)
-      return requests.compaction({
+      const compactionEffect = requests.compaction({
         session: context.session,
         agent: context.agent.id,
         model: context.model,
@@ -959,6 +959,11 @@ export const layer = Layer.effect(
             }
           : {}),
       })
+      return localSlotBudgeted
+        ? compactionEffect.pipe(
+            Effect.ensuring(Effect.sync(() => SessionSlotLease.release(context.session.id))),
+          )
+        : compactionEffect
     }
 
     /** A request hook supplied the summary itself, so no model call happens. */

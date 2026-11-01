@@ -139,6 +139,9 @@ const unsupportedMedia = (
       ? mime
       : undefined
   if (!unsupported) return
+  if (modality === "video" || modality === "audio") {
+    return `[Attached deliverable: ${name ?? modality} (${mime})]`
+  }
   return `ERROR: Cannot read ${name ? `"${name}"` : modality} (this model does not support ${unsupported} input). Inform the user.`
 }
 

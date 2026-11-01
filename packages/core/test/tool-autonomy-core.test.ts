@@ -28,7 +28,9 @@ import { FileAccess } from "@opencode/core/file-access"
 import { Image } from "@opencode/core/image"
 import { SessionInstructions } from "@opencode/core/session/instructions"
 import { FSUtil } from "@opencode/util/fs-util"
-import { MAX_SUBAGENT_DEPTH } from "@opencode/core/tool/plugin/subagent"
+import { MAX_SUBAGENT_DEPTH, bindChildSubagentModel } from "@opencode/core/tool/plugin/subagent"
+import { ConfigAgentPlugin } from "@opencode/core/config/plugin/agent"
+import { SessionSlotLease } from "@opencode/core/session/slot-lease"
 import { OptimizePlugin, DeepSeekPlugin } from "@opencode/core/plugin/optimize"
 import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
@@ -753,8 +755,8 @@ startxref
 })
 
 describe("Deliverable 6: SubagentTool Bounded Depth", () => {
-  test("exports MAX_SUBAGENT_DEPTH as 2", () => {
-    expect(MAX_SUBAGENT_DEPTH).toBe(2)
+  test("exports MAX_SUBAGENT_DEPTH as 3", () => {
+    expect(MAX_SUBAGENT_DEPTH).toBe(3)
   })
 })
 
@@ -762,5 +764,141 @@ describe("Deliverable 7: DeepSeek Autonomous Prompt Optimizer", () => {
   test("OptimizePlugin.Plugins contains DeepSeekPlugin with autonomous instructions", () => {
     expect(OptimizePlugin.Plugins.some((p) => p.id === "opencode.prompt.deepseek")).toBe(true)
     expect(DeepSeekPlugin.id).toBe("opencode.prompt.deepseek")
+  })
+})
+
+describe("Deliverable 8: Portable Agent Frontmatter & ID Normalization", () => {
+  test("normalizes nested <dir>/agent.md to directory name and translates tools array", () => {
+    const yaml = `---
+name: master-animator
+description: Master animator agent
+model: anthropic/claude-3-7-sonnet
+tools:
+  - run_command
+  - view_file
+  - write_file
+  - edit_file
+inheritCustomizations: true
+inheritMcp: false
+---
+You are the master animator.`
+
+    const doc = Effect.runSync(
+      ConfigAgentPlugin.decode(
+        {
+          directory: "/home/rjwits/.agents/agents",
+          filepath: "/home/rjwits/.agents/agents/master-animator/agent.md",
+          primary: false,
+        },
+        yaml,
+      ),
+    )
+
+    expect(doc).toBeDefined()
+    expect(Object.keys(doc!.info.agents ?? {})).toEqual(["master-animator"])
+    const agent = doc!.info.agents!["master-animator"]
+    expect(agent.description).toBe("Master animator agent")
+    expect(agent.permissions).toBeDefined()
+
+    const actions = (agent.permissions ?? []).map((r) => `${r.action}:${r.effect}`)
+    expect(actions).toContain("shell:allow")
+    expect(actions).toContain("read:allow")
+    expect(actions).toContain("write:allow")
+    expect(actions).toContain("edit:allow")
+    expect(actions).toContain("patch:allow")
+    expect(actions).toContain("skill:allow")
+    expect(actions).toContain("lsp:allow")
+    expect(actions).toContain("memory:allow")
+    expect(actions).toContain("headless_browser:allow")
+    expect(actions).toContain("render_artifact:allow")
+  })
+
+  test("explicitly denies mutating tools when omitted in read-only agents", () => {
+    const yaml = `---
+description: Read-only reviewer
+tools:
+  - view_file
+  - search_web
+---
+Inspect code without mutations.`
+
+    const doc = Effect.runSync(
+      ConfigAgentPlugin.decode(
+        {
+          directory: "/workspace/.agents/agents",
+          filepath: "/workspace/.agents/agents/reviewer/AGENT.MD",
+          primary: false,
+        },
+        yaml,
+      ),
+    )
+
+    expect(doc).toBeDefined()
+    expect(Object.keys(doc!.info.agents ?? {})).toEqual(["reviewer"])
+    const agent = doc!.info.agents!["reviewer"]
+    const actions = (agent.permissions ?? []).map((r) => `${r.action}:${r.effect}`)
+
+    expect(actions).toContain("read:allow")
+    expect(actions).toContain("websearch:allow")
+    expect(actions).toContain("shell:deny")
+    expect(actions).toContain("write:deny")
+    expect(actions).toContain("edit:deny")
+    expect(actions).toContain("patch:deny")
+  })
+})
+
+describe("Deliverable 9: Subagent DeepSeek Optimizations & Slot Lease Yielding", () => {
+  test("bindChildSubagentModel upgrades plain deepseek-local to #subagent-high", () => {
+    const catalog = [
+      {
+        providerID: Provider.ID.make("deepseek-local"),
+        id: Model.ID.make("deepseek-chat"),
+        name: "DeepSeek Chat",
+        variants: [
+          { id: Model.VariantID.make("subagent-high") },
+          { id: Model.VariantID.make("high") },
+          { id: Model.VariantID.make("max") },
+        ],
+      } as any,
+    ]
+
+    const plain = Model.Ref.make({
+      providerID: Provider.ID.make("deepseek-local"),
+      id: Model.ID.make("deepseek-chat"),
+    })
+
+    const upgraded = bindChildSubagentModel(plain, catalog)
+    expect(upgraded).toBeDefined()
+    expect(String(upgraded!.providerID)).toBe("deepseek-local")
+    expect(String(upgraded!.variant)).toBe("subagent-high")
+  })
+
+  test("SessionSlotLease yields slot during synchronous wait and re-acquires", () => {
+    SessionSlotLease.reset()
+    const parentSession = "ses_test_parent"
+    const childSession = "ses_test_child"
+
+    const parentSlot = SessionSlotLease.acquire(parentSession, false)
+    expect(parentSlot).toBe(0)
+    expect(SessionSlotLease.activeCount(0)).toBe(1)
+
+    // Yield slot before jobs.block
+    SessionSlotLease.release(parentSession)
+    expect(SessionSlotLease.activeCount(0)).toBe(0)
+
+    // Child acquires its subagent slot
+    const childSlot = SessionSlotLease.acquire(childSession, true)
+    expect(childSlot).toBe(1)
+    expect(SessionSlotLease.activeCount(1)).toBe(1)
+
+    // Child finishes
+    SessionSlotLease.release(childSession)
+    expect(SessionSlotLease.activeCount(1)).toBe(0)
+
+    // Parent re-acquires its sticky slot
+    const reacquired = SessionSlotLease.acquire(parentSession, false)
+    expect(reacquired).toBe(0)
+    expect(SessionSlotLease.activeCount(0)).toBe(1)
+    SessionSlotLease.release(parentSession)
   })
 })

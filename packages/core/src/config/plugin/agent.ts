@@ -137,7 +137,7 @@ function isAgentSource(entries: Entry[], file: string) {
   )
 }
 
-function expandPermissions(rules: Permission.Ruleset, home: string): Permission.Ruleset {
+export function expandPermissions(rules: Permission.Ruleset, home: string): Permission.Ruleset {
   // Expand only resources tools resolve as filesystem paths. Bash resources are raw shell text:
   // rewriting `$HOME/private/**` would miss `$HOME/private/key`, and safe expansion needs shell-aware parsing.
   return rules.map((rule) =>
@@ -173,19 +173,110 @@ function discover(fs: FSUtil.Interface, directory: string) {
   )
 }
 
-const decode = Effect.fnUntraced(function* (
+const toolMapping: Record<string, readonly string[]> = {
+  run_command: ["shell"],
+  bash: ["shell"],
+  shell: ["shell"],
+  view_file: ["read"],
+  read: ["read"],
+  write_file: ["write"],
+  write: ["write"],
+  edit_file: ["edit", "patch"],
+  edit: ["edit", "patch"],
+  patch: ["patch"],
+  invoke_subagent: ["subagent"],
+  subagent: ["subagent"],
+  search_web: ["websearch"],
+  websearch: ["websearch"],
+  read_url_content: ["webfetch"],
+  webfetch: ["webfetch"],
+  send_message: ["send_message"],
+  manage_task: ["manage_task"],
+  schedule: ["schedule"],
+}
+
+const standardAutonomousTools: readonly string[] = [
+  "skill",
+  "lsp",
+  "memory",
+  "headless_browser",
+  "render_artifact",
+  "request_synthesis",
+  "snapshot",
+  "external_directory",
+]
+
+export function translateToolsArrayToRuleset(tools: readonly string[]): Permission.Ruleset {
+  const allowedActions = new Set<string>()
+  for (const tool of tools) {
+    const mapped = toolMapping[tool]
+    if (mapped) {
+      for (const action of mapped) allowedActions.add(action)
+    } else {
+      allowedActions.add(tool)
+    }
+  }
+
+  const rules: Permission.Rule[] = []
+  for (const action of allowedActions) {
+    rules.push({ action, resource: "*", effect: "allow" })
+  }
+  for (const action of standardAutonomousTools) {
+    if (!allowedActions.has(action)) {
+      rules.push({ action, resource: "*", effect: "allow" })
+    }
+  }
+
+  const hasShell = tools.includes("run_command") || tools.includes("bash") || tools.includes("shell")
+  const hasWrite = tools.includes("write_file") || tools.includes("write")
+  const hasEdit = tools.includes("edit_file") || tools.includes("edit")
+
+  if (!hasShell) {
+    rules.push({ action: "shell", resource: "*", effect: "deny" })
+  }
+  if (!hasWrite) {
+    rules.push({ action: "write", resource: "*", effect: "deny" })
+  }
+  if (!hasEdit) {
+    rules.push({ action: "edit", resource: "*", effect: "deny" })
+    rules.push({ action: "patch", resource: "*", effect: "deny" })
+  }
+
+  return rules
+}
+
+const ignoredExtraKeys = new Set(["name", "inheritCustomizations", "inheritMcp"])
+
+export const decode = Effect.fnUntraced(function* (
   file: { directory: string; filepath: string; primary: boolean },
   content: string,
 ) {
   const markdown = ConfigMarkdown.parseOption(content)
   if (!markdown) return
-  const name = path
+  const rawRelative = path
     .relative(file.directory, file.filepath)
     .replaceAll("\\", "/")
-    .replace(/^(agent|agents|mode|modes)\//, "")
-    .replace(/\.md$/, "")
+    .replace(/^(agent|agents|mode|modes)\//i, "")
+    .replace(/\.md$/i, "")
+  const name = rawRelative.replace(/\/agent$/i, "")
   const body = markdown.content.trim()
-  const keys = Object.keys(markdown.data)
+
+  const rawData: Record<string, unknown> = { ...markdown.data }
+  if (Array.isArray(rawData.tools)) {
+    const toolsList = rawData.tools.filter((t): t is string => typeof t === "string")
+    const rules = translateToolsArrayToRuleset(toolsList)
+    rawData.permissions = [
+      // SAFETY: existing permissions from frontmatter if present
+      ...(Array.isArray(rawData.permissions) ? (rawData.permissions as Permission.Ruleset) : []),
+      ...rules,
+    ]
+    delete rawData.tools
+  }
+  for (const key of ignoredExtraKeys) {
+    delete rawData[key]
+  }
+
+  const keys = Object.keys(rawData)
   const unsupported = keys.filter((key) => !agentKeys.has(key))
   const legacy = unsupported.length > 0 && !keys.some((key) => nativeKeys.includes(key))
   if (!legacy && unsupported.length > 0)
@@ -193,16 +284,16 @@ const decode = Effect.fnUntraced(function* (
   // Join legacy model + variant without sending native request/permissions through migration.
   // Embedded and structured native selections, and a variant without a model, stay unchanged.
   const data =
-    typeof markdown.data.model === "string" &&
-    !markdown.data.model.includes("#") &&
-    typeof markdown.data.variant === "string" &&
-    /^[^#]+$/.test(markdown.data.variant)
-      ? { ...markdown.data, model: `${markdown.data.model}#${markdown.data.variant}` }
-      : markdown.data
+    typeof rawData.model === "string" &&
+    !rawData.model.includes("#") &&
+    typeof rawData.variant === "string" &&
+    /^[^#]+$/.test(rawData.variant)
+      ? { ...rawData, model: `${rawData.model}#${rawData.variant}` }
+      : rawData
   const agent = legacy
     ? Option.getOrUndefined(
         Option.map(
-          decodeLegacyAgent({ name, ...markdown.data, prompt: body }, { errors: "all" }),
+          decodeLegacyAgent({ name, ...rawData, prompt: body }, { errors: "all" }),
           ConfigMigrateV1.migrateAgent,
         ),
       )

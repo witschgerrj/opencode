@@ -184,6 +184,7 @@ const withSubagent = (location: Location.Ref) =>
           model.variants = [{ id: Model.VariantID.make("fast") }]
         })
         editor.models.update(Provider.ID.make("test"), Model.ID.make("plain"), () => {})
+        editor.models.update(childModel.providerID, childModel.id, () => {})
       }),
     ).pipe(Effect.provide(locations.get(location)))
     yield* Agent.Service.use((agents) =>
@@ -328,15 +329,16 @@ describe("SubagentTool", () => {
           const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
           const sessions = yield* Session.Service
           const root = yield* sessions.create({ location })
-          const parent = yield* sessions.create({ parentID: root.id, title: "parent" })
-          const child = yield* sessions.create({ parentID: parent.id, title: "child" })
-          yield* withSubagent(child.location)
+          const tier1 = yield* sessions.create({ parentID: root.id, title: "tier1" })
+          const tier2 = yield* sessions.create({ parentID: tier1.id, title: "tier2" })
+          const tier3 = yield* sessions.create({ parentID: tier2.id, title: "tier3" })
+          yield* withSubagent(tier3.location)
           const locations = yield* LocationServiceMap.Service
-          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(child.location)))
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(tier3.location)))
 
           expect(
             yield* executeTool(registry, {
-              sessionID: child.id,
+              sessionID: tier3.id,
               ...toolIdentity,
               call: {
                 type: "tool-call",
@@ -349,10 +351,10 @@ describe("SubagentTool", () => {
             status: "error",
             error: {
               type: "tool.execution",
-              message: expect.stringContaining("Maximum subagent nesting depth (2) reached"),
+              message: expect.stringContaining("Maximum subagent nesting depth (3) reached"),
             },
           })
-          expect((yield* sessions.list({ parentID: child.id })).data).toHaveLength(0)
+          expect((yield* sessions.list({ parentID: tier3.id })).data).toHaveLength(0)
         }),
       ),
     ),

@@ -15,6 +15,7 @@ import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { LspTool } from "@opencode/core/tool/plugin/lsp"
 import { HeadlessBrowserTool, assertSafeBrowserUrl } from "@opencode/core/tool/plugin/headless-browser"
 import { ArtifactTool, MAX_ARTIFACT_BYTES } from "@opencode/core/tool/plugin/artifact"
+import { SessionModelRequest } from "@opencode/core/session/model-request"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { permissionLayer } from "./lib/permission"
@@ -35,7 +36,7 @@ const browserToolNode = makeLocationNode({
 const artifactToolNode = makeLocationNode({
   name: "test/artifact-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(ArtifactTool.Plugin)),
-  deps: [Tool.node, Permission.node, Location.node],
+  deps: [Tool.node, FileAccess.node, Permission.node, Location.node],
 })
 
 const sessionID = Session.ID.make("ses_intelligence_test")
@@ -400,6 +401,70 @@ describe("HeadlessBrowserTool", () => {
       await tmp[Symbol.asyncDispose]()
     }
   })
+
+  test("render_html with keyframesMs captures multi-frame PNG sequence and fulfills offline bundles", async () => {
+    const tmp = await tmpdir()
+    try {
+      const html = `<!DOCTYPE html>
+<html>
+<head>
+  <title>Motion Capture</title>
+  <script src="/__local_lib__/three.min.js"></script>
+</head>
+<body>
+  <div id="anim" style="width: 50px; height: 50px; background: red; transition: transform 0.3s;"></div>
+  <script>
+    setTimeout(() => {
+      document.getElementById('anim').style.transform = 'translateX(100px)';
+    }, 60);
+  </script>
+</body>
+</html>`
+
+      await Effect.runPromise(
+        withWorkspace(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const browserExec = yield* executeTool(registry, {
+              sessionID,
+              ...toolIdentity,
+              call: {
+                type: "tool-call",
+                id: "call_render_motion",
+                name: "headless_browser",
+                input: {
+                  action: "render_html",
+                  html,
+                  keyframesMs: [0, 120, 240],
+                  screenshot: true,
+                },
+              },
+            })
+
+            expect(browserExec.status).toBe("completed")
+            expect(browserExec.output.screenshotCaptured).toBe(true)
+
+            // Verify 3 keyframe PNG frames were captured
+            const fileParts = (browserExec.content ?? []).filter((c) => c.type === "file")
+            expect(fileParts.length).toBe(3)
+            const names = fileParts.map((f: any) => f.name)
+            expect(names).toEqual([
+              "browser-frame-0ms.png",
+              "browser-frame-120ms.png",
+              "browser-frame-240ms.png",
+            ])
+            for (const f of fileParts) {
+              if (f.type === "file") {
+                expect(f.mime).toBe("image/png")
+                expect(f.uri).toMatch(/^data:image\/png;base64,iVBORw0KGgo/)
+              }
+            }
+          }),
+        ),
+      )
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  })
 })
 
 describe("ArtifactTool", () => {
@@ -494,6 +559,93 @@ describe("ArtifactTool", () => {
             })
             expect(overExec.status).toBe("error")
             expect(overExec.error?.message).toContain("Artifact content too large")
+          }),
+        ),
+      )
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  })
+
+  test("attaches .mp4 and .png deliverables alongside HTML artifact and degrades non-image in model request", async () => {
+    const tmp = await tmpdir()
+    try {
+      const mp4Path = path.join(tmp.path, "anim.mp4")
+      const pngPath = path.join(tmp.path, "frame.png")
+      fs.writeFileSync(mp4Path, Buffer.from("fake-mp4-video-data"))
+      fs.writeFileSync(pngPath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"))
+
+      await Effect.runPromise(
+        withWorkspace(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const artifactExec = yield* executeTool(registry, {
+              sessionID,
+              ...toolIdentity,
+              call: {
+                type: "tool-call",
+                id: "call_art_with_files",
+                name: "render_artifact",
+                input: {
+                  kind: "html",
+                  title: "Rendered Animation",
+                  content: "<h1>Animation Complete</h1>",
+                  files: ["anim.mp4", "frame.png"],
+                },
+              },
+            })
+
+            expect(artifactExec.status).toBe("completed")
+            expect(artifactExec.output.kind).toBe("html")
+            expect(artifactExec.output.files).toBeDefined()
+            expect(artifactExec.output.files!.length).toBe(2)
+
+            const fileParts = (artifactExec.content ?? []).filter((c) => c.type === "file")
+            expect(fileParts.length).toBe(2)
+            const mp4Part = fileParts.find((f: any) => f.name === "anim.mp4")
+            const pngPart = fileParts.find((f: any) => f.name === "frame.png")
+            expect(mp4Part).toBeDefined()
+            if (mp4Part && mp4Part.type === "file") {
+              expect(mp4Part.mime).toBe("video/mp4")
+              expect(mp4Part.uri).toContain("data:video/mp4;base64,")
+            }
+            expect(pngPart).toBeDefined()
+            if (pngPart && pngPart.type === "file") {
+              expect(pngPart.mime).toBe("image/png")
+              expect(pngPart.uri).toContain("data:image/png;base64,")
+            }
+
+            // Verify safe degradation in SessionModelRequest
+            const messages = [
+              {
+                role: "tool" as const,
+                content: [
+                  {
+                    type: "tool-result" as const,
+                    id: "call_art_with_files",
+                    name: "render_artifact",
+                    result: {
+                      type: "content" as const,
+                      value: [
+                        {
+                          type: "file" as const,
+                          uri: "data:video/mp4;base64,AAAA",
+                          mime: "video/mp4",
+                          name: "anim.mp4",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ]
+            const replaced = SessionModelRequest.unsupportedParts(
+              messages as any,
+              { input: ["text", "image"], output: ["text"], tools: true },
+            )
+            const toolMsg = replaced[0] as any
+            const resultValue = toolMsg.content[0].result.value[0]
+            expect(resultValue.type).toBe("text")
+            expect(resultValue.text).toBe("[Attached deliverable: anim.mp4 (video/mp4)]")
           }),
         ),
       )
