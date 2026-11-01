@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "44bd8ca5-689a-410e-a46a-958eb5accd97",
-  "prevIds": ["f1f14616-b6a1-483d-87b0-d5b7a9132580"],
+  "id": "453b28f6-b96b-4cbc-8c7c-a89f3898e9b3",
+  "prevIds": ["44bd8ca5-689a-410e-a46a-958eb5accd97"],
   "ddl": [
     {
       "name": "account_state",
@@ -65,6 +65,10 @@
       "entityType": "tables"
     },
     {
+      "name": "session_epoch_prefix",
+      "entityType": "tables"
+    },
+    {
       "name": "session_inbox",
       "entityType": "tables"
     },
@@ -74,6 +78,10 @@
     },
     {
       "name": "session_v2",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_turn_reminder",
       "entityType": "tables"
     },
     {
@@ -986,6 +994,126 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "epoch_key",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "frozen_initial",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_applied_initial",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "frozen_first_reminder",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "initial_iso_date",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_applied_iso_date",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "frozen_tools_json",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "frozen_hooked_tools_json",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_announced_new_tools",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -1486,6 +1614,56 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_turn_reminder"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "epoch_key",
+      "entityType": "columns",
+      "table": "session_turn_reminder"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_turn_reminder"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reminder_text",
+      "entityType": "columns",
+      "table": "session_turn_reminder"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_turn_reminder"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -1669,6 +1847,17 @@
       "onUpdate": "NO ACTION",
       "onDelete": "CASCADE",
       "nameExplicit": false,
+      "name": "fk_session_epoch_prefix_session_id_session_v2_id_fk",
+      "entityType": "fks",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "columns": ["session_id"],
+      "tableTo": "session_v2",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
       "name": "fk_session_inbox_session_id_session_v2_id_fk",
       "entityType": "fks",
       "table": "session_inbox"
@@ -1694,6 +1883,17 @@
       "name": "fk_session_v2_project_id_project_id_fk",
       "entityType": "fks",
       "table": "session_v2"
+    },
+    {
+      "columns": ["session_id"],
+      "tableTo": "session_v2",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_turn_reminder_session_id_session_v2_id_fk",
+      "entityType": "fks",
+      "table": "session_turn_reminder"
     },
     {
       "columns": ["project_id"],
@@ -1733,6 +1933,20 @@
       "name": "instruction_entry_pk",
       "entityType": "pks",
       "table": "instruction_entry"
+    },
+    {
+      "columns": ["session_id", "epoch_key"],
+      "nameExplicit": false,
+      "name": "session_epoch_prefix_pk",
+      "entityType": "pks",
+      "table": "session_epoch_prefix"
+    },
+    {
+      "columns": ["session_id", "epoch_key", "message_id"],
+      "nameExplicit": false,
+      "name": "session_turn_reminder_pk",
+      "entityType": "pks",
+      "table": "session_turn_reminder"
     },
     {
       "columns": ["project_id", "directory"],
@@ -2111,6 +2325,24 @@
       "name": "session_v2_time_suspended_idx",
       "entityType": "indexes",
       "table": "session_v2"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "epoch_key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_turn_reminder_session_epoch_idx",
+      "entityType": "indexes",
+      "table": "session_turn_reminder"
     }
   ],
   "renames": []

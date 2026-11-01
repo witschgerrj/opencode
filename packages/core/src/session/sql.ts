@@ -17,6 +17,7 @@ import type { Session } from "@opencode/schema/session"
 import type { CompactionPayload, MovePayload, SyntheticPayload } from "@opencode/schema/session-inbox"
 import type { RevertV1 } from "@opencode/schema/session-revert"
 import type { Schema } from "effect"
+import type { ToolDefinitionInput } from "@opencode/ai/effect"
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 type SessionMessageData = DistributiveOmit<
@@ -186,5 +187,48 @@ export const BlobRefTable = sqliteTable(
     primaryKey({ columns: [table.session_id, table.message_id, table.hash] }),
     index("blob_ref_hash_idx").on(table.hash),
     index("blob_ref_session_seq_idx").on(table.session_id, table.seq),
+  ],
+)
+
+export type FrozenHookedToolsMap = Readonly<Record<string, ReadonlyArray<readonly [string, ToolDefinitionInput]>>>
+
+export const SessionEpochPrefixTable = sqliteTable(
+  "session_epoch_prefix",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    epoch_key: text().notNull(),
+    frozen_initial: text().notNull(),
+    last_applied_initial: text().notNull(),
+    frozen_first_reminder: text().notNull(),
+    initial_iso_date: text().notNull(),
+    last_applied_iso_date: text().notNull(),
+    frozen_tools_json: text({ mode: "json" }).notNull().$type<ReadonlyArray<ToolDefinitionInput>>(),
+    frozen_hooked_tools_json: text({ mode: "json" }).notNull().$type<FrozenHookedToolsMap>(),
+    last_announced_new_tools: text({ mode: "json" }).notNull().$type<ReadonlyArray<string>>(),
+    ...Timestamps,
+  },
+  (table) => [primaryKey({ columns: [table.session_id, table.epoch_key] })],
+)
+
+export const SessionTurnReminderTable = sqliteTable(
+  "session_turn_reminder",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    epoch_key: text().notNull(),
+    message_id: text().$type<SessionMessage.ID>().notNull(),
+    reminder_text: text().notNull(),
+    time_created: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.epoch_key, table.message_id] }),
+    index("session_turn_reminder_session_epoch_idx").on(table.session_id, table.epoch_key),
   ],
 )

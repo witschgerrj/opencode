@@ -53,6 +53,11 @@ export interface NormalizedResult extends Tool.Result {
 export interface Snapshot {
   readonly definitions: ReadonlyArray<ToolDefinition>
   readonly codeModeCatalog?: CodeModeCatalog.Inventory
+  /** Optional epoch hook-schema pinner so primary/compaction requests keep frozen post-hook tool schemas. */
+  readonly pinHookedDefinitions?: (
+    scopeKey: string,
+    computed: ReadonlyMap<string, ToolDefinition>,
+  ) => Effect.Effect<ReadonlyMap<string, ToolDefinition>>
   readonly execute: (input: {
     readonly sessionID: SessionSchema.ID
     readonly agent: Agent.ID

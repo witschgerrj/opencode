@@ -18,6 +18,8 @@ export interface Observation extends Instructions.Admission {
   readonly current: Instructions.Values
 }
 
+const observedByList = new WeakMap<Instructions.List, Instructions.ReadResult>()
+
 export const observe = Effect.fn("InstructionState.observe")(function* (
   db: DatabaseService,
   instructions: Instructions.List,
@@ -26,6 +28,7 @@ export const observe = Effect.fn("InstructionState.observe")(function* (
   const [observed, stored] = yield* Effect.all([Instructions.read(instructions), find(db, sessionID)], {
     concurrency: "unbounded",
   })
+  observedByList.set(instructions, observed)
   const result = yield* observeAgainst(observed, stored?.current_values)
   return {
     sessionID,
@@ -179,6 +182,86 @@ export const initial = Effect.fn("InstructionState.initial")(function* (
   if (!state) return yield* Effect.die(new Error(`Instruction state not found during assembly: ${sessionID}`))
   const blobs = yield* loadBlobs(db, Object.values(state.initial_values))
   return Instructions.renderInitial(instructions, dereference(state.initial_values, blobs))
+})
+
+/**
+ * Returns `epoch_start` and renders the initial `last_applied_initial` baseline using persisted
+ * `current_values` blobs without re-reading already-tracked sources (reading only untracked sources).
+ */
+export const renderEpochBaseline = Effect.fn("InstructionState.renderEpochBaseline")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  instructions: Instructions.List,
+  fallbackInitial: string,
+) {
+  const state = yield* find(db, sessionID)
+  if (!state) {
+    return { epochStart: 0, baselineRendered: fallbackInitial }
+  }
+  const stored = yield* loadBlobs(db, Object.values(state.current_values))
+  const currentDereferenced = dereference(state.current_values, stored)
+  const untracked = instructions.filter((source) => !Object.hasOwn(currentDereferenced, source.key))
+  const combinedValues: Record<string, Schema.Json> = { ...currentDereferenced }
+  if (untracked.length > 0) {
+    const observed = yield* Instructions.read(untracked)
+    for (const entry of observed) {
+      if (entry.value !== Instructions.unavailable && entry.value !== Instructions.removed) {
+        combinedValues[entry.key] = entry.value
+      }
+    }
+  }
+  return {
+    epochStart: state.epoch_start,
+    baselineRendered: Instructions.renderInitial(instructions, combinedValues),
+  }
+})
+
+/** Returns the current durable `epoch_start` sequence for `sessionID` (or `0` if uninitialized). */
+export const epochStartSeq = Effect.fn("InstructionState.epochStartSeq")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const state = yield* find(db, sessionID)
+  return state?.epoch_start ?? 0
+})
+
+/**
+ * Renders both the persisted `current_values` fold and the live instruction sources on disk/memory,
+ * falling back to `current_values` for any temporarily unavailable source.
+ */
+export const renderLiveAndCurrent = Effect.fn("InstructionState.renderLiveAndCurrent")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  instructions: Instructions.List,
+  fallbackInitial: string,
+) {
+  const state = yield* find(db, sessionID)
+  const observed = observedByList.get(instructions) ?? (yield* Instructions.read(instructions))
+  if (!state) {
+    const liveValues: Record<string, Schema.Json> = {}
+    for (const entry of observed) {
+      if (entry.value !== Instructions.unavailable && entry.value !== Instructions.removed) {
+        liveValues[entry.key] = entry.value
+      }
+    }
+    return {
+      currentRendered: fallbackInitial,
+      liveRendered: Instructions.renderInitial(instructions, liveValues),
+    }
+  }
+  const stored = yield* loadBlobs(db, Object.values(state.current_values))
+  const currentDereferenced = dereference(state.current_values, stored)
+  const currentRendered = Instructions.renderInitial(instructions, currentDereferenced)
+  const liveValues: Record<string, Schema.Json> = {}
+  for (const entry of observed) {
+    if (entry.value === Instructions.unavailable) {
+      if (Object.hasOwn(currentDereferenced, entry.key)) liveValues[entry.key] = currentDereferenced[entry.key]
+    } else if (entry.value !== Instructions.removed) {
+      liveValues[entry.key] = entry.value
+    }
+  }
+  const liveRendered = Instructions.renderInitial(instructions, liveValues)
+  return { currentRendered, liveRendered }
 })
 
 /** The current instruction values, used to seed a fork's baseline. */

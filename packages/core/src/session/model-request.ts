@@ -10,6 +10,7 @@ import {
   type Media,
   Message,
   SystemPart,
+  ToolDefinition,
 } from "@opencode/ai/effect"
 import type { StreamOptions } from "@opencode/ai/route"
 import type {
@@ -277,12 +278,31 @@ export const layer = Layer.effect(
       // Match by identity first, then by key. Entries matching neither were invented by a
       // hook and are dropped. `t.name` stays the real name so execution can map renames back.
       const byName = new Map(tools.definitions.map((t) => [t.name, t]))
-      const hooked = new Map(
+      const rawHooked = new Map(
         Object.entries(shaped.tools ?? {}).flatMap(([name, d]) => {
           const t = given.get(d) ?? byName.get(name)
-          return t ? [[name, { ...t, description: d.description, inputSchema: d.input }] as const] : []
+          return t
+            ? [
+                [
+                  name,
+                  ToolDefinition.make({
+                    name: t.name,
+                    description: d.description,
+                    inputSchema: d.input,
+                    ...(t.outputSchema === undefined ? {} : { outputSchema: t.outputSchema }),
+                    ...(t.cache === undefined ? {} : { cache: t.cache }),
+                    ...(t.metadata === undefined ? {} : { metadata: t.metadata }),
+                    ...(t.native === undefined ? {} : { native: t.native }),
+                  }),
+                ] as const,
+              ]
+            : []
         }),
       )
+      const hooked =
+        (kind === "primary" || kind === "compaction") && input.tools?.pinHookedDefinitions
+          ? yield* input.tools.pinHookedDefinitions(`${input.agent}:${model.ref.providerID}/${model.ref.id}`, rawHooked)
+          : rawHooked
       const entries = Object.entries(shaped.options)
       const generation = Object.fromEntries(entries.filter(([k]) => GENERATION_KEYS.has(k))) as GenerationOptionsFields
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
