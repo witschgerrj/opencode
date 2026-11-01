@@ -52,7 +52,7 @@ export const SUBAGENT_CONTINUE_AFTER_OUTPUT_LIMIT =
 export const isRequestSynthesisTurn = (messages: ReadonlyArray<SessionMessage.Info>): boolean => {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!
-    if (msg.type === "user") return false
+    if (msg.type === "user" || msg.type === "synthetic") return false
     if (msg.type !== "assistant") continue
     const toolParts = msg.content.filter((part): part is SessionMessage.AssistantTool => part.type === "tool")
     if (toolParts.length === 0) {
@@ -97,7 +97,7 @@ export const analyzeCausalStep = (messages: ReadonlyArray<SessionMessage.Info>):
   let lastMeaningfulIndex = -1
   for (let i = messages.length - 1; i >= 0; i--) {
     const type = messages[i]?.type
-    if (type === "user" || type === "assistant" || type === "compaction") {
+    if (type === "user" || type === "synthetic" || type === "assistant" || type === "compaction") {
       lastMeaningfulIndex = i
       break
     }
@@ -159,7 +159,7 @@ export const analyzeCausalStep = (messages: ReadonlyArray<SessionMessage.Info>):
   let turnStartIndex = 0
   for (let i = lastMeaningfulIndex - 1; i >= 0; i--) {
     const type = messages[i]?.type
-    if (type === "user" || type === "compaction") {
+    if (type === "user" || type === "synthetic" || type === "compaction") {
       turnStartIndex = i + 1
       break
     }

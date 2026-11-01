@@ -208,6 +208,8 @@ describe("Agent", () => {
       expect(Permission.evaluate("shell", "git log -5", explore?.permissions ?? []).effect).toBe("deny")
       expect(Permission.evaluate("request_synthesis", "*", explore?.permissions ?? []).effect).toBe("allow")
       expect(Permission.evaluate("request_synthesis", "*", general?.permissions ?? []).effect).toBe("allow")
+      expect(Permission.evaluate("send_message", "*", explore?.permissions ?? []).effect).toBe("allow")
+      expect(Permission.evaluate("send_message", "*", general?.permissions ?? []).effect).toBe("allow")
       expect(Permission.evaluate("edit", "src/index.ts", explore?.permissions ?? []).effect).toBe("deny")
       expect(Permission.evaluate("read", ".env", explore?.permissions ?? []).effect).toBe("ask")
       expect(Permission.evaluate("read", ".env.local", explore?.permissions ?? []).effect).toBe("ask")

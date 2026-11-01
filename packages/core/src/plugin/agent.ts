@@ -13,6 +13,7 @@ Guidelines:
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths with exact line ranges in your final response
 - You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
+- Use send_message when you need to hand off discovered contracts or findings directly to a concurrent sibling subagent or inspect/message another conversation
 - Once discovery is complete, call request_synthesis({}) and immediately emit a concise (<= 2,000 tokens) structured report
 
 Complete the user's search request efficiently and report your findings clearly.`
@@ -70,6 +71,7 @@ export const Plugin = define({
           { action: "question", resource: "*", effect: "deny" },
           { action: "subagent", resource: "*", effect: "deny" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
+          { action: "send_message", resource: "*", effect: "allow" },
         )
       })
 
@@ -91,6 +93,7 @@ export const Plugin = define({
           { action: "read", resource: "*.env.*", effect: "ask" },
           { action: "read", resource: "*.env.example", effect: "allow" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
+          { action: "send_message", resource: "*", effect: "allow" },
           { action: "subagent", resource: "*", effect: "deny" },
           { action: "external_directory", resource: "*", effect: "allow" },
         )
