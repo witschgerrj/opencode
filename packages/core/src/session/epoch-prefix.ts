@@ -1,3 +1,5 @@
+import { execSync } from "node:child_process"
+import * as fs from "node:fs"
 export * as SessionEpochPrefix from "./epoch-prefix.js"
 
 import { ToolDefinition, type ToolDefinitionInput } from "@opencode/ai/effect"
@@ -61,12 +63,49 @@ export function parseIsoFromDateValue(val: unknown): string {
   return formatDateIso(new Date())
 }
 
+function sortDeterministicJsonKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") return obj
+  if (Array.isArray(obj)) return obj.map(sortDeterministicJsonKeys)
+  const sorted: Record<string, unknown> = {}
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortDeterministicJsonKeys((obj as Record<string, unknown>)[key])
+  }
+  return sorted
+}
+
+export function getWorkspaceSummary(cwd: string = process.cwd()): string {
+  if (process.env.NODE_ENV === "test" || process.env.BUN_TEST || process.env.VITEST) {
+    return ""
+  }
+  try {
+    const gitStatus = execSync("git status -sb", {
+      cwd,
+      timeout: 500,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim()
+
+    const entries = fs.readdirSync(cwd, { withFileTypes: true })
+      .filter((e) => !e.name.startsWith(".git"))
+      .slice(0, 40)
+      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+      .join(", ")
+
+    let summary = `<workspace_summary>\nGit status: ${gitStatus}\nWorkspace files: ${entries}\n</workspace_summary>`
+    if (summary.length > 1200) {
+      summary = summary.slice(0, 1196) + "\n..."
+    }
+    return summary
+  } catch {
+    return ""
+  }
+}
+
 export function serializeToolDefinition(t: ToolDefinition): ToolDefinitionInput {
   return {
-    name: t.name,
     description: t.description,
-    inputSchema: structuredClone(t.inputSchema),
-    ...(t.outputSchema === undefined ? {} : { outputSchema: structuredClone(t.outputSchema) }),
+    name: t.name,
+    inputSchema: sortDeterministicJsonKeys(structuredClone(t.inputSchema)) as any,
     ...(t.cache === undefined ? {} : { cache: structuredClone(t.cache) }),
     ...(t.metadata === undefined ? {} : { metadata: structuredClone(t.metadata) }),
     ...(t.native === undefined ? {} : { native: structuredClone(t.native) }),
@@ -75,10 +114,9 @@ export function serializeToolDefinition(t: ToolDefinition): ToolDefinitionInput 
 
 export function hydrateToolDefinition(input: ToolDefinitionInput): ToolDefinition {
   return ToolDefinition.make({
-    name: input.name,
     description: input.description,
+    name: input.name,
     inputSchema: structuredClone(input.inputSchema),
-    ...(input.outputSchema === undefined ? {} : { outputSchema: structuredClone(input.outputSchema) }),
     ...(input.cache === undefined ? {} : { cache: structuredClone(input.cache) }),
     ...(input.metadata === undefined ? {} : { metadata: structuredClone(input.metadata) }),
     ...(input.native === undefined ? {} : { native: structuredClone(input.native) }),
@@ -194,6 +232,7 @@ function wrapEpochTools(
 export const resolveEpochContext = Effect.fn("SessionEpochPrefix.resolveEpochContext")(function* (input: {
   readonly db: DatabaseService
   readonly sessionID: SessionSchema.ID
+  readonly session?: SessionSchema.Info
   readonly instructions: Instructions.List
   readonly volatileInstructions?: Instructions.List
   readonly tools: Tool.Snapshot
@@ -262,10 +301,15 @@ export const resolveEpochContext = Effect.fn("SessionEpochPrefix.resolveEpochCon
       history.initial,
     )
     const frozenInitial = history.initial
-    const frozenFirstReminder =
+    const isRootSession = !input.session || !input.session.parentID
+    const isTurn1 = compactionEntry === undefined
+    const workspaceSummary = isRootSession && isTurn1 ? getWorkspaceSummary() : ""
+    const renderedVolatile =
       volatileInstructions && volatileInstructions.length > 0
         ? Instructions.renderInitial(volatileInstructions, volatileValues)
         : ""
+    const reminderParts = [workspaceSummary, renderedVolatile].filter((p) => p.length > 0)
+    const frozenFirstReminder = reminderParts.join("\n\n")
     const initialIsoDate =
       volatileInstructions && volatileInstructions.length > 0 && currentObservedDate !== undefined
         ? parseIsoFromDateValue(currentObservedDate)

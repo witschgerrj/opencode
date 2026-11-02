@@ -359,6 +359,7 @@ test("compaction prompt requires the checkpoint headings in order", () => {
     "### Completed",
     "### Active",
     "### Blocked",
+    "## Failed Hypotheses / Approaches Not to Repeat",
     "## Next Move",
     "## Relevant Files",
     "## Important Context",

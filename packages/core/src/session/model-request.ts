@@ -363,8 +363,19 @@ export const layer = Layer.effect(
             ...aquanoxHeaders,
           },
         },
-        // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
-        promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
+        // Persist cache lineage so nested forks and subagents reuse the root session's cache key.
+        promptCacheKey: (() => {
+          const rootSessionId =
+            aquanoxCorr?.rootSessionId ??
+            (session.metadata && typeof session.metadata === "object" && "aquanoxRootSessionId" in session.metadata
+              ? ((session.metadata as Record<string, unknown>).aquanoxRootSessionId as string)
+              : undefined)
+          const lineageKey =
+            session.parentID || session.fork?.sessionID || (session.metadata as any)?.mode === "fork"
+              ? (rootSessionId ?? affinity)
+              : affinity
+          return /^ses_[0-9a-f]{64}$/.test(lineageKey) ? lineageKey.slice(4) : lineageKey
+        })(),
         cache: model.cache?.ttl === undefined ? undefined : { ttl: model.cache.ttl },
         system: shaped.system,
         messages: boundImages(unsupportedParts(shaped.messages, model.capabilities, model.model.provider)),

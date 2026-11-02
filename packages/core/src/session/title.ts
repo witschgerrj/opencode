@@ -88,7 +88,7 @@ export const layer = Layer.effect(
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
         messages: [Message.user(input.text)],
         ...(String(input.model.ref.providerID) === "deepseek-local"
-          ? { httpBody: { id_slot: 2, reasoning_budget_tokens: 64 } }
+          ? { httpBody: { id_slot: -1, reasoning_budget_tokens: 0, chat_template_kwargs: { reasoning_effort: "minimal" } } }
           : {}),
         ...(titleCorr && titleSpanId
           ? {

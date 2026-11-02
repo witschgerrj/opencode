@@ -188,6 +188,7 @@ const layer = Layer.effect(
       const resolved = yield* SessionEpochPrefix.resolveEpochContext({
         db,
         sessionID: selection.session.id,
+        session: selection.session,
         instructions: selection.instructions,
         volatileInstructions: selection.volatileInstructions,
         tools: selection.tools,

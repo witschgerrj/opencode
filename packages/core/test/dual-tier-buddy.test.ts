@@ -196,9 +196,12 @@ describe("Aquanox Dual-Tier 9-Quantum Coordinator — SessionSlotLease Buddy Are
 })
 
 describe("Aquanox Dual-Tier Context Engine — Tier Resolution & Compaction Ceiling", () => {
-  test("resolveSessionContextTier resolves 384k for lead and 128k for subagents", () => {
+  test("resolveSessionContextTier resolves 256k for standard lead, 384k for explicit lead, and 128k for subagents", () => {
     const rootSession = makeSession("ses_root")
-    expect(resolveSessionContextTier(rootSession)).toBe("384k")
+    expect(resolveSessionContextTier(rootSession)).toBe("256k")
+
+    const root384 = makeSession("ses_root_384", undefined, { contextTier: "384k" })
+    expect(resolveSessionContextTier(root384)).toBe("384k")
 
     const subDefault = makeSession("ses_sub_1", "ses_root")
     expect(resolveSessionContextTier(subDefault)).toBe("128k")
@@ -222,7 +225,7 @@ describe("Aquanox Dual-Tier Context Engine — Tier Resolution & Compaction Ceil
 })
 
 describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping", () => {
-  test("caps subagent reasoning budget at <= 4096 across all variants and continuation states", () => {
+  test("caps subagent reasoning budget at <= 8192 across all variants and continuation states", () => {
     const userMsg = makeUserMessage("Inspect mesh topology")
 
     // Turn entry for lead session with variant 'high' -> 8192
@@ -247,7 +250,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
     })
     expect(leadMax).toBe(12288)
 
-    // Turn entry for SUBAGENT session with variant 'high' -> capped at 4096!
+    // Turn entry for SUBAGENT session with variant 'high' -> capped at 8192!
     const subHigh = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [userMsg],
       variant: "high",
@@ -256,9 +259,9 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subHigh).toBe(4096)
+    expect(subHigh).toBe(8192)
 
-    // Turn entry for SUBAGENT session with variant 'max' -> capped at 4096!
+    // Turn entry for SUBAGENT session with variant 'max' -> capped at 8192!
     const subMax = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [userMsg],
       variant: "max",
@@ -267,9 +270,9 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subMax).toBe(4096)
+    expect(subMax).toBe(8192)
 
-    // Mutating continuation for subagent -> 1280 (not inflated to 4096)
+    // Mutating continuation for subagent -> 4096 (non-truncating ceiling)
     const subMutating = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [userMsg],
       variant: "high",
@@ -278,12 +281,12 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subMutating).toBeLessThanOrEqual(4096)
+    expect(subMutating).toBeLessThanOrEqual(8192)
   })
 })
 
 describe("Aquanox Dual-Tier Agent Profiles — Frontmatter Verification", () => {
-  const openWorldAgentsDir = "/home/rjwits/worktrees/open-world-dual-tier/.opencode/agents"
+  const openWorldAgentsDir = fs.existsSync("/home/rjwits/github/open-world/.opencode/agents") ? "/home/rjwits/github/open-world/.opencode/agents" : "/home/rjwits/worktrees/open-world-dual-tier/.opencode/agents"
 
   test("master-animator.md configures 384k lead tier, 3 reserved 128k subagents, max 3 concurrent", () => {
     const raw = fs.readFileSync(`${openWorldAgentsDir}/master-animator.md`, "utf8")

@@ -220,49 +220,46 @@ export const computeCausalReasoningBudget = (input: {
 }): number => {
   const { variant, configuredBudget, isExplore, isSynthesizing, stepLimitReached, isSubagent } = input
 
+  const baseBudget =
+    configuredBudget !== undefined && configuredBudget >= 0
+      ? configuredBudget
+      : variant === "max"
+        ? 12288
+        : variant === "high"
+          ? 8192
+          : variant === "medium"
+            ? 4096
+            : 2048
+
+  const analysis = analyzeCausalStep(input.messages)
+
   let budget: number
-  if (variant === "low") {
-    if (configuredBudget !== undefined && configuredBudget >= 0 && configuredBudget < 1024) {
-      budget = configuredBudget
+  if (variant === "low" || baseBudget <= 2048) {
+    if (analysis.isTurnEntry || analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn) {
+      budget = 3072
     } else {
-      budget = isExplore ? 1024 : 256
-    }
-  } else if (variant === "medium") {
-    if (configuredBudget !== undefined && configuredBudget >= 0 && configuredBudget < 2048) {
-      budget = configuredBudget
-    } else {
-      budget = 2048
+      budget = isExplore ? 3072 : 2048
     }
   } else {
-    const analysis = analyzeCausalStep(input.messages)
-
     if (analysis.isTurnEntry) {
-      const turnCeiling =
-        configuredBudget !== undefined && configuredBudget >= 0
-          ? configuredBudget
-          : variant === "max"
-            ? 12288
-            : variant === "high"
-              ? 8192
-              : 6144
-      budget = Math.max(6144, turnCeiling)
+      budget = Math.min(12288, Math.max(baseBudget, 8192))
     } else if (stepLimitReached) {
       budget = 2048
     } else if (isSynthesizing) {
       budget = 4096
     } else if (analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn || analysis.cumulativeExploratorySteps >= 2) {
-      budget = 4096
+      budget = 8192
     } else if (analysis.isCleanMutatingContinuation) {
-      budget = 1280
+      budget = 4096
     } else if (analysis.isSingleExploratoryContinuation) {
-      budget = 1024
+      budget = 3072
     } else {
       budget = 4096
     }
   }
 
   if (isSubagent) {
-    return Math.min(budget, 4096)
+    return Math.min(budget, 8192)
   }
   return budget
 }
@@ -275,7 +272,14 @@ export const resolveStepRouting = (input: {
   readonly stepLimitReached: boolean
 }): {
   readonly toolChoice: "none" | "auto" | undefined
-  readonly httpBody: { readonly id_slot: SessionSlotLease.SlotID; readonly reasoning_budget_tokens: number } | undefined
+  readonly httpBody:
+    | {
+        readonly id_slot: SessionSlotLease.SlotID
+        readonly reasoning_budget_tokens: number
+        readonly think_temp?: number
+        readonly think_min_p?: number
+      }
+    | undefined
   readonly isSynthesizing: boolean
 } => {
   const isSubagent = Boolean(input.session.parentID)
@@ -309,9 +313,16 @@ export const resolveStepRouting = (input: {
     stepLimitReached: input.stepLimitReached,
   })
 
+  const analysis = analyzeCausalStep(input.messages)
+
   return {
     toolChoice,
-    httpBody: { id_slot, reasoning_budget_tokens },
+    httpBody: {
+      id_slot,
+      reasoning_budget_tokens,
+      think_temp: analysis.hasErrorOrDiagnostic ? 1.0 : 0.85,
+      think_min_p: 0.01,
+    },
     isSynthesizing,
   }
 }

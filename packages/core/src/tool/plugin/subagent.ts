@@ -103,6 +103,46 @@ const backgroundResult = (sessionID: SessionSchema.ID) => ({
   ].join("\n"),
 })
 
+const activeWriteScopes = new Map<string, ReadonlyArray<string>>()
+
+export const getActiveWriteScopes = (): ReadonlyMap<string, ReadonlyArray<string>> => activeWriteScopes
+
+export const getActiveWriteScope = (sessionId: string): ReadonlyArray<string> | undefined =>
+  activeWriteScopes.get(sessionId)
+
+export const registerWriteScope = (sessionId: string, scopes: ReadonlyArray<string>): void => {
+  activeWriteScopes.set(sessionId, scopes)
+}
+
+export const unregisterWriteScope = (sessionId: string): void => {
+  activeWriteScopes.delete(sessionId)
+}
+
+export const checkWriteScope = (targetPath: string, writeScope?: ReadonlyArray<string>): string | undefined => {
+  if (!writeScope || writeScope.length === 0) return undefined
+  const normalized = targetPath.replaceAll("\\", "/")
+  const matches = writeScope.some((pattern) => {
+    const p = pattern.replaceAll("\\", "/")
+    if (p.endsWith("/**")) {
+      const prefix = p.slice(0, -3)
+      return normalized.startsWith(prefix) || normalized === prefix.replace(/\/$/, "")
+    }
+    if (p.endsWith("/*")) {
+      const prefix = p.slice(0, -2)
+      return normalized.startsWith(prefix)
+    }
+    if (p.includes("*")) {
+      const regex = new RegExp("^" + p.replaceAll(".", "\\.").replaceAll("*", ".*") + "$")
+      return regex.test(normalized)
+    }
+    return normalized === p || normalized.startsWith(p.endsWith("/") ? p : p + "/")
+  })
+  if (!matches) {
+    return `Advisory write_scope violation: Target path '${targetPath}' is outside declared subagent write_scope [${writeScope.join(", ")}].`
+  }
+  return undefined
+}
+
 export const Input = Schema.Struct({
   agent: Schema.String.annotate({
     description:
@@ -124,6 +164,12 @@ export const Input = Schema.Struct({
   }),
   context_tier: Schema.optionalKey(Schema.Literals(["128k", "384k"])).annotate({
     description: "Context tier allocation ('128k' or '384k'). Defaults to '128k' for subagents.",
+  }),
+  mode: Schema.optionalKey(Schema.Literals(["fresh", "fork"])).annotate({
+    description: "Execution mode ('fresh' starts empty context; 'fork' inherits parent context prefix). Defaults to 'fresh'.",
+  }),
+  write_scope: Schema.optionalKey(Schema.Array(Schema.String)).annotate({
+    description: "Optional list of file/directory paths or globs this subagent is permitted to write or edit.",
   }),
 })
 
@@ -328,6 +374,8 @@ export const Plugin = {
                 ...inheritedKwargs,
                 contextTier: resolvedTier,
                 context_tier: resolvedTier,
+                mode: input.mode ?? "fresh",
+                ...(input.write_scope ? { write_scope: input.write_scope } : {}),
                 ...(parentCorr && subSpanId
                   ? {
                       aquanoxConversationId: parentCorr.conversationId,
@@ -357,6 +405,9 @@ export const Plugin = {
                   ))
                             SessionSlotLease.registerChildSession(child.id, context.sessionID)
               SessionSlotLease.setSessionTier(child.id, resolvedTier)
+              if (input.write_scope && input.write_scope.length > 0) {
+                registerWriteScope(child.id, input.write_scope)
+              }
               if (parentCorr && subSpanId) {
                 AquanoxTrace.recordSubagentBinding({
                   childSessionId: child.id,

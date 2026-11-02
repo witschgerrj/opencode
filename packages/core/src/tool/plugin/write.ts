@@ -1,3 +1,4 @@
+import { SubagentTool } from "./subagent.js"
 /**
  * Model-facing file-write leaf. Relative paths resolve within the active
  * Location. Absolute paths inside that Location are accepted, while explicit
@@ -63,6 +64,14 @@ export const Plugin = {
           output: Output,
           execute: (input, context) =>
             Effect.gen(function* () {
+              const scopeWarning = SubagentTool.checkWriteScope(
+                input.path,
+                SubagentTool.getActiveWriteScope(context.sessionID),
+              )
+              if (scopeWarning) {
+                return yield* new ToolFailure({ message: scopeWarning })
+              }
+
               const source = {
                 type: "tool" as const,
                 messageID: context.messageID,

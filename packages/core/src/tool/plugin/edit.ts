@@ -1,3 +1,4 @@
+import { SubagentTool } from "./subagent.js"
 /**
  * Model-facing exact-edit leaf. Relative paths resolve within the active
  * Location. Absolute paths inside that Location are accepted, while explicit
@@ -240,6 +241,14 @@ export const Plugin = {
           output: Output,
           execute: (input, context) => {
             return Effect.gen(function* () {
+              const scopeWarning = SubagentTool.checkWriteScope(
+                input.path,
+                SubagentTool.getActiveWriteScope(context.sessionID),
+              )
+              if (scopeWarning) {
+                return yield* new ToolFailure({ message: scopeWarning })
+              }
+
               const permissionSource = {
                 type: "tool" as const,
                 messageID: context.messageID,

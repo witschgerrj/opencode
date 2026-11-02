@@ -1,3 +1,5 @@
+import * as fs from "node:fs"
+import * as path from "node:path"
 import { emptyInputJsonSchema, type ToolDefinition } from "@opencode/ai/effect"
 import { isRecord } from "@opencode/util/record"
 import { Tool } from "@opencode/schema/tool"
@@ -255,10 +257,45 @@ const hasLocalReference = (value: unknown): boolean => {
   return Object.values(value).some(hasLocalReference)
 }
 
+export function truncateWithSpillToFile(raw: string): string {
+  if (raw.length <= 50_000) return raw
+
+  let spillPath = ""
+  try {
+    const dir = "/tmp/aquanox-tool-spill"
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const filename = `tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.log`
+    spillPath = path.join(dir, filename)
+    fs.writeFileSync(spillPath, raw, { mode: 0o600, encoding: "utf8" })
+  } catch {
+    // try/catch so it never throws
+  }
+
+  const head = raw.slice(0, 20_000)
+  const tail = raw.slice(-20_000)
+  const spillNote = spillPath
+    ? `Full output saved to ${spillPath} — use read/grep to inspect`
+    : `Full output could not be saved to disk`
+
+  return `${head}\n\n... [Output truncated (${raw.length} chars total). ${spillNote}] ...\n\n${tail}`
+}
+
 export const normalizeContent = (value: string | ReadonlyArray<Tool.Content> | undefined, output?: unknown) => {
-  if (typeof value === "string") return [{ type: "text" as const, text: value }]
-  if (value !== undefined && value.length > 0) return [...value]
-  return [{ type: "text" as const, text: stringify(output) }]
+  let content: Array<Tool.Content>
+  if (typeof value === "string") {
+    content = [{ type: "text" as const, text: value }]
+  } else if (value !== undefined && value.length > 0) {
+    content = [...value]
+  } else {
+    content = [{ type: "text" as const, text: stringify(output) }]
+  }
+
+  return content.map((item) => {
+    if (item.type === "text" && typeof item.text === "string" && item.text.length > 50_000) {
+      return { ...item, text: truncateWithSpillToFile(item.text) }
+    }
+    return item
+  })
 }
 
 export const stringify = (value: unknown) => {

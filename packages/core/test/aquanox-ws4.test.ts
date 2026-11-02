@@ -132,7 +132,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
     expect(budgetAfterCompact).toBe(8192)
   })
 
-  test("Tier 2: Complex Synthesis & Error-Diagnosis Tier (4096 tokens)", () => {
+  test("Tier 2: Complex Synthesis & Error-Diagnosis Tier (8192 tokens)", () => {
     // 1. Tool execution error
     const errTool = makeAssistantTool("shell", {
       status: "error",
@@ -146,7 +146,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetError).toBe(4096)
+    expect(budgetError).toBe(8192)
 
     // 2. Failure diagnostic regex patterns in output text
     for (const failureText of [
@@ -173,7 +173,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
         isSynthesizing: false,
         stepLimitReached: false,
       })
-      expect(budgetDiag).toBe(4096)
+      expect(budgetDiag).toBe(8192)
     }
 
     // 3. Multi-tool fan-in (>= 3 tool calls)
@@ -188,7 +188,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetFanIn).toBe(4096)
+    expect(budgetFanIn).toBe(8192)
 
     // 4. Cumulative exploratory steps >= 2
     const readStep1 = makeAssistantMessage([
@@ -205,10 +205,10 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetExploratorySynthesis).toBe(4096)
+    expect(budgetExploratorySynthesis).toBe(8192)
   })
 
-  test("Tier 3: Clean Verification / Incremental Edit Continuation Tier (1280 tokens)", () => {
+  test("Tier 3: Clean Verification / Incremental Edit Continuation Tier (4096 tokens)", () => {
     // 1 clean mutating edit tool
     const cleanEdit = makeAssistantTool("edit", {
       status: "completed",
@@ -222,7 +222,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetEdit).toBe(1280)
+    expect(budgetEdit).toBe(4096)
 
     // 2 clean mutating shell/write tools
     const cleanWrite = makeAssistantTool("write", { status: "completed", content: [{ type: "text", text: "ok" }] })
@@ -235,10 +235,10 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetMutating2).toBe(1280)
+    expect(budgetMutating2).toBe(4096)
   })
 
-  test("Tier 4: Single-File Exploratory Continuation Tier (1024 tokens)", () => {
+  test("Tier 4: Single-File Exploratory Continuation Tier (3072 tokens)", () => {
     // 1 clean read step
     const cleanRead = makeAssistantTool("read", {
       status: "completed",
@@ -252,7 +252,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetSingleRead).toBe(1024)
+    expect(budgetSingleRead).toBe(3072)
   })
 })
 

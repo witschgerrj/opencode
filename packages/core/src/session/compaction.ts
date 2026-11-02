@@ -186,6 +186,9 @@ Break the objective into smaller goals and report which are completed, which are
 ### Blocked
 - [anything blocking progress, and why; otherwise "(none)"]
 
+## Failed Hypotheses / Approaches Not to Repeat
+- [debugging attempts, architectural approaches, or test fixes that failed, why they failed, and why they MUST NOT be retried; or "(none)"]
+
 ## Next Move
 1. [ordered list of next actions, or "(none)"]
 
@@ -203,6 +206,7 @@ const SUMMARY_RULES = `Rules:
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
 - Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
 - Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
+- Under Failed Hypotheses, document failed fixes, incorrect assumptions, or broken approaches with their error messages so future turns avoid repeating them.
 - Do not mention the summary process or that context was compacted.`
 
 export const buildPrompt = (update: boolean, legacy = false) => {
@@ -414,10 +418,10 @@ export const layer = Layer.effect(
       given?: Estimate,
     ) {
       const settings = state.get()
-      if (!settings.precompute || !settings.auto) return
       const context = yield* load
-      if (context.model.compaction?.type === "native") return
       const isDeepSeekLocal = String(context.model.ref.providerID) === "deepseek-local"
+      if (!isDeepSeekLocal && (!settings.precompute || !settings.auto)) return
+      if (context.model.compaction?.type === "native") return
       const ceiling = calculateCeiling(context.model.limit, settings.buffer, context.model.ref.providerID)
       if (!Number.isFinite(ceiling)) return
       const estimate = given ?? estimatePrompt(context)
@@ -1268,9 +1272,17 @@ export const calculateCeiling = (
   const window = limit.input || limit.context
   if (window <= 0) return Number.POSITIVE_INFINITY
 
+  const isDeepSeekLocal = String(providerID) === "deepseek-local"
+
   // 128k dual-tier: effectiveBuffer = 32768, ceiling = window - 32768 = 98304 (skip 0.85 floor clamp)
-  if (window <= 131072) {
+  if (isDeepSeekLocal && window <= 131072) {
     const effectiveBuffer = buffer !== undefined && buffer < window ? buffer : 32768
+    return window - effectiveBuffer
+  }
+
+  // 256k tier: window = 262,144, buffer = 38,144 -> ceiling = 224,000
+  if (isDeepSeekLocal && window <= 262144) {
+    const effectiveBuffer = buffer !== undefined && buffer < window ? buffer : 38144
     return window - effectiveBuffer
   }
 
@@ -1279,7 +1291,7 @@ export const calculateCeiling = (
       ? window - buffer
       : window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
   // Ensure deepseek-local never triggers premature < 320K compaction below 0.85 * contextLimit (~334K of 393,216)
-  if (String(providerID) === "deepseek-local" && (limit.context > 0 || (limit.input ?? 0) > 0)) {
+  if (isDeepSeekLocal && (limit.context > 0 || (limit.input ?? 0) > 0)) {
     const contextLimit = limit.context || limit.input || 393_216
     const floor = Math.floor(0.85 * contextLimit)
     if (ceiling < floor) {

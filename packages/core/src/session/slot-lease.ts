@@ -20,10 +20,10 @@ export interface ConversationAdmissionInput {
   reservedSubagentQuanta?: number
   maxConcurrentSubagents?: number
   resources?: {
-    contextTier?: "128k" | "384k"
+    contextTier?: "128k" | "256k" | "384k"
     reservedSubagents?: {
       count: number
-      contextTier: "128k" | "384k"
+      contextTier?: "128k" | "256k" | "384k"
     }
     maxConcurrentSubagents?: number
   }
@@ -107,7 +107,7 @@ interface SubagentWaiter {
   readonly id: string
   readonly sessionID: string
   readonly parentSessionID?: string
-  readonly tier: "128k" | "384k"
+  readonly tier: "128k" | "256k" | "384k"
   readonly conversationId?: string
   readonly resume: (effect: Effect.Effect<SlotID>) => void
 }
@@ -137,7 +137,7 @@ const blockOwner: Record<0 | 1 | 2, string | undefined> = {
 }
 
 const sessionSlotMap = new Map<string, PhysicalSlotID>()
-const sessionTierMap = new Map<string, "128k" | "384k">()
+const sessionTierMap = new Map<string, "128k" | "256k" | "384k">()
 const sessionConversationMap = new Map<string, string>()
 const childParentMap = new Map<string, string>()
 const conversations = new Map<string, AdmittedConversation>()
@@ -193,11 +193,11 @@ export function registerChildSession(childID: string, parentID: string): void {
   childParentMap.set(childID, parentID)
 }
 
-export function setSessionTier(sessionID: string, tier: "128k" | "384k"): void {
+export function setSessionTier(sessionID: string, tier: "128k" | "256k" | "384k"): void {
   sessionTierMap.set(sessionID, tier)
 }
 
-export function getSessionTier(sessionID: string): "128k" | "384k" | undefined {
+export function getSessionTier(sessionID: string): "128k" | "256k" | "384k" | undefined {
   return sessionTierMap.get(sessionID)
 }
 
@@ -397,7 +397,7 @@ export function releaseConversation(conversationId: string): { ok: boolean } {
 function tryAcquireSubagentSync(input: {
   sessionID: string
   parentSessionID?: string
-  tier: "128k" | "384k"
+  tier: "128k" | "256k" | "384k"
 }): PhysicalSlotID | undefined {
   const tier = input.tier
   const neededQuanta = tier === "384k" ? 3 : 1
@@ -448,10 +448,11 @@ function tryAcquireSubagentSync(input: {
       }
     }
 
+    const SUBAGENT_SLOT_PREFERENCE: ReadonlyArray<PhysicalSlotID> = [2, 5, 8, 1, 4, 7] as const
     const splitBlockSlots: PhysicalSlotID[] = []
     const idleBlockSlots: PhysicalSlotID[] = []
 
-    for (const s of SLOTS) {
+    for (const s of SUBAGENT_SLOT_PREFERENCE) {
       const b = Math.floor(s / 3) as 0 | 1 | 2
       if (blockMode[b] === "384k_locked") continue
       if (activeSessionsBySlot[s].size > 0) continue
@@ -532,7 +533,7 @@ function drainWaiters(): void {
 export function acquireSubagentAsync(input: {
   sessionID: string
   parentSessionID?: string
-  tier: "128k" | "384k"
+  tier: "128k" | "256k" | "384k"
 }): Effect.Effect<SlotID> {
   return Effect.callback<SlotID>((resume) => {
     const immediate = tryAcquireSubagentSync(input)
@@ -559,7 +560,7 @@ export function withTierLease<A, E, R>(
   input: {
     sessionID: string
     parentSessionID?: string
-    tier: "128k" | "384k"
+    tier: "128k" | "256k" | "384k"
   },
   use: (slot: SlotID) => Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> {

@@ -72,21 +72,21 @@ export const resolved = (
 export const resolveSessionContextTier = (
   session: SessionSchema.Info,
   agentInfo?: Agent.Info,
-): "128k" | "384k" => {
-  if (!session.parentID) {
-    return "384k"
-  }
+): "128k" | "256k" | "384k" => {
   const metadata = session.metadata as Record<string, unknown> | undefined
   const metadataTier = metadata?.["contextTier"] ?? metadata?.["context_tier"]
-  if (metadataTier === "128k" || metadataTier === "384k") {
+  if (metadataTier === "128k" || metadataTier === "256k" || metadataTier === "384k") {
     return metadataTier
   }
   const leaseTier = SessionSlotLease.getSessionTier(session.id)
-  if (leaseTier === "128k" || leaseTier === "384k") {
+  if (leaseTier === "128k" || leaseTier === "256k" || leaseTier === "384k") {
     return leaseTier
   }
   if (agentInfo?.resources?.contextTier) {
-    return agentInfo.resources.contextTier
+    return agentInfo.resources.contextTier as "128k" | "256k" | "384k"
+  }
+  if (!session.parentID) {
+    return "256k"
   }
   return "128k"
 }
@@ -129,6 +129,9 @@ const layer = Layer.effect(
         if (tier === "128k") {
           limit.context = 131072
           limit.output = Math.min(limit.output ?? 16384, 16384) || 8192
+        } else if (tier === "256k") {
+          limit.context = 262144
+          limit.output = Math.min(limit.output ?? 32768, 32768) || 16384
         } else if (tier === "384k") {
           const isDeepseekLocal =
             String(baseResolved.ref.providerID) === "deepseek-local" ||

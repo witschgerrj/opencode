@@ -308,7 +308,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(rootRoute).toEqual({
       toolChoice: undefined,
-      httpBody: { id_slot: 0, reasoning_budget_tokens: 12288 },
+      httpBody: { id_slot: 0, reasoning_budget_tokens: 12288, think_temp: 0.85, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
@@ -334,7 +334,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
       time: { created, completed: created },
     })
 
-    // 2. Explore child action step: Slot 1, toolChoice "auto", reasoning_budget_tokens 1024
+    // 2. Explore child action step: Slot 1, toolChoice "auto", non-truncating exploratory ceiling 3072
     const exploreAction = SessionRunnerLLM.resolveStepRouting({
       session: exploreSession,
       agent: makeAgent("explore"),
@@ -344,11 +344,11 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(exploreAction).toEqual({
       toolChoice: "auto",
-      httpBody: { id_slot: 1, reasoning_budget_tokens: 1024 },
+      httpBody: { id_slot: 1, reasoning_budget_tokens: 3072, think_temp: 0.85, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
-    // 3. Concurrent General child action step: Slot 2, toolChoice "auto", reasoning_budget_tokens 3072
+    // 3. Concurrent General child action step: Slot 2, toolChoice "auto", non-truncating exploratory ceiling 3072
     const generalAction = SessionRunnerLLM.resolveStepRouting({
       session: generalSession,
       agent: makeAgent("general"),
@@ -358,7 +358,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(generalAction).toEqual({
       toolChoice: "auto",
-      httpBody: { id_slot: 2, reasoning_budget_tokens: 1024 },
+      httpBody: { id_slot: 2, reasoning_budget_tokens: 3072, think_temp: 0.85, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
@@ -392,7 +392,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(exploreSynthesis).toEqual({
       toolChoice: "none",
-      httpBody: { id_slot: 1, reasoning_budget_tokens: 4096 },
+      httpBody: { id_slot: 1, reasoning_budget_tokens: 4096, think_temp: 0.85, think_min_p: 0.01 },
       isSynthesizing: true,
     })
 
