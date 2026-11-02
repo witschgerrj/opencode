@@ -33,18 +33,18 @@ export const SystemResourcesHandler = HttpApiBuilder.group(Api, "system.resource
       .handle(
         "system.resources.bind",
         Effect.fn("system.resources.bind")(function* (ctx) {
-          const success = SessionSlotLease.bindConversationSession({
+          const res = SessionSlotLease.bindConversationSession({
             conversationId: ctx.payload.conversationId,
-            sessionID: ctx.payload.sessionId,
+            sessionID: ctx.payload.sessionId ?? ctx.payload.sessionID ?? "",
           })
-          return { success }
+          return { success: res.ok }
         }),
       )
       .handle(
         "system.resources.release",
         Effect.fn("system.resources.release")(function* (ctx) {
-          const released = SessionSlotLease.releaseConversation(ctx.payload.conversationId)
-          return { released }
+          const res = SessionSlotLease.releaseConversation(ctx.payload.conversationId)
+          return { released: res.ok }
         }),
       ),
   ),

@@ -67,6 +67,8 @@ export const AdmitConversationInput = Schema.Struct({
   conversationId: Schema.String,
   agentId: Schema.optional(Schema.String),
   rootSessionId: Schema.optional(Schema.String),
+  reservedSubagentQuanta: Schema.optional(Schema.Int),
+  maxConcurrentSubagents: Schema.optional(Schema.Int),
   resources: Schema.optional(
     Schema.Struct({
       contextTier: Schema.optional(Schema.Literals(["128k", "384k"])),
@@ -93,7 +95,8 @@ export type AdmitConversationResult = typeof AdmitConversationResult.Type
 
 export const BindConversationInput = Schema.Struct({
   conversationId: Schema.String,
-  sessionId: Schema.String,
+  sessionId: Schema.optional(Schema.String),
+  sessionID: Schema.optional(Schema.String),
 }).annotate({ identifier: "BindConversationInput" })
 export type BindConversationInput = typeof BindConversationInput.Type
 
