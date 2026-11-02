@@ -427,10 +427,7 @@ export const layer = Layer.effect(
       const estimate = given ?? estimatePrompt(context)
       if (due(context, ceiling, estimate)) return
       if (isDeepSeekLocal) {
-        const isTier128k = (context.model.limit.context || 0) <= 131072
-        const floor = isTier128k
-          ? Math.floor(ceiling * PRECOMPUTE_RATIO)
-          : Math.floor(0.85 * (context.model.limit.context || 393_216))
+        const floor = Math.floor(ceiling * PRECOMPUTE_RATIO)
         if (total(estimate) < floor) return
       } else {
         if (total(estimate) < ceiling * PRECOMPUTE_RATIO) return
@@ -488,8 +485,9 @@ export const layer = Layer.effect(
     ): Effect.fn.Return<Result | undefined> {
       const context = trigger.context
       const index = heldIndex(held, context)
+      const isDeepSeekLocal = String(context.model.ref.providerID) === "deepseek-local"
       const usable =
-        settings.precompute &&
+        (settings.precompute || isDeepSeekLocal) &&
         trigger.reason !== "overflow" &&
         context.model.compaction?.type !== "native" &&
         index >= 0 &&

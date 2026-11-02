@@ -193,6 +193,47 @@ describe("Aquanox Dual-Tier 9-Quantum Coordinator — SessionSlotLease Buddy Are
     expect(snap.freeFullBlocks384k).toBe(3)
     expect(snap.canAdmitNewLeadConversation).toBe(true)
   })
+
+  test("idempotent sticky subagent re-acquisition does not leak activeSubagents or quanta", () => {
+    SessionSlotLease.admitConversation({
+      conversationId: "conv_idempotent",
+      resources: {
+        contextTier: "384k",
+        reservedSubagents: { count: 3, contextTier: "128k" },
+        maxConcurrentSubagents: 3,
+      },
+    })
+    SessionSlotLease.bindConversationSession({ conversationId: "conv_idempotent", sessionID: "ses_lead" })
+    SessionSlotLease.acquire("ses_lead", false)
+
+    SessionSlotLease.registerChildSession("ses_sub_1", "ses_lead")
+    SessionSlotLease.setSessionTier("ses_sub_1", "128k")
+
+    const slotA = Effect.runSync(
+      SessionSlotLease.acquireSubagentAsync({
+        sessionID: "ses_sub_1",
+        parentSessionID: "ses_lead",
+        tier: "128k",
+      }),
+    )
+    const slotB = Effect.runSync(
+      SessionSlotLease.acquireSubagentAsync({
+        sessionID: "ses_sub_1",
+        parentSessionID: "ses_lead",
+        tier: "128k",
+      }),
+    )
+    expect(slotB).toBe(slotA)
+
+    const snapDuring = SessionSlotLease.getResourceSnapshot({ conversationId: "conv_idempotent" })
+    expect(snapDuring.thisConversation?.activeSubagents).toBe(1)
+    expect(snapDuring.thisConversation?.activeSubagentQuanta128k).toBe(1)
+
+    SessionSlotLease.release("ses_sub_1")
+    const snapAfter = SessionSlotLease.getResourceSnapshot({ conversationId: "conv_idempotent" })
+    expect(snapAfter.thisConversation?.activeSubagents).toBe(0)
+    expect(snapAfter.thisConversation?.activeSubagentQuanta128k).toBe(0)
+  })
 })
 
 describe("Aquanox Dual-Tier Context Engine — Tier Resolution & Compaction Ceiling", () => {

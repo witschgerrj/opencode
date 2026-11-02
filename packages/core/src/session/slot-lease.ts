@@ -377,6 +377,16 @@ export function releaseConversation(conversationId: string): { ok: boolean } {
     sessionConversationMap.delete(conv.rootSessionId)
   }
 
+  for (let i = waiterQueue.length - 1; i >= 0; i--) {
+    const w = waiterQueue[i]
+    if (
+      w.conversationId === conversationId ||
+      (w.parentSessionID !== undefined && sessionConversationMap.get(w.parentSessionID) === conversationId)
+    ) {
+      waiterQueue.splice(i, 1)
+    }
+  }
+
   for (const [sessId, cId] of sessionConversationMap.entries()) {
     if (cId === conversationId) {
       const slot = sessionSlotMap.get(sessId)
@@ -400,7 +410,18 @@ function tryAcquireSubagentSync(input: {
   tier: "128k" | "256k" | "384k"
 }): PhysicalSlotID | undefined {
   const tier = input.tier
-  const neededQuanta = tier === "384k" ? 3 : 1
+  const existingSlot = sessionSlotMap.get(input.sessionID)
+  if (existingSlot !== undefined && activeSessionsBySlot[existingSlot]?.has(input.sessionID)) {
+    const existingTier = sessionTierMap.get(input.sessionID) ?? "128k"
+    const requestedEffectiveTier = tier === "128k" ? "128k" : "384k"
+    if (existingTier === requestedEffectiveTier) {
+      lastUsedAtPerSlot[existingSlot] = ++leaseClock
+      recordPin(input.sessionID, existingSlot)
+      return existingSlot
+    }
+  }
+
+  const neededQuanta = tier === "128k" ? 1 : 3
   const convId = input.parentSessionID ? getConversationIdForSession(input.parentSessionID) : undefined
   const conv = convId ? conversations.get(convId) : undefined
 
@@ -431,7 +452,7 @@ function tryAcquireSubagentSync(input: {
       const b = Math.floor(sticky / 3) as 0 | 1 | 2
       if (
         blockMode[b] !== "384k_locked" &&
-        (activeSessionsBySlot[sticky].has(input.sessionID) || activeSessionsBySlot[sticky].size === 0)
+        activeSessionsBySlot[sticky].size === 0
       ) {
         activeSessionsBySlot[sticky].add(input.sessionID)
         lastUsedAtPerSlot[sticky] = ++leaseClock
@@ -553,6 +574,12 @@ export function acquireSubagentAsync(input: {
       resume,
     }
     waiterQueue.push(waiter)
+    return Effect.sync(() => {
+      const idx = waiterQueue.findIndex((w) => w.id === waiterId)
+      if (idx !== -1) {
+        waiterQueue.splice(idx, 1)
+      }
+    })
   })
 }
 
