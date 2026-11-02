@@ -77,6 +77,7 @@ import { QuestionTool } from "../tool/plugin/question.js"
 import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
 import { RequestSynthesisTool } from "../tool/plugin/request-synthesis.js"
+import { SystemResourcesTool } from "../tool/plugin/system-resources.js"
 import { ArtifactTool } from "../tool/plugin/artifact.js"
 import { HeadlessBrowserTool } from "../tool/plugin/headless-browser.js"
 import { LspTool } from "../tool/plugin/lsp.js"
@@ -248,6 +249,7 @@ const pre = [
   QuestionTool.Plugin,
   ReadTool.Plugin,
   RequestSynthesisTool.Plugin,
+  SystemResourcesTool.Plugin,
   ArtifactTool.Plugin,
   HeadlessBrowserTool.Plugin,
   LspTool.Plugin,

@@ -218,55 +218,53 @@ export const computeCausalReasoningBudget = (input: {
   readonly isSynthesizing: boolean
   readonly stepLimitReached: boolean
 }): number => {
-  const { variant, configuredBudget, isExplore, isSynthesizing, stepLimitReached } = input
+  const { variant, configuredBudget, isExplore, isSynthesizing, stepLimitReached, isSubagent } = input
 
+  let budget: number
   if (variant === "low") {
     if (configuredBudget !== undefined && configuredBudget >= 0 && configuredBudget < 1024) {
-      return configuredBudget
+      budget = configuredBudget
+    } else {
+      budget = isExplore ? 1024 : 256
     }
-    return isExplore ? 1024 : 256
-  }
-  if (variant === "medium") {
+  } else if (variant === "medium") {
     if (configuredBudget !== undefined && configuredBudget >= 0 && configuredBudget < 2048) {
-      return configuredBudget
+      budget = configuredBudget
+    } else {
+      budget = 2048
     }
-    return 2048
+  } else {
+    const analysis = analyzeCausalStep(input.messages)
+
+    if (analysis.isTurnEntry) {
+      const turnCeiling =
+        configuredBudget !== undefined && configuredBudget >= 0
+          ? configuredBudget
+          : variant === "max"
+            ? 12288
+            : variant === "high"
+              ? 8192
+              : 6144
+      budget = Math.max(6144, turnCeiling)
+    } else if (stepLimitReached) {
+      budget = 2048
+    } else if (isSynthesizing) {
+      budget = 4096
+    } else if (analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn || analysis.cumulativeExploratorySteps >= 2) {
+      budget = 4096
+    } else if (analysis.isCleanMutatingContinuation) {
+      budget = 1280
+    } else if (analysis.isSingleExploratoryContinuation) {
+      budget = 1024
+    } else {
+      budget = 4096
+    }
   }
 
-  const analysis = analyzeCausalStep(input.messages)
-
-  if (analysis.isTurnEntry) {
-    const turnCeiling =
-      configuredBudget !== undefined && configuredBudget >= 0
-        ? configuredBudget
-        : variant === "max"
-          ? 12288
-          : variant === "high"
-            ? 8192
-            : 6144
-    return Math.max(6144, turnCeiling)
+  if (isSubagent) {
+    return Math.min(budget, 4096)
   }
-
-  if (stepLimitReached) {
-    return 2048
-  }
-  if (isSynthesizing) {
-    return 4096
-  }
-
-  if (analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn || analysis.cumulativeExploratorySteps >= 2) {
-    return 4096
-  }
-
-  if (analysis.isCleanMutatingContinuation) {
-    return 1280
-  }
-
-  if (analysis.isSingleExploratoryContinuation) {
-    return 1024
-  }
-
-  return 4096
+  return budget
 }
 
 export const resolveStepRouting = (input: {

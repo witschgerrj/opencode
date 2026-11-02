@@ -85,6 +85,7 @@ const READ_ONLY_TOOLS = new Set([
   "codesearch",
   "lsp",
   "request_synthesis",
+  "inspect_system_resources",
 ])
 
 interface Input {

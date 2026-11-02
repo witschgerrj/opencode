@@ -70,6 +70,7 @@ export const Plugin = define({
         item.permissions.push(
           { action: "question", resource: "*", effect: "deny" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
+          { action: "inspect_system_resources", resource: "*", effect: "allow" },
           { action: "send_message", resource: "*", effect: "allow" },
           { action: "lsp", resource: "*", effect: "allow" },
           { action: "memory", resource: "*", effect: "allow" },
@@ -99,6 +100,7 @@ export const Plugin = define({
           { action: "read", resource: "*.env.*", effect: "ask" },
           { action: "read", resource: "*.env.example", effect: "allow" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
+          { action: "inspect_system_resources", resource: "*", effect: "allow" },
           { action: "send_message", resource: "*", effect: "allow" },
           { action: "skill", resource: "*", effect: "allow" },
           { action: "lsp", resource: "*", effect: "allow" },

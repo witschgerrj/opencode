@@ -19,6 +19,21 @@ export type Name = typeof Name.Type
 export const Color = Schema.String.annotate({ identifier: "Agent.Color" })
 export type Color = typeof Color.Type
 
+export const ContextTier = Schema.Literals(["128k", "384k"]).annotate({ identifier: "Agent.ContextTier" })
+export type ContextTier = typeof ContextTier.Type
+
+export const AgentResourceConfig = Schema.Struct({
+  contextTier: ContextTier.pipe(optional),
+  reservedSubagents: Schema.Struct({
+    count: Schema.Number,
+    contextTier: ContextTier.pipe(optional),
+  }).pipe(optional),
+  maxConcurrentSubagents: Schema.Number.pipe(optional),
+}).annotate({ identifier: "Agent.ResourceConfig" })
+export type AgentResourceConfig = typeof AgentResourceConfig.Type
+export const ResourceConfig = AgentResourceConfig
+export type ResourceConfig = AgentResourceConfig
+
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 export const Info = Schema.Struct({
   id: ID,
@@ -31,6 +46,7 @@ export const Info = Schema.Struct({
   hidden: Schema.Boolean,
   color: Color.pipe(optional),
   steps: PositiveInt.pipe(optional),
+  resources: AgentResourceConfig.pipe(optional),
   permissions: Permission.Ruleset,
 })
   .annotate({ identifier: "Agent.Info" })

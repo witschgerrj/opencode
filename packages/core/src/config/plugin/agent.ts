@@ -117,6 +117,7 @@ export const Plugin = define({
             if (item.hidden !== undefined) agent.hidden = item.hidden
             if (item.color !== undefined) agent.color = item.color
             if (item.steps !== undefined) agent.steps = item.steps
+            if (item.resources !== undefined) agent.resources = item.resources
             if (item.permissions !== undefined) {
               agent.permissions.push(...expandPermissions(item.permissions, global.home))
             }
@@ -193,6 +194,7 @@ const toolMapping: Record<string, readonly string[]> = {
   send_message: ["send_message"],
   manage_task: ["manage_task"],
   schedule: ["schedule"],
+  inspect_system_resources: ["inspect_system_resources"],
 }
 
 const standardAutonomousTools: readonly string[] = [
@@ -202,6 +204,7 @@ const standardAutonomousTools: readonly string[] = [
   "headless_browser",
   "render_artifact",
   "request_synthesis",
+  "inspect_system_resources",
   "snapshot",
   "external_directory",
 ]

@@ -122,6 +122,9 @@ export const Input = Schema.Struct({
     description:
       "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
   }),
+  context_tier: Schema.optionalKey(Schema.Literals(["128k", "384k"])).annotate({
+    description: "Context tier allocation ('128k' or '384k'). Defaults to '128k' for subagents.",
+  }),
 })
 
 export const Output = Schema.Struct({
@@ -136,6 +139,7 @@ export const description = [
   "Foreground (default) runs the subagent to completion and returns its final response.",
   "Background mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.",
   "Use background only for independent work that can run while you continue elsewhere.",
+  "CONCURRENCY LIMIT: A conversation may have at most 3 subagents active concurrently (3x128k or 1x384k). Additional subagents wait in queue until active slots release. Design steps to dispatch in waves of at most 3.",
 ].join("\n")
 
 export const Plugin = {
@@ -312,6 +316,8 @@ export const Plugin = {
               const parentCorr = propagateMeta ? AquanoxTrace.resolveSessionCorrelationSync(parent) : undefined
               const subSpanId = propagateMeta ? AquanoxTrace.newSpanId("sp_oc_sub") : undefined
               const parentToolSpanId = `sp_oc_tool_${context.sessionID}_${context.id}`
+              const resolvedTier: "128k" | "384k" =
+                input.context_tier ?? agent.resources?.contextTier ?? "128k"
               const childThinkingMode = model?.variant ?? parentCorr?.thinkingMode ?? null
               const inheritedKwargs =
                 inheritedReasoningEffort !== undefined
@@ -320,6 +326,8 @@ export const Plugin = {
               const childMetadata: any = {
                 ...(existing?.metadata ?? parent.metadata ?? {}),
                 ...inheritedKwargs,
+                contextTier: resolvedTier,
+                context_tier: resolvedTier,
                 ...(parentCorr && subSpanId
                   ? {
                       aquanoxConversationId: parentCorr.conversationId,
@@ -347,6 +355,8 @@ export const Plugin = {
                       (error) => new ToolFailure({ message: `Parent session not found: ${context.sessionID}`, error }),
                     ),
                   ))
+                            SessionSlotLease.registerChildSession(child.id, context.sessionID)
+              SessionSlotLease.setSessionTier(child.id, resolvedTier)
               if (parentCorr && subSpanId) {
                 AquanoxTrace.recordSubagentBinding({
                   childSessionId: child.id,
@@ -405,7 +415,16 @@ export const Plugin = {
 
               const preleasedSlot = model !== undefined && String(model.providerID) === "deepseek-local"
               if (preleasedSlot) {
-                SessionSlotLease.acquire(child.id, true)
+                yield* SessionSlotLease.acquireSubagentAsync({
+                  sessionID: child.id,
+                  parentSessionID: context.sessionID,
+                  tier: resolvedTier,
+                }).pipe(
+                  Effect.timeout("30 seconds"),
+                  Effect.catch(() =>
+                    Effect.sync(() => SessionSlotLease.acquire(child.id, true)),
+                  ),
+                )
               }
               let jobStarted = false
 

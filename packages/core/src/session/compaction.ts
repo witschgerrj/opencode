@@ -423,7 +423,10 @@ export const layer = Layer.effect(
       const estimate = given ?? estimatePrompt(context)
       if (due(context, ceiling, estimate)) return
       if (isDeepSeekLocal) {
-        const floor = Math.floor(0.85 * (context.model.limit.context || 393_216))
+        const isTier128k = (context.model.limit.context || 0) <= 131072
+        const floor = isTier128k
+          ? Math.floor(ceiling * PRECOMPUTE_RATIO)
+          : Math.floor(0.85 * (context.model.limit.context || 393_216))
         if (total(estimate) < floor) return
       } else {
         if (total(estimate) < ceiling * PRECOMPUTE_RATIO) return
@@ -1264,6 +1267,13 @@ export const calculateCeiling = (
   // all, only a provider rejection can limit the request.
   const window = limit.input || limit.context
   if (window <= 0) return Number.POSITIVE_INFINITY
+
+  // 128k dual-tier: effectiveBuffer = 32768, ceiling = window - 32768 = 98304 (skip 0.85 floor clamp)
+  if (window <= 131072) {
+    const effectiveBuffer = buffer !== undefined && buffer < window ? buffer : 32768
+    return window - effectiveBuffer
+  }
+
   let ceiling =
     buffer !== undefined && buffer < window
       ? window - buffer
