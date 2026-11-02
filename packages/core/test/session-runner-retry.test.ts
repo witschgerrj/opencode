@@ -44,4 +44,23 @@ describe("SessionRunnerRetry.policy", () => {
       expect(yield* decisions(internal, 11)).toEqual([...Array(10).fill(true), false])
     }),
   )
+
+  it.effect("allows extended 10s retries for 503 Loading model without exhausting the general budget", () =>
+    Effect.gen(function* () {
+      const loading = new AIError({
+        reason: new ProviderInternalError({
+          message: "Loading model",
+          http: { url: "http://127.0.0.1:8080/v1/chat/completions", status: 503, headers: {} },
+        }),
+      })
+      const policy = yield* SessionRunnerRetry.policy(SessionSchema.ID.make("ses_retry_loading"))
+      for (let i = 0; i < 60; i++) {
+        const d = yield* policy(input(loading))
+        expect(d).toEqual({ retry: true, attempt: i + 2, delay: 10_000 })
+      }
+      expect(yield* policy(input(loading))).toEqual({ retry: false })
+      // And the general transient failure budget is still intact:
+      expect((yield* policy(input(internal))).retry).toBe(true)
+    }),
+  )
 })

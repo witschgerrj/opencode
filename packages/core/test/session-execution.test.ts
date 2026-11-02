@@ -1,3 +1,4 @@
+import { StepFailedError } from "@opencode/core/session/error"
 import type { FileSystem } from "@opencode/core/filesystem"
 import { describe, expect, test } from "bun:test"
 import { AIError, TransportError } from "@opencode/ai/effect"
@@ -1229,6 +1230,60 @@ describe("SessionExecution interrupt continuation", () => {
 
       // The queued prompt is next in line; the compaction behind it waits its turn.
       expect(drains).toEqual([])
+    }),
+  )
+
+  it.effect("does not emit a trailing Succeeded after a multi-step drain consumes a wake and then fails", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const sessionID = Session.ID.make("ses_failed_after_consumed_wake")
+      yield* seedSessions(database, [sessionID])
+
+      const draining = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const drains: Array<{ force: boolean; promotable?: SessionInbox.Promotable }> = []
+      const terminals: string[] = []
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      yield* bus.project(SessionEvent.Execution.Failed, (event) =>
+        Effect.sync(() => {
+          if (event.data.sessionID === sessionID) terminals.push("failed")
+        }),
+      )
+      yield* bus.project(SessionEvent.Execution.Succeeded, (event) =>
+        Effect.sync(() => {
+          if (event.data.sessionID === sessionID) terminals.push("succeeded")
+        }),
+      )
+      const context = yield* buildExecution(scope, (input) =>
+        Effect.suspend(() => {
+          drains.push({ force: input.force, promotable: input.promotable })
+          return Deferred.succeed(draining, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(
+              Effect.fail(
+                new StepFailedError({
+                  error: { type: "provider.internal", message: "Loading model", status: 503 },
+                }),
+              ),
+            ),
+          )
+        }),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      const running = yield* execution.resume(sessionID).pipe(Effect.forkScoped)
+      yield* Deferred.await(draining)
+
+      // Simulate a mid-turn wake whose inbox item was already promoted/consumed by advanceToStep()
+      // before the subsequent step failed.
+      yield* execution.wake(sessionID)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.await(running)
+      yield* execution.awaitIdle(sessionID)
+
+      expect(drains).toEqual([{ force: true, promotable: "input" }])
+      expect(terminals).toEqual(["failed"])
     }),
   )
 })

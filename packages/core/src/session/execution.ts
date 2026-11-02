@@ -113,7 +113,7 @@ export const layer = Layer.effect(
         ),
       drain: (sessionID, force, promotable) => drain(sessionID, force, undefined, promotable),
       // One terminal observation per busy period, covering every coalesced drain.
-      settled: (sessionID, exit, reason) =>
+      settled: (sessionID, exit, reason): Effect.Effect<void> =>
         reportLifecycle(
           sessionID,
           Effect.gen(function* () {
@@ -131,6 +131,11 @@ export const layer = Layer.effect(
                 outcome.reason === "shutdown" ? undefined : releaseOnCommit(sessionID),
               )
               return
+            }
+            // Clear stale doorbells from inbox items already consumed earlier in a multi-step
+            // drain so settle does not spawn an empty successor drain that overwrites Failed.
+            if ((yield* SessionInbox.nextPromotable(db, sessionID, "input")) === undefined) {
+              yield* coordinator.interrupt(sessionID)
             }
             yield* bus.publish(
               SessionEvent.Execution.Failed,

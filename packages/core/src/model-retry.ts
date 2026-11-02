@@ -39,12 +39,35 @@ const schedule = Schedule.max([
 // dead provider hold a call for most of an hour. Cap those attempts well below it.
 const MAX_TIMEOUT_RETRIES = 3
 
+// Local model servers (e.g. llama-server loading a 475 GiB model + NVMe KV cache) can return HTTP 503
+// "Loading model" for 8-10 minutes during cold start or restart recovery. Allow up to 60 retries at
+// 10s intervals (10 minutes) without burning the general 10-attempt transient error budget.
+const MAX_LOADING_MODEL_RETRIES = 60
+const LOADING_MODEL_DELAY_MS = Duration.toMillis("10 seconds")
+
+const isLoadingModel = (input: Input) =>
+  input.cause.reason._tag === "ProviderInternal" &&
+  input.cause.reason.http?.status === 503 &&
+  /loading model/i.test(input.cause.reason.message)
+
 export const policy = Effect.gen(function* () {
   const step = yield* Schedule.toStep(schedule)
   let attempt = 1
   let timeouts = 0
+  let loadingRetries = 0
   return (input: Input) =>
     Effect.gen(function* () {
+      if (isLoadingModel(input)) {
+        if (loadingRetries >= MAX_LOADING_MODEL_RETRIES) return undefined
+        loadingRetries++
+        attempt++
+        const delay = Math.ceil(retryAfter(input) ?? LOADING_MODEL_DELAY_MS)
+        return {
+          attempt,
+          delay,
+          retry: input.retry,
+        }
+      }
       const now = yield* Clock.currentTimeMillis
       const next = yield* step(now, input).pipe(Pull.catchDone(() => Effect.succeed(undefined)))
       if (!next) return undefined
