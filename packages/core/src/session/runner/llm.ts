@@ -150,6 +150,17 @@ export const analyzeCausalStep = (messages: ReadonlyArray<SessionMessage.Info>):
 
   const hasErrorOrDiagnostic = assistantTools.some((tool) => {
     if (tool.state.status === "error") return true
+    if (tool.name !== "shell" && tool.name !== "bash") return false
+    const meta =
+      "metadata" in tool.state && typeof tool.state.metadata === "object" && tool.state.metadata !== null
+        ? (tool.state.metadata as Record<string, unknown>)
+        : undefined
+    if (meta?.status === "running") return false
+    const exitCode = typeof meta?.exit === "number" ? meta.exit : undefined
+    const timedOut = meta?.timeout === true
+    const signal = typeof meta?.signal === "string" ? meta.signal : undefined
+    if (exitCode === 0 && !timedOut && !signal) return false
+    if ((exitCode !== undefined && exitCode !== 0) || timedOut || signal !== undefined) return true
     const text = getToolText(tool)
     return FAILURE_DIAGNOSTIC_REGEX.test(text)
   })
@@ -166,7 +177,7 @@ export const analyzeCausalStep = (messages: ReadonlyArray<SessionMessage.Info>):
   }
 
   const mutatingToolNames = new Set(["edit", "write", "patch", "shell", "bash"])
-  const exploratoryToolNames = new Set(["read", "grep", "glob", "file_diff"])
+  const exploratoryToolNames = new Set(["read", "grep", "glob", "file_diff", "lsp", "skill"])
 
   let cumulativeExploratorySteps = 0
   for (let i = turnStartIndex; i <= lastMeaningfulIndex; i++) {
@@ -220,46 +231,54 @@ export const computeCausalReasoningBudget = (input: {
 }): number => {
   const { variant, configuredBudget, isExplore, isSynthesizing, stepLimitReached, isSubagent } = input
 
+  if (variant === "minimal" || configuredBudget === 0) {
+    return 0
+  }
+
   const baseBudget =
-    configuredBudget !== undefined && configuredBudget >= 0
-      ? configuredBudget
+    configuredBudget !== undefined && configuredBudget > 0
+      ? Math.min(configuredBudget, 2048)
       : variant === "max"
-        ? 12288
-        : variant === "high"
-          ? 8192
+        ? 2048
+        : variant === "high" || variant === "subagent-high"
+          ? 2048
           : variant === "medium"
-            ? 4096
-            : 2048
+            ? 1536
+            : 1024
 
   const analysis = analyzeCausalStep(input.messages)
 
   let budget: number
-  if (variant === "low" || baseBudget <= 2048) {
-    if (analysis.isTurnEntry || analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn) {
-      budget = 3072
+  if (variant === "low" || baseBudget <= 1024) {
+    if (analysis.isTurnEntry || analysis.hasErrorOrDiagnostic) {
+      budget = Math.min(baseBudget, 1024)
+    } else if (isSynthesizing || analysis.isCleanMutatingContinuation || analysis.isMultiToolFanIn) {
+      budget = Math.min(baseBudget, 512)
     } else {
-      budget = isExplore ? 3072 : 2048
+      budget = Math.min(baseBudget, isExplore ? 512 : 256)
     }
   } else {
     if (analysis.isTurnEntry) {
-      budget = Math.min(12288, Math.max(baseBudget, 8192))
-    } else if (stepLimitReached) {
+      budget = Math.min(2048, baseBudget)
+    } else if (analysis.hasErrorOrDiagnostic) {
       budget = 2048
+    } else if (stepLimitReached) {
+      budget = 512
     } else if (isSynthesizing) {
-      budget = 4096
-    } else if (analysis.hasErrorOrDiagnostic || analysis.isMultiToolFanIn || analysis.cumulativeExploratorySteps >= 2) {
-      budget = 8192
+      budget = 1024
     } else if (analysis.isCleanMutatingContinuation) {
-      budget = 4096
+      budget = 1024
+    } else if (analysis.isMultiToolFanIn || analysis.cumulativeExploratorySteps >= 2) {
+      budget = 512
     } else if (analysis.isSingleExploratoryContinuation) {
-      budget = 3072
+      budget = 256
     } else {
-      budget = 4096
+      budget = 512
     }
   }
 
   if (isSubagent) {
-    return Math.min(budget, 8192)
+    return Math.min(budget, 2048)
   }
   return budget
 }
@@ -320,7 +339,7 @@ export const resolveStepRouting = (input: {
     httpBody: {
       id_slot,
       reasoning_budget_tokens,
-      think_temp: analysis.hasErrorOrDiagnostic ? 1.0 : 0.85,
+      think_temp: analysis.hasErrorOrDiagnostic ? 0.85 : 0.55,
       think_min_p: 0.01,
     },
     isSynthesizing,

@@ -196,4 +196,57 @@ describe("SkillInstructions", () => {
       expect((yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
+
+  it.effect("sorts global, system, and builtin skills ahead of project-local skills while preserving alphabetical order within each tier", () => {
+    const agent = Agent.Info.make(Agent.Info.default(build))
+    const projectAccessible = Skill.Info.make({
+      id: Skill.ID.make("accessible-interactions"),
+      name: Skill.Name.make("Accessible Interactions"),
+      description: "Project accessibility skill",
+      path: AbsolutePath.make("/home/rjwits/github/aquanox-harness/.opencode/skills/accessible-interactions/SKILL.md"),
+      content: "Project guidance",
+    })
+    const projectValidation = Skill.Info.make({
+      id: Skill.ID.make("validation-pipeline-performance"),
+      name: Skill.Name.make("Validation Pipeline"),
+      description: "Project validation skill",
+      path: AbsolutePath.make("/home/rjwits/github/aquanox-harness/.opencode/skills/validation-pipeline-performance/SKILL.md"),
+      content: "Project validation guidance",
+    })
+    const systemCaveman = Skill.Info.make({
+      id: Skill.ID.make("caveman"),
+      name: Skill.Name.make("Caveman"),
+      description: "System caveman skill",
+      path: AbsolutePath.make("/etc/opencode/skills/caveman/SKILL.md"),
+      content: "System guidance",
+    })
+    const globalTeamLead = Skill.Info.make({
+      id: Skill.ID.make("team-lead-speaking"),
+      name: Skill.Name.make("Team Lead Speaking"),
+      description: "Global team lead skill",
+      path: AbsolutePath.make("/home/rjwits/.config/opencode/skills/team-lead-speaking/SKILL.md"),
+      content: "Global guidance",
+    })
+    const builtinOpencode = Skill.Info.make({
+      id: Skill.ID.make("opencode"),
+      name: Skill.Name.make("OpenCode"),
+      description: "Builtin opencode skill",
+      path: AbsolutePath.make("/builtin/opencode.md"),
+      content: "Builtin guidance",
+    })
+
+    const skills = [projectValidation, globalTeamLead, projectAccessible, builtinOpencode, systemCaveman]
+    return Effect.gen(function* () {
+      const instructions = yield* SkillInstructions.Service
+      const initialized = yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))
+      const ids = Array.from(initialized.text.matchAll(/<id>([^<]+)<\/id>/g), (m) => m[1])
+      expect(ids).toEqual([
+        "caveman",
+        "opencode",
+        "team-lead-speaking",
+        "accessible-interactions",
+        "validation-pipeline-performance",
+      ])
+    }).pipe(Effect.provide(layer(() => skills)))
+  })
 })

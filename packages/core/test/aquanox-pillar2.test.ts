@@ -308,7 +308,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(rootRoute).toEqual({
       toolChoice: undefined,
-      httpBody: { id_slot: 0, reasoning_budget_tokens: 12288, think_temp: 0.85, think_min_p: 0.01 },
+      httpBody: { id_slot: 0, reasoning_budget_tokens: 2048, think_temp: 0.55, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
@@ -344,7 +344,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(exploreAction).toEqual({
       toolChoice: "auto",
-      httpBody: { id_slot: 1, reasoning_budget_tokens: 3072, think_temp: 0.85, think_min_p: 0.01 },
+      httpBody: { id_slot: 1, reasoning_budget_tokens: 256, think_temp: 0.55, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
@@ -358,7 +358,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(generalAction).toEqual({
       toolChoice: "auto",
-      httpBody: { id_slot: 2, reasoning_budget_tokens: 3072, think_temp: 0.85, think_min_p: 0.01 },
+      httpBody: { id_slot: 2, reasoning_budget_tokens: 256, think_temp: 0.55, think_min_p: 0.01 },
       isSynthesizing: false,
     })
 
@@ -392,7 +392,7 @@ describe("Aquanox Pillar 2 — RequestSynthesisTool & Two-Stage Step Routing", (
     })
     expect(exploreSynthesis).toEqual({
       toolChoice: "none",
-      httpBody: { id_slot: 1, reasoning_budget_tokens: 4096, think_temp: 0.85, think_min_p: 0.01 },
+      httpBody: { id_slot: 1, reasoning_budget_tokens: 1024, think_temp: 0.55, think_min_p: 0.01 },
       isSynthesizing: true,
     })
 

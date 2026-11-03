@@ -141,6 +141,7 @@ const sessionTierMap = new Map<string, "128k" | "256k" | "384k">()
 const sessionConversationMap = new Map<string, string>()
 const childParentMap = new Map<string, string>()
 const conversations = new Map<string, AdmittedConversation>()
+const conversationBlockMap = new Map<string, 0 | 1 | 2>()
 const waiterQueue: SubagentWaiter[] = []
 
 const lastUsedAtPerSlot: Record<PhysicalSlotID, number> = {
@@ -227,17 +228,19 @@ function computeCommittedQuanta(): number {
   return committed
 }
 
+function isBlockFree(b: 0 | 1 | 2): boolean {
+  if (blockOwner[b] !== undefined || blockMode[b] === "384k_locked") return false
+  return (
+    activeSessionsBySlot[(b * 3) as PhysicalSlotID].size === 0 &&
+    activeSessionsBySlot[(b * 3 + 1) as PhysicalSlotID].size === 0 &&
+    activeSessionsBySlot[(b * 3 + 2) as PhysicalSlotID].size === 0
+  )
+}
+
 function countFreeFullBlocks(): number {
   let count = 0
   for (const b of BUDDY_BLOCKS) {
-    if (blockOwner[b] !== undefined || blockMode[b] === "384k_locked") continue
-    if (
-      activeSessionsBySlot[(b * 3) as PhysicalSlotID].size === 0 &&
-      activeSessionsBySlot[(b * 3 + 1) as PhysicalSlotID].size === 0 &&
-      activeSessionsBySlot[(b * 3 + 2) as PhysicalSlotID].size === 0
-    ) {
-      count++
-    }
+    if (isBlockFree(b)) count++
   }
   return count
 }
@@ -289,16 +292,30 @@ export function admitConversation(input: ConversationAdmissionInput): Conversati
     }
   }
 
+  const stickySessionID =
+    input.rootSessionId ?? (input.conversationId.startsWith("conv_") ? input.conversationId.slice(5) : undefined)
+  const stickySlot = stickySessionID ? sessionSlotMap.get(stickySessionID) : undefined
+  const preferredBlock =
+    stickySlot !== undefined
+      ? (Math.floor(stickySlot / 3) as 0 | 1 | 2)
+      : conversationBlockMap.get(input.conversationId)
+
   let freeBlock: (0 | 1 | 2) | undefined
-  for (const b of BUDDY_BLOCKS) {
-    if (blockOwner[b] !== undefined || blockMode[b] === "384k_locked") continue
-    if (
-      activeSessionsBySlot[(b * 3) as PhysicalSlotID].size === 0 &&
-      activeSessionsBySlot[(b * 3 + 1) as PhysicalSlotID].size === 0 &&
-      activeSessionsBySlot[(b * 3 + 2) as PhysicalSlotID].size === 0
-    ) {
-      freeBlock = b
-      break
+  if (preferredBlock !== undefined && isBlockFree(preferredBlock)) {
+    freeBlock = preferredBlock
+  } else {
+    const freeBlocks = BUDDY_BLOCKS.filter(isBlockFree)
+    if (freeBlocks.length > 0) {
+      const pinnedSlots = new Set(sessionSlotMap.values())
+      const unpinned = freeBlocks.find((b) => {
+        const leadSlot = (b * 3) as PhysicalSlotID
+        return !pinnedSlots.has(leadSlot) || lastUsedAtPerSlot[leadSlot] === 0
+      })
+      freeBlock =
+        unpinned ??
+        freeBlocks.reduce((oldest, b) =>
+          lastUsedAtPerSlot[(b * 3) as PhysicalSlotID] < lastUsedAtPerSlot[(oldest * 3) as PhysicalSlotID] ? b : oldest,
+        )
     }
   }
 
@@ -318,6 +335,7 @@ export function admitConversation(input: ConversationAdmissionInput): Conversati
   const conv: AdmittedConversation = {
     conversationId: input.conversationId,
     agentId: input.agentId,
+    ...(input.rootSessionId ? { rootSessionId: input.rootSessionId } : {}),
     leadBlockId: freeBlock,
     leadSlotId,
     reservedSubagentQuanta,
@@ -328,8 +346,14 @@ export function admitConversation(input: ConversationAdmissionInput): Conversati
   }
 
   conversations.set(input.conversationId, conv)
+  conversationBlockMap.set(input.conversationId, freeBlock)
   blockMode[freeBlock] = "384k_locked"
   blockOwner[freeBlock] = input.conversationId
+  if (input.rootSessionId) {
+    sessionConversationMap.set(input.rootSessionId, input.conversationId)
+    sessionTierMap.set(input.rootSessionId, "384k")
+    recordPin(input.rootSessionId, leadSlotId)
+  }
   generation++
 
   return {
@@ -350,11 +374,29 @@ export function bindConversationSession(input: {
 }): { ok: boolean; leadSlotId?: number } {
   let conv = conversations.get(input.conversationId)
   if (!conv) {
-    const adm = admitConversation({ conversationId: input.conversationId })
+    const adm = admitConversation({ conversationId: input.conversationId, rootSessionId: input.sessionID })
     if (!adm.admitted) {
       return { ok: false }
     }
     conv = conversations.get(input.conversationId)!
+  } else {
+    const existingPin = sessionSlotMap.get(input.sessionID)
+    if (existingPin !== undefined) {
+      const preferredBlock = Math.floor(existingPin / 3) as 0 | 1 | 2
+      if (
+        preferredBlock !== conv.leadBlockId &&
+        activeSessionsBySlot[conv.leadSlotId].size === 0 &&
+        isBlockFree(preferredBlock)
+      ) {
+        blockMode[conv.leadBlockId] = "idle"
+        blockOwner[conv.leadBlockId] = undefined
+        conv.leadBlockId = preferredBlock
+        conv.leadSlotId = (preferredBlock * 3) as PhysicalSlotID
+        blockMode[preferredBlock] = "384k_locked"
+        blockOwner[preferredBlock] = conv.conversationId
+        conversationBlockMap.set(conv.conversationId, preferredBlock)
+      }
+    }
   }
   conv.rootSessionId = input.sessionID
   sessionConversationMap.set(input.sessionID, input.conversationId)
@@ -622,10 +664,11 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   if (sticky !== undefined) {
     const b = Math.floor(sticky / 3) as 0 | 1 | 2
     const isLockedBy384k = blockMode[b] === "384k_locked" && sticky % 3 !== 0
-    if (!isLockedBy384k) {
+    const ownedByOtherConv = blockOwner[b] !== undefined && blockOwner[b] !== convId
+    if (!isLockedBy384k && !ownedByOtherConv) {
       const isOwnerActive = activeSessionsBySlot[sticky].has(sessionID)
       const isIdle = activeSessionsBySlot[sticky].size === 0
-      if (isOwnerActive || isIdle) {
+      if (isOwnerActive || (isIdle && (conversations.size === 0 || isSub))) {
         activeSessionsBySlot[sticky].add(sessionID)
         lastUsedAtPerSlot[sticky] = ++leaseClock
         recordPin(sessionID, sticky)
@@ -635,7 +678,7 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   }
 
   if (!isSub && conversations.size > 0) {
-    const autoAdm = admitConversation({ conversationId: "conv_" + sessionID })
+    const autoAdm = admitConversation({ conversationId: "conv_" + sessionID, rootSessionId: sessionID })
     if (autoAdm.admitted && autoAdm.leadSlotId !== undefined) {
       const slot = autoAdm.leadSlotId as PhysicalSlotID
       bindConversationSession({ conversationId: "conv_" + sessionID, sessionID })
@@ -650,7 +693,14 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   const primaryPool: ReadonlyArray<PhysicalSlotID> = isSub ? [1, 2] : [0]
   const fallbackPool: ReadonlyArray<PhysicalSlotID> = isSub ? [0] : [1, 2]
 
-  const primaryIdle = primaryPool.filter((s) => activeSessionsBySlot[s].size === 0 && !(blockMode[Math.floor(s / 3) as 0 | 1 | 2] === "384k_locked" && s % 3 !== 0))
+  const primaryIdle = primaryPool.filter((s) => {
+    const b = Math.floor(s / 3) as 0 | 1 | 2
+    return (
+      activeSessionsBySlot[s].size === 0 &&
+      blockOwner[b] === undefined &&
+      !(blockMode[b] === "384k_locked" && s % 3 !== 0)
+    )
+  })
   const pinnedSlots = new Set(sessionSlotMap.values())
 
   if (primaryIdle.length > 0) {
@@ -661,7 +711,14 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
     return chosen
   }
 
-  const fallbackIdle = fallbackPool.filter((s) => activeSessionsBySlot[s].size === 0 && !(blockMode[Math.floor(s / 3) as 0 | 1 | 2] === "384k_locked" && s % 3 !== 0))
+  const fallbackIdle = fallbackPool.filter((s) => {
+    const b = Math.floor(s / 3) as 0 | 1 | 2
+    return (
+      activeSessionsBySlot[s].size === 0 &&
+      blockOwner[b] === undefined &&
+      !(blockMode[b] === "384k_locked" && s % 3 !== 0)
+    )
+  })
   if (fallbackIdle.length > 0) {
     const chosen = pickBestIdleSlot(fallbackIdle, pinnedSlots)
     activeSessionsBySlot[chosen].add(sessionID)
@@ -739,6 +796,7 @@ export function reset(): void {
   sessionConversationMap.clear()
   childParentMap.clear()
   conversations.clear()
+  conversationBlockMap.clear()
   waiterQueue.length = 0
   leaseClock = 0
   generation = 1

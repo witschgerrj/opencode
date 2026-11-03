@@ -86,8 +86,8 @@ const makeAssistantMessage = (tools: SessionMessage.AssistantTool[]): SessionMes
   }) as unknown as SessionMessage.Info
 
 describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", () => {
-  test("Tier 1: Full Deep Planning Tier (6144 tokens or turn ceiling)", () => {
-    // User message entry on variant 'max' (turn ceiling 12288 >= 6144)
+  test("Tier 1: Turn Entry & Error Recovery Tier (1024..2048 tokens)", () => {
+    // User message entry on variant max -> 2048
     const budgetMax = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [makeUserMessage("Plan the architecture")],
       variant: "max",
@@ -96,9 +96,9 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetMax).toBe(12288)
+    expect(budgetMax).toBe(2048)
 
-    // User message entry on variant 'high' (turn ceiling 8192 >= 6144)
+    // User message entry on variant high -> 2048
     const budgetHigh = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [makeUserMessage("Plan the architecture")],
       variant: "high",
@@ -107,9 +107,9 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetHigh).toBe(8192)
+    expect(budgetHigh).toBe(2048)
 
-    // Subagent wakeup/inbox turn entry
+    // Subagent wakeup/inbox turn entry -> 2048
     const budgetSubagent = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [makeUserMessage("Subagent task starting")],
       variant: "high",
@@ -118,9 +118,9 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetSubagent).toBe(8192)
+    expect(budgetSubagent).toBe(2048)
 
-    // First step after compaction
+    // First step after compaction -> 2048
     const budgetAfterCompact = SessionRunnerLLM.computeCausalReasoningBudget({
       messages: [makeCompactionMessage()],
       variant: "high",
@@ -129,11 +129,11 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetAfterCompact).toBe(8192)
+    expect(budgetAfterCompact).toBe(2048)
   })
 
-  test("Tier 2: Complex Synthesis & Error-Diagnosis Tier (8192 tokens)", () => {
-    // 1. Tool execution error
+  test("Tier 2: Genuine Error Diagnosis vs Exploratory & Fan-In Continuations", () => {
+    // 1. Tool execution error -> 2048
     const errTool = makeAssistantTool("shell", {
       status: "error",
       error: { type: "tool.execution", message: "Command failed" },
@@ -146,9 +146,9 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetError).toBe(8192)
+    expect(budgetError).toBe(2048)
 
-    // 2. Failure diagnostic regex patterns in output text
+    // 2. Failure diagnostic regex patterns on shell output without exit=0 -> 2048
     for (const failureText of [
       "not ok 1 - test failed",
       "TEST SUITE FAILED",
@@ -173,10 +173,25 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
         isSynthesizing: false,
         stepLimitReached: false,
       })
-      expect(budgetDiag).toBe(8192)
+      expect(budgetDiag).toBe(2048)
     }
 
-    // 3. Multi-tool fan-in (>= 3 tool calls)
+    // 2b. False-positive immunity: read, grep, skill, and exit=0 shell NEVER trigger hasErrorOrDiagnostic!
+    const readWithErrorText = makeAssistantTool("read", {
+      status: "completed",
+      content: [{ type: "text", text: "throw new TypeError(\"AssertionError FAIL not ok error TS2345\")" }],
+    })
+    expect(SessionRunnerLLM.analyzeCausalStep([makeUserMessage("Read file"), makeAssistantMessage([readWithErrorText])]).hasErrorOrDiagnostic).toBe(false)
+
+    const shellExitZeroWithErrorText = makeAssistantTool("shell", {
+      status: "completed",
+      input: { command: "npm test" },
+      metadata: { exit: 0, truncated: false },
+      content: [{ type: "text", text: "ok 1 - handles AssertionError and TypeError without FAIL" }],
+    } as any)
+    expect(SessionRunnerLLM.analyzeCausalStep([makeUserMessage("Run tests"), makeAssistantMessage([shellExitZeroWithErrorText])]).hasErrorOrDiagnostic).toBe(false)
+
+    // 3. Multi-tool fan-in (>= 3 clean exploratory tool calls) -> compact 512 tokens (no 8192 escalation)
     const t1 = makeAssistantTool("read", { status: "completed", content: [{ type: "text", text: "ok 1" }] })
     const t2 = makeAssistantTool("read", { status: "completed", content: [{ type: "text", text: "ok 2" }] })
     const t3 = makeAssistantTool("read", { status: "completed", content: [{ type: "text", text: "ok 3" }] })
@@ -188,9 +203,9 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetFanIn).toBe(8192)
+    expect(budgetFanIn).toBe(512)
 
-    // 4. Cumulative exploratory steps >= 2
+    // 4. Cumulative exploratory steps >= 2 without error -> compact 512 tokens (no 8192 escalation)
     const readStep1 = makeAssistantMessage([
       makeAssistantTool("read", { status: "completed", content: [{ type: "text", text: "content 1" }] }),
     ])
@@ -205,10 +220,10 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetExploratorySynthesis).toBe(8192)
+    expect(budgetExploratorySynthesis).toBe(512)
   })
 
-  test("Tier 3: Clean Verification / Incremental Edit Continuation Tier (4096 tokens)", () => {
+  test("Tier 3: Clean Verification / Incremental Edit Continuation Tier (1024 tokens)", () => {
     // 1 clean mutating edit tool
     const cleanEdit = makeAssistantTool("edit", {
       status: "completed",
@@ -222,7 +237,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetEdit).toBe(4096)
+    expect(budgetEdit).toBe(1024)
 
     // 2 clean mutating shell/write tools
     const cleanWrite = makeAssistantTool("write", { status: "completed", content: [{ type: "text", text: "ok" }] })
@@ -235,10 +250,10 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetMutating2).toBe(4096)
+    expect(budgetMutating2).toBe(1024)
   })
 
-  test("Tier 4: Single-File Exploratory Continuation Tier (3072 tokens)", () => {
+  test("Tier 4: Single-File Exploratory Continuation Tier (256 tokens)", () => {
     // 1 clean read step
     const cleanRead = makeAssistantTool("read", {
       status: "completed",
@@ -252,7 +267,7 @@ describe("Workstream 4 — Causal reasoning_budget_tokens Scheduler (llm.ts)", (
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(budgetSingleRead).toBe(3072)
+    expect(budgetSingleRead).toBe(256)
   })
 })
 

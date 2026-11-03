@@ -265,6 +265,35 @@ describe("Aquanox Dual-Tier Context Engine — Tier Resolution & Compaction Ceil
   })
 })
 
+
+  test("preserves sticky Buddy Block affinity across conversation release and re-admission and prevents 4th-root corruption", () => {
+    SessionSlotLease.reset()
+    // Admit conv_0 (Block 0) and conv_1 (Block 1)
+    const adm0 = SessionSlotLease.admitConversation({ conversationId: "conv_0", rootSessionId: "ses_root_0" })
+    const adm1 = SessionSlotLease.admitConversation({ conversationId: "conv_1", rootSessionId: "ses_root_1" })
+    expect(adm0.leadBlockId).toBe(0)
+    expect(adm1.leadBlockId).toBe(1)
+
+    // Release both conversations; both Block 0 and Block 1 are now free, but ses_root_1 has sticky pin on Block 1 (slot 3)
+    SessionSlotLease.releaseConversation("conv_0")
+    SessionSlotLease.releaseConversation("conv_1")
+
+    // Re-admitting ses_root_1 preferentially re-assigns Block 1 (slot 3) rather than jumping to Block 0!
+    const reAdm1 = SessionSlotLease.admitConversation({ conversationId: "conv_1_resumed", rootSessionId: "ses_root_1" })
+    expect(reAdm1.admitted).toBe(true)
+    expect(reAdm1.leadBlockId).toBe(1)
+    expect(reAdm1.leadSlotId).toBe(3)
+
+    // Admit conv_0 and conv_2 to fill all 3 Buddy Blocks (0, 1, 2)
+    const reAdm0 = SessionSlotLease.admitConversation({ conversationId: "conv_0_resumed", rootSessionId: "ses_root_0" })
+    const adm2 = SessionSlotLease.admitConversation({ conversationId: "conv_2", rootSessionId: "ses_root_2" })
+    expect(reAdm0.leadBlockId).toBe(0)
+    expect(adm2.leadBlockId).toBe(2)
+
+    // A 4th root session attempting acquire() under full 3-block contention gets -1 without stealing any locked Buddy Block
+    expect(SessionSlotLease.acquire("ses_root_4", false)).toBe(-1)
+  })
+
 describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping", () => {
   test("caps subagent reasoning budget at <= 8192 across all variants and continuation states", () => {
     const userMsg = makeUserMessage("Inspect mesh topology")
@@ -278,7 +307,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(leadHigh).toBe(8192)
+    expect(leadHigh).toBe(2048)
 
     // Turn entry for lead session with variant 'max' -> 12288
     const leadMax = SessionRunnerLLM.computeCausalReasoningBudget({
@@ -289,7 +318,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(leadMax).toBe(12288)
+    expect(leadMax).toBe(2048)
 
     // Turn entry for SUBAGENT session with variant 'high' -> capped at 8192!
     const subHigh = SessionRunnerLLM.computeCausalReasoningBudget({
@@ -300,7 +329,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subHigh).toBe(8192)
+    expect(subHigh).toBe(2048)
 
     // Turn entry for SUBAGENT session with variant 'max' -> capped at 8192!
     const subMax = SessionRunnerLLM.computeCausalReasoningBudget({
@@ -311,7 +340,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subMax).toBe(8192)
+    expect(subMax).toBe(2048)
 
     // Mutating continuation for subagent -> 4096 (non-truncating ceiling)
     const subMutating = SessionRunnerLLM.computeCausalReasoningBudget({
@@ -322,7 +351,7 @@ describe("Aquanox Dual-Tier Reasoning Engine — Causal Reasoning Budget Capping
       isSynthesizing: false,
       stepLimitReached: false,
     })
-    expect(subMutating).toBeLessThanOrEqual(8192)
+    expect(subMutating).toBeLessThanOrEqual(2048)
   })
 })
 
