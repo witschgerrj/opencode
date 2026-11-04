@@ -1,65 +1,63 @@
 ---
 name: opencode-session-lifecycle
-description: "Implement and debug OpenCode V2 session lifecycle operations (`session.create`, `list`, `get`, `active`, `switchAgent`, `switchModel`, `move`, `interrupt`, `background`, `wait`, child-session family settlement, `fork` with `before`, `update` rename/archive, `remove`, `export`/`import`, `stats`) plus general `opencode.json(c)` file precedence and `{env:...}`/`{file:...}` config macros. Use for session execution lifecycle and top-level config layering; use `opencode-inbox-delivery` for prompt queueing and `opencode-messages-parts` for transcript hydration."
+description: Manage native session lifecycle tree settlement fork archive import config
+  precedence
 ---
 
 # OpenCode Session Lifecycle and Config Precedence
 
-Manage OpenCode V2 native session creation, execution control, descendant-tree settlement, forking, archiving, import/export, and the foundational `opencode.json(c)` configuration layering that governs every session.
+Manage OpenCode V2 native session creation, exec control, descendant-tree settlement, forking, archiving, import/export, and foundational `opencode.json(c)` config layering governing every session.
 
 ## Scope and Neighbor Boundaries
 
-- **This skill owns**: `@opencode/client` `session.*` lifecycle operations (`list`, `create`, `get`, `active`, `update`, `switchAgent`, `switchModel`, `move`, `interrupt`, `background`, `wait`, `fork`, `remove`, `export`, `import`, `view`, `environment`, `stats`), parent/child session-family discovery and settlement invariants, and general `opencode.json(c)` file discovery/precedence, `{env:...}`/`{file:...}` substitution macros, `config.get`/`shells`/`update`, and `experimental.*` flags.
-- **Use sibling skills for**:
-  - `` `opencode-inbox-delivery` `` — `session.prompt` / `synthetic` admission, `steer` vs `queue`, `inbox.update`, and `inbox.cancel`.
-  - `` `opencode-messages-parts` `` — paginated `message.list` hydration and part/tool state projection.
-  - `` `opencode-event-streams` `` — SSE `event.subscribe` and `session.log` replay.
-  - `` `opencode-human-input` `` — pending form/question and permission request replies.
-  - `` `opencode-agents` ``, `` `opencode-models` ``, `` `opencode-providers` ``, `` `opencode-policies` `` — feature-specific config schemas and inverted policy precedence.
-  - `` `opencode-server-client` `` — daemon discovery, Basic/pairing auth, `location.reload`, and shell/PTY transports.
+- **This skill owns**: `@opencode/client` `session.*` lifecycle operations (`list`, `create`, `get`, `active`, `update`, `switchAgent`, `switchModel`, `move`, `interrupt`, `background`, `wait`, `fork`, `remove`, `export`, `import`, `view`, `environment`, `stats`), parent/child session-family discovery and settlement invariants, general `opencode.json(c)` file discovery/precedence, `{env:...}`/`{file:...}` substitution macros, `config.get`/`shells`/`update`, and `experimental.*` flags.
+- **Sibling skills**:
+  - `opencode-inbox-delivery` — `session.prompt` / `synthetic` admission, `steer` vs `queue`, `inbox.update`, `inbox.cancel`.
+  - `opencode-messages-parts` — paginated `message.list` hydration, part/tool state projection.
+  - `opencode-event-streams` — SSE `event.subscribe`, `session.log` replay.
+  - `opencode-human-input` — pending form/question, permission req replies.
+  - `opencode-agents`, `opencode-models`, `opencode-providers`, `opencode-policies` — feature-specific config schemas, inverted policy precedence.
+  - `opencode-server-client` — daemon discovery, Basic/pairing auth, `location.reload`, shell/PTY transports.
 
-Read [session lifecycle contracts and config precedence](references/lifecycle-and-config.md) for the complete `@opencode/client` method/HTTP table, SDK unwrap rules, and config merge hierarchy.
+Read `references/lifecycle-and-config.md` for complete `@opencode/client` method/HTTP table, SDK unwrap rules, config merge hierarchy.
 
 ## Core Session Lifecycle Workflow
 
-1. **Create, configure, and switch session agent/model explicitly**:
-   - Create via `client.session.create({ id?, parentID?, title?, agent?, model?, location?, metadata?, permissions? })` where runtime `model` is `{ providerID, id, variant? }` and `location` is `{ directory }`.
-   - Switch active agent via `session.switchAgent({ sessionID, agent })` (`POST /api/session/:id/agent` body `{ agent }`) and model via `session.switchModel({ sessionID, model })` (`POST /api/session/:id/model` body `{ model }`). **Submitting a prompt never switches the session's model, and switching agents never changes the session's model.**
-2. **Track activity and settle entire child-session families**:
-   - Check live activity via `session.active()` (`GET /api/session/active`, map keyed by active `sessionID`; stale `SessionInfo.time.idle` or old `outcome` does **not** prove current activity or idleness).
-   - Enumerate descendants via paginated `session.list({ parentID, cursor })` and verify each child's authoritative `session.get({ sessionID }).parentID` before trusting membership (reject cycles and spoofed IDs, and re-read `session.active()` **after** child discovery).
-   - Treat a session family as settled only after **two consecutive identical observations** show zero active family sessions, zero pending forms/permissions, zero pending inbox items, and zero undelivered background subagent wakes.
-3. **Stop, fork, archive, or transfer cleanly**:
-   - **Stop**: Cancel only owned pending inbox IDs (`inbox.cancel`), call `session.interrupt({ sessionID, resume? })` across active family members, await `session.wait({ sessionID })` (`/api/experimental/session/:id/wait`), and keep watching for background child wakes or newly spawned children before releasing locks.
-   - **Fork**: Require idle state and call `session.fork({ sessionID, before? })` (`POST /api/session/:id/fork` body `{ before? }` -> new `SessionInfo` excluding the `before` message boundary).
-   - **Rename / Archive**: Call `session.update({ sessionID, title?, archived? })` (`PATCH /api/session/:id` with `archived: true | false`—do not invent `/archive` routes).
-   - **Export / Import**: Use `session.export({ sessionID, sanitize? })` and `session.import({ info, messages, location? })`; inspect exported payloads directly rather than assuming `sanitize` strips every domain secret.
+1. **Create, configure, switch session agent/model explicitly**:
+   - Create: `client.session.create({ id?, parentID?, title?, agent?, model?, location?, metadata?, permissions? })` where runtime `model` is `{ providerID, id, variant? }`, `location` is `{ directory }`.
+   - Switch active agent: `session.switchAgent({ sessionID, agent })` (`POST /api/session/:id/agent` body `{ agent }`).
+   - Switch model: `session.switchModel({ sessionID, model })` (`POST /api/session/:id/model` body `{ model }`). Submitting prompt never switches model; switching agents never changes model.
+2. **Track activity and settle child-session families**:
+   - Check live activity: `session.active()` (`GET /api/session/active`, map keyed by active `sessionID`; stale `SessionInfo.time.idle` or old `outcome` does not prove activity/idleness).
+   - Enumerate descendants: paginated `session.list({ parentID, cursor })`. Verify authoritative `session.get({ sessionID }).parentID` before trusting membership (reject cycles, spoofed IDs; re-read `session.active()` after child discovery).
+   - Settle family: require **two consecutive identical observations** showing 0 active family sessions, 0 pending forms/permissions, 0 pending inbox items, 0 undelivered background subagent wakes.
+3. **Stop, fork, archive, transfer cleanly**:
+   - **Stop**: Cancel owned pending inbox IDs (`inbox.cancel`) → call `session.interrupt({ sessionID, resume? })` across active family → await `session.wait({ sessionID })` (`/api/experimental/session/:id/wait`) → watch background child wakes / new children before releasing locks.
+   - **Fork**: Require idle state → `session.fork({ sessionID, before? })` (`POST /api/session/:id/fork` body `{ before? }` → new `SessionInfo` excluding `before` message boundary).
+   - **Rename / Archive**: `session.update({ sessionID, title?, archived? })` (`PATCH /api/session/:id` with `archived: true | false`; no `/archive` routes).
+   - **Export / Import**: `session.export({ sessionID, sanitize? })`, `session.import({ info, messages, location? })`. Inspect exported payloads directly; `sanitize` not guaranteed to strip all domain secrets.
 
 ## Key Invariants and Gotchas
 
-- **Config `ModelSelector` vs runtime `ModelRef` key mismatch**: `opencode.json(c)` model objects use `{ providerID, model, variant? }` (and root `"model": "provider/model"` drops `#variant`), whereas runtime SDK `ModelRef` uses `{ providerID, id, variant? }`. Never pass one object unchanged to the other!
-- **`.opencode/opencode.json(c)` outranks every direct `opencode.json(c)`**: OpenCode merges direct `opencode.json(c)` files farthest-to-closest first, **then** merges `.opencode/opencode.json(c)` files farthest-to-closest—so any `.opencode/opencode.json(c)` overrides every direct `opencode.json(c)` in the directory tree! System config (`/etc/opencode`, `/Library/Application Support/opencode`, `%ProgramData%\opencode`) and macOS MDM (`ai.opencode.managed`) outrank user and project files.
-- **Silent empty-string macro expansion**: Missing `{env:VAR}` variables and missing `{file:path}` files expand silently to `""` inside JSON strings.
-- **`config.get` vs `config.update` trap**: `client.config.get({ location? })` returns `ConfigEntry[]` (layered config documents, not a single merged object to PATCH back), and `client.config.update({ shell })` (`PATCH /api/experimental/config`) updates **only `shell`**—it is not a general config editor!
-- **`session.wait` vs family settlement & observer abort**: `session.wait` waits for **one** session loop only (a parent can go idle while a background subagent runs and later wakes it). Never equate aborting a local HTTP/SSE observer with interrupting native execution.
+- **Config `ModelSelector` vs runtime `ModelRef` key mismatch**: `opencode.json(c)` model objects use `{ providerID, model, variant? }` (root `"model": "provider/model"` drops `#variant`). Runtime SDK `ModelRef` uses `{ providerID, id, variant? }`. Never pass object unchanged across boundaries.
+- **`.opencode/opencode.json(c)` outranks direct `opencode.json(c)`**: OpenCode merges direct `opencode.json(c)` farthest-to-closest first, then merges `.opencode/opencode.json(c)` farthest-to-closest. `.opencode/opencode.json(c)` overrides every direct `opencode.json(c)` in dir tree. System config (`/etc/opencode`, `/Library/Application Support/opencode`, `%ProgramData%\opencode`) and macOS MDM (`ai.opencode.managed`) outrank user/project files.
+- **Silent empty-string macro expansion**: Missing `{env:VAR}` and missing `{file:path}` expand silently to `""` inside JSON strings.
+- **`config.get` vs `config.update` trap**: `client.config.get({ location? })` returns `ConfigEntry[]` (layered docs, not single merged object to PATCH). `client.config.update({ shell })` (`PATCH /api/experimental/config`) updates **only `shell`**; not general config editor.
+- **`session.wait` vs family settlement & observer abort**: `session.wait` waits for single session loop only (parent idle while background subagent runs, wakes parent later). Local HTTP/SSE observer abort != native execution interrupt.
 - **Two-stage `request_synthesis({})` control & zero-KV-bust synthesis transition (`llm.ts:387-425`)**:
-  - On autonomous `general` agents (`steps: undefined`), the runtime cannot predict prior to model invocation whether a turn will emit tool calls or generate the final response. Mutating the tool definition array on the final step changes the system/tools prefix at token `~2K`, completely invalidating the KV cache.
-  - Calling the zero-argument `request_synthesis({})` tool deterministically signals completion: the session runner transitions the immediately following step to `toolChoice: "none"` and elevates the reasoning budget to synthesis levels (`2048..2560` tokens) while keeping `tools: loaded.tools` 100% byte-identical, achieving a **100% KV prefix hit**.
+  - Autonomous `general` agents (`steps: undefined`): runtime cannot predict prior to model invocation whether turn emits tool calls or final res. Mutating tool definition array on final step changes system/tools prefix at token `~2K`, bust KV cache.
+  - Zero-arg `request_synthesis({})` tool call deterministically signals completion: session runner transitions next step to `toolChoice: "none"`, elevates reasoning budget to `2048..2560` tokens, keeps `tools: loaded.tools` 100% byte-identical → 100% KV prefix hit.
 - **`CONTINUE_AFTER_OUTPUT_LIMIT` runaway loop fix in child sessions (`llm.ts:38-40, 502-545`)**:
-  - The default OpenCode continuation prompt (`"Break the remaining work into smaller pieces"`) causes subagents that hit token limits to re-enter multi-turn tool-call loops (observed generating up to 29 redundant DSML turns).
-  - Child sessions (`!!parentID`) must receive a single-pass terminal directive: `"Synthesize and complete your final deliverable immediately. Do not call any further tools."` to guarantee clean settlement without looping.
+  - Default OpenCode continuation prompt (`"Break the remaining work into smaller pieces"`) triggers multi-turn tool-call loops in token-limited subagents (observed up to 29 redundant DSML turns).
+  - Child sessions (`!!parentID`) req single-pass terminal directive: `"Synthesize and complete your final deliverable immediately. Do not call any further tools."` → guaranteed clean settlement.
 - **60-minute location activity watchdog & long reasoning runs (`location-activity.ts`)**:
-  - During extended deep `<think>` reasoning turns (e.g. multi-minute synthesis under `#max`) or long background subagent runs, the server process can trigger an idle location shutdown if activity is not tracked.
-  - `location-activity.ts` must call `touch` on incoming streaming deltas and register active child subagents in `owners`, paired with `experimental: { todo: true, location_idle_timeout: false }` in configuration to prevent premature execution termination.
+  - Long deep `<think>` turns (multi-minute synthesis under `#max`) or long background subagent runs trigger idle location shutdown if untracked.
+  - `location-activity.ts` must call `touch` on incoming streaming deltas, register active child subagents in `owners`, pair with `experimental: { todo: true, location_idle_timeout: false }` in config.
 - **Prefix immutability and SWA ring buffer protection (`to-llm-message.ts:156-184`)**:
-  - Historical `{ type: "reasoning" }` blocks from `sameModel` turns (including errored or interrupted turns) must remain in the message history. Stripping reasoning parts alters token offsets and wipes `llama_kv_cache_dsv4` SWA ring buffers (`cache = 0`). Token `#0` system prompts must also remain strictly immutable across compactions.
+  - Historical `{ type: "reasoning" }` blocks from `sameModel` turns (including err/interrupted) must persist in message history. Stripping reasoning parts alters token offsets, wipes `llama_kv_cache_dsv4` SWA ring buffers (`cache = 0`). Token `#0` system prompts strictly immutable across compactions.
 - **Sticky Parent-to-Child Buddy Block Affinity in Slot Leasing (`getPreferredBuddyBlock` in `packages/core/src/session/slot-lease.ts` / `packages/opencode/src/session/slot-lease.ts`)**:
-  - The 9-quantum dual-tier Buddy Arena (`9Q = 1,179,648` unified pure-`FP16` MLA+DSA tokens) partitions inference slots across three Buddy Blocks:
-    - Block 0: Slots `0, 1, 2`
-    - Block 1: Slots `3, 4, 5`
-    - Block 2: Slots `6, 7, 8`
-  - Primary Lead agents (`general`, etc.) default to the `256k` (`2Q = 262,144` tokens) context tier on slots `0, 3, 6` (occupying sub-slots `0` and `1`), leaving tail sibling slots `2, 5, 8` (`sib = 2`) 100% immune to Lead context expansion.
-  - When spawning a subagent, `getPreferredBuddyBlock` maps the parent Lead's slot to its owning block (`block = Math.floor(parentSlot / 3)`) and prioritizes the immune tail sibling slot in that exact block (`slot = 3 * block + 2`, i.e., slot `2`, `5`, or `8`) before falling back to the global tail-first lease sequence `[2, 5, 8, 1, 4, 7]`.
-  - **Memory locality & non-interference**: This sticky affinity keeps parent orchestrators and their child subagents co-located within the same Buddy Block while guaranteeing zero collision with the parent Lead's expanding context tier.
+  - 9-quantum dual-tier Buddy Arena (`9Q = 1,179,648` unified pure-`FP16` MLA+DSA tok) partitions slots across 3 Buddy Blocks: Block 0 (`0, 1, 2`), Block 1 (`3, 4, 5`), Block 2 (`6, 7, 8`).
+  - Lead agents (`general`) default to `256k` (`2Q = 262,144` tok) on slots `0, 3, 6` (sub-slots `0, 1`), leaving tail sibling slots `2, 5, 8` (`sib = 2`) 100% immune to Lead ctx expansion.
+  - On subagent spawn, `getPreferredBuddyBlock` maps parent Lead slot to owning block (`block = Math.floor(parentSlot / 3)`) and prioritizes immune tail sibling (`slot = 3 * block + 2` → `2, 5, 8`) before fallback `[2, 5, 8, 1, 4, 7]`.
 - **Compaction object schema and watermark alignment**:
-  - In `3 × 384K` environments (`limit.context = 393216`), configure `"compaction": { "auto": true, "buffer": 65536, "keep": { "tokens": 12288 } }` (`327,680` watermark). Note that `"keep"` must be an object (`keep: { tokens: ... }`); a bare number fails schema validation in `normalize.ts:374` and is silently ignored.
+  - `3 × 384K` env (`limit.context = 393216`): configure `"compaction": { "auto": true, "buffer": 65536, "keep": { "tokens": 12288 } }` (`327,680` watermark). `"keep"` must be object (`keep: { tokens: ... }`); bare number fails validation in `normalize.ts:374`, silently ignored.

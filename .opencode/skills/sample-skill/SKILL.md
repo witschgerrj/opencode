@@ -1,31 +1,31 @@
 ---
 name: sample-skill
-description: Use when the user says sample skill, skill demo, or asks how an opencode SKILL.md should be structured; demonstrates a tiny project-local skill with practical assistant workflow guidance.
+description: Minimal project-local skill reference demo showing SKILL.md structure
+  format assistant workflow.
 ---
 
 # Sample Skill
 
-This is a minimal project-local opencode skill. It exists as a reference for how a skill is structured and as a tiny reusable workflow the assistant can load when the user asks for a skill example.
+Minimal project-local opencode skill. Reference for skill structure and tiny reusable workflow example.
 
 ## When To Use
 
-- Use when the user asks for a sample skill or skill template.
-- Use when demonstrating the required `SKILL.md` frontmatter and body format.
-- Do not use for unrelated coding tasks just because a skill exists.
+- User asks for sample skill or template.
+- Demonstrating required `SKILL.md` frontmatter and body format.
+- Skip for unrelated coding tasks.
 
 ## Workflow
 
-- Confirm the specific outcome the user wants if the request is ambiguous.
-- Inspect the relevant files before changing anything.
-- Make the smallest correct change.
-- Verify the result with a focused read, typecheck, test, or other lightweight check when available.
-- Summarize the changed files and any required restart or reload step.
+- Confirm specific outcome if req ambiguous.
+- Inspect relevant files before editing.
+- Apply smallest correct change.
+- Verify: focused read, typecheck, test, or lightweight check.
+- Summarize changed files and reload/restart steps.
 
 ## Example Response Style
 
-When this skill is relevant, keep responses direct and actionable:
+Keep res direct, actionable:
 
 ```text
 I created a project-local skill at .opencode/skills/sample-skill/SKILL.md.
 Restart opencode for the new skill to be discovered by future sessions.
-```

@@ -1,38 +1,38 @@
 ---
 name: effect
-description: Work with Effect v4 TypeScript code in this repo
+description: Build Effect v4 TypeScript services schemas workflows tests
 ---
 
 # Effect
 
-This codebase uses Effect for typed, composable TypeScript services, schemas, and workflows.
+Codebase uses Effect for typed composable TS services, schemas, workflows.
 
 ## Source Of Truth
 
-Use the current Effect v4 source, not memory or older Effect v2/v3 examples.
+Use current Effect v4 source; no memory / old v2/v3 examples.
 
-1. If `.opencode/references/effect` is missing, clone `https://github.com/Effect-TS/effect` there. Do this in the project, not in the skill folder.
-2. Search `.opencode/references/effect` for exact APIs, examples, tests, and naming patterns before answering or implementing Effect-specific code.
-3. Also inspect existing repo code for local house style before introducing new patterns.
-4. Prefer answers and implementations backed by specific source files or nearby repo examples.
+1. `.opencode/references/effect` missing → clone `https://github.com/Effect-TS/effect` there (run in project repo root, not skill dir).
+2. Search `.opencode/references/effect` for exact APIs, examples, tests, naming patterns before answering or writing Effect code.
+3. Inspect repo code for local house style before adding patterns.
+4. Back implementations with source files or nearby repo examples.
 
 ## Guidelines
 
-- Prefer current Effect v4 APIs and project-local patterns over old blog posts, examples, or package-memory guesses.
-- Use `Effect.gen(function* () { ... })` for multi-step workflows.
-- Use `Effect.fn("Name")` or `Effect.fnUntraced(...)` for named effects when adding reusable service methods or important workflows.
-- Prefer Effect `Schema` for API and domain data shapes. Use branded schemas for IDs and `Schema.TaggedErrorClass` for typed domain errors when modeling new error surfaces.
-- Keep HTTP handlers thin: decode input, read request context, call services, and map transport errors. Put business rules in services.
-- In Effect service code, prefer Effect-aware platform abstractions and dependencies over ad hoc promises where the surrounding code already does so.
-- Keep layer composition explicit. Avoid broad hidden provisioning that makes missing dependencies hard to see.
-- In tests, prefer the repo's existing Effect test helpers and live tests for filesystem, git, child process, locks, or timing behavior.
-- Do not introduce `any`, non-null assertions, unchecked casts, or older Effect APIs just to satisfy types.
-- Do not answer from memory. Verify against `.opencode/references/effect` or nearby code first.
+- Current Effect v4 APIs + local patterns > external posts, examples, guesses.
+- Multi-step workflows → `Effect.gen(function* () { ... })`.
+- Reusable service methods / workflows → `Effect.fn("Name")` or `Effect.fnUntraced(...)`.
+- API / domain shapes → Effect `Schema`. IDs → branded schemas. Typed domain errors → `Schema.TaggedErrorClass`.
+- Thin HTTP handlers: decode input → read req ctx → call services → map transport errs. Business rules belong in services.
+- Prefer Effect platform abstractions + deps over ad hoc promises where code already uses them.
+- Explicit layer composition: avoid broad hidden provisioning hiding missing deps.
+- Tests → prefer repo Effect test helpers + live tests for FS, git, child proc, locks, timing.
+- Ban `any`, non-null assertions, unchecked casts, legacy Effect APIs.
+- Never answer from memory; verify against `.opencode/references/effect` or nearby code first.
 
 ## Testing Patterns
 
-- Use `testEffect(...)` from `packages/core/test/lib/effect.ts` for tests that exercise Effect services, layers, runtime context, scoped resources, or platform integrations.
-- Use `it.live(...)` for filesystem, git repositories, HTTP servers, sockets, child processes, locks, real time, and other live platform behavior.
-- Run tests from package directories such as `packages/core`; never run package tests from the repo root.
-- Prefer explicit test layers over ad hoc managed runtimes. Keep dependency provisioning visible in the test file.
-- Use scoped fixtures and finalizers for resources that must be cleaned up, including temporary directories, flags, databases, fibers, servers, and global state.
+- Effect services, layers, runtime ctx, scoped resources, platform integrations → use `testEffect(...)` from `packages/core/test/lib/effect.ts`.
+- FS, git repos, HTTP servers, sockets, child procs, locks, real time, live platform behavior → use `it.live(...)`.
+- Exec tests from pkg dirs (`packages/core`); never run pkg tests from repo root.
+- Explicit test layers > ad hoc managed runtimes; keep dep provisioning visible in test file.
+- Clean up resources via scoped fixtures + finalizers: temp dirs, flags, DBs, fibers, servers, global state.

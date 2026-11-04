@@ -1,50 +1,49 @@
 ---
 name: opencode-skills
-description: Configure, discover, prioritize, permit, and load OpenCode V2 skills across local roots, configured paths, and HTTP index.json catalogs. Use for skill discovery precedence, path-derived IDs, autoinvoke metadata, @skill-id mentions, skill permissions, and skill API contracts; use create-skill for authoring and validating skill content.
+description: Configure discover prioritize permit load OpenCode V2 skills across local
+  roots config paths HTTP index catalogs
 ---
 
-# OpenCode Skills Discovery, Precedence, and Loading
+# OpenCode Skills Discovery Precedence Loading
 
-OpenCode V2 skills package task-specific instructions and private supporting files (`references/`, `scripts/`) so agents load them on demand via the `skill` tool or `@skill-id` prompt mentions instead of bloating every system prompt.
+OpenCode V2 skills package task instructions + supporting files (`references/`, `scripts/`). Loaded on demand via `skill` tool or `@skill-id` mention. Prevents prompt bloat.
 
-## Boundaries with Neighbor Skills
+## Boundaries With Neighbor Skills
 
-- **Authoring, structuring, and running `validate_skills.py` on a skill**: Use `create-skill`.
-- **Slash command prompt templates (`.opencode/commands/`)**: Use `opencode-commands`.
-- **Always-on ambient `AGENTS.md` instructions**: Use `opencode-instructions`.
-- **General permission rule evaluation and live approval prompts**: Use `opencode-permissions` and `opencode-human-input`.
+- **Author, structure, run `validate_skills.py`**: Use `create-skill`.
+- **Slash command templates (`.opencode/commands/`)**: Use `opencode-commands`.
+- **Ambient `AGENTS.md` instructions**: Use `opencode-instructions`.
+- **Permission rules + live approval prompts**: Use `opencode-permissions` + `opencode-human-input`.
 
 ## Core Workflow
 
-1. **Trace discovery roots and exact path-derived IDs**:
-   - OpenCode automatically scans global (`~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`), system, and upward project (`.opencode/skills`, `.claude/skills`, `.agents/skills`) roots, plus additive `"skills": [...]` config paths and HTTP `index.json` catalogs.
-   - The file path strictly determines the **case-sensitive** skill ID (`<source>/git-release/SKILL.md` -> `git-release`; `<source>/teams/release/SKILL.md` -> `release`; root `<source>/review.md` -> `review`). Frontmatter `name` is only a display label.
-   - Read [discovery precedence, HTTP catalogs, loading, and wire contracts](references/discovery-and-loading.md) for full ordering and HTTP catalog schemas.
-2. **Distinguish registered, advertised, permitted, and loaded states**:
-   - At each model step, OpenCode advertises only `{ id, name, description }` for skills that have a non-empty `description`, do not disable auto-invocation, and are not denied by the active agent's `skill` permissions.
-   - Setting `opencode/autoinvoke` to `false` under `metadata` (or `disable-model-invocation` to `true`) hides a skill from automatic model listings while keeping it loadable explicitly by exact ID (`@skill-id` or explicit `skill` tool / API call).
-3. **Diagnose missing or shadowed skills systematically**:
-   - Check in order: (1) exact uppercase `SKILL.md` (or root-level `*.md`) within 6 directory levels, (2) exact path-derived ID casing, (3) non-empty `description`, (4) `opencode/autoinvoke` and `skill` permissions / `policies`, (5) later higher-precedence sources overriding the same ID, and (6) HTTP catalog `index.json` `version` bumps.
+1. **Trace discovery roots + path-derived IDs**:
+   - Auto-scans global (`~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`), system, upward project (`.opencode/skills`, `.claude/skills`, `.agents/skills`) roots, additive `"skills": [...]` config paths, HTTP `index.json` catalogs.
+   - File path strictly determines **case-sensitive** skill ID: `<source>/git-release/SKILL.md` → `git-release`; `<source>/teams/release/SKILL.md` → `release`; root `<source>/review.md` → `review`. Frontmatter `name` = display label only.
+   - Read `references/discovery-and-loading.md` for ordering + HTTP catalog schemas.
+2. **Distinguish states**:
+   - Model advertises `{ id, name, description }` if non-empty `description`, autoinvoke enabled, not denied by agent `skill` permissions.
+   - Set `metadata.opencode/autoinvoke: false` (or `disable-model-invocation: true`) → hides skill from auto listings, keeps loadable via exact ID (`@skill-id` or explicit `skill` tool/API call).
+3. **Diagnose missing or shadowed skills**:
+   - Check sequence: (1) exact uppercase `SKILL.md` (or root `*.md`) ≤ 6 dir levels deep → (2) exact path ID casing → (3) non-empty `description` → (4) `opencode/autoinvoke` + `skill` permissions/`policies` → (5) higher-precedence source override → (6) HTTP catalog `index.json` `version` bumps.
 
 ## Critical Invariants and Gotchas
 
-- **Display `name` is never a valid skill ID**: Calling the `skill` tool, `@skill-id`, or `session.skill` with `"Git Release"` instead of `"git-release"` fails with an unknown-ID error.
-- **Relative `skills` config paths resolve from the active working directory**: Unlike `plugins` and `references` (which resolve relative to the containing `opencode.json(c)` file), relative entries in `"skills": ["./team-skills"]` resolve from OpenCode's **active working directory**.
-- **`SKILL.md` stops deeper directory scanning**: Any folder containing `SKILL.md` is treated as one skill leaf; nested `SKILL.md` files inside it are ignored and hidden. Flat `*.md` skills are discovered **only** at a source root, never in subfolders, and do not receive a 10-file supporting path sample on load.
-- **Loading a skill never grants tool permissions**: Injecting a skill's Markdown body does not authorize `shell`, `edit`, `webfetch`, or other tools recommended inside those instructions; normal agent permissions and system policies still apply.
-- **Supporting files load lazily**: Loading a skill injects its frontmatter-stripped Markdown body, base directory path, and up to 10 sample neighbor file paths—never the contents of `references/` or `scripts/`. The agent reads supporting files on demand. Never read entire reference catalogs if only specific sections or rows are needed.
+- **Display `name` never valid skill ID**: Calling `skill` tool, `@skill-id`, or `session.skill` with `"Git Release"` instead of `"git-release"` → fails unknown-ID err.
+- **Relative `skills` config paths resolve from CWD**: Unlike `plugins`/`references` (resolve relative to `opencode.json(c)`), relative entries in `"skills": ["./team-skills"]` resolve from active working dir.
+- **`SKILL.md` stops deeper dir scan**: Dir containing `SKILL.md` = skill leaf. Nested `SKILL.md` ignored. Flat `*.md` discovered **only** at source root, never subfolders; receives no 10-file sample on load.
+- **Loading skill grants zero tool permissions**: Injected body does not authorize `shell`, `edit`, `webfetch`. Agent permissions + policies enforce separately.
+- **Supporting files load lazily**: Skill load injects stripped markdown body, base dir path, ≤ 10 sample neighbor file paths. Never injects `references/` or `scripts/` contents. Agent reads on demand. Do not read entire catalogs if target subset suffices.
 - **`<available_skills>` XML catalog bloat & `autoinvoke: false` scoping**:
-  - An unfiltered global+project catalog of 50+ skills injects `5,000–6,500+` XML tokens into every prompt turn (the rendered `<available_skills>` XML format is `~20%` larger than raw JSON instruction blobs).
-  - Adding `metadata.opencode/autoinvoke: false` (or `disable-model-invocation: true`) to frontmatter strips admin-only, platform-authoring, or meta skills from the automatic XML catalog while preserving explicit `@skill-id` and `skill` tool loading.
+  - Unfiltered catalog of 50+ skills injects `5,000–6,500+` XML tokens/turn (`~20%` larger than raw JSON).
+  - Add `metadata.opencode/autoinvoke: false` (or `disable-model-invocation: true`) to strip admin/platform/meta skills from auto XML catalog while preserving explicit `@skill-id` + `skill` tool loads.
 - **Global-First Skill Sorting (`isGlobalOrSystemSkill` in `packages/core/src/skill/instructions.ts`)**:
-  - `SkillInstructions.load` sorts global, system, and builtin skills (`~/.config/opencode/skills`, `/etc/opencode/skills`, `/builtin/`) ahead of project-local skills (`.opencode/skills/`) via `isGlobalOrSystemSkill()`, while preserving deterministic alphabetical `id.localeCompare` order within each tier.
-  - **KV prefix stability**: Placing invariant global/system skills ahead of project-specific skills maximizes `<available_skills>` token prefix stability across different workspaces, enabling early cross-repository KV cache sharing.
-- **Impact of Large Project Skill/Agent Catalogs (`open-world` / `aurelith` Case Study)**:
-  - In massive codebases like `open-world` / `aurelith`, `128` project skills (`52.3 KB`) plus `57` project agents (`13.1 KB` serialized in the `subagent` tool schema) expand `frozen_initial` + `frozen_hooked_tools_json` to `~164 KB` (`~36,500` tokens after `AGENTS.md` deduplication).
-  - Uncached cold prefill on `~36.5K` tokens consumes `~170–190s` TTFT on pure-FP16 inference.
-  - **`epoch_prefix` table (`SessionEpochPrefix`) protection**: OpenCode's `epoch_prefix` table freezes `frozen_initial` and `frozen_hooked_tools_json` at session initialization. Across all subsequent turns (Turns 2+), the session restores this exact frozen prefix, delivering `96–99.7%` KV cache hit rates and reducing TTFT to `1.47s–12.67s`.
-- **Runtime V2 vs portable conventions**: OpenCode V2 runtime treats all frontmatter as optional and does not enforce lowercase kebab-case, 1-64 char length, or `name == id`; enforce those rules via `` `create-skill` `` for cross-repo portability without mislabeling them as V2 runtime errors.
-- **Orthogonal roles of `autoinvoke: true` vs `subagent` permissions**:
-  - `autoinvoke: true` (default) publishes the skill's `{ id, name, description }` inside the `<available_skills>` prompt catalog, enabling the top-level agent to discover and load domain guidance on demand via the `skill` tool.
-  - `autoinvoke: false` (or `metadata.opencode/autoinvoke: false` / `disable-model-invocation: true`) hides the skill from automatic discovery while keeping it loadable via manual `/skill` user commands or explicit `@skill-id` prompt mentions.
-  - This is **completely orthogonal to `subagent` permissions**: `subagent` permissions govern delegating work to independent child agents (`explore`, custom subagents) running in separate sessions, whereas `skill` permissions and `autoinvoke` govern loading Markdown instructions directly into the active session context.
+  - `SkillInstructions.load` sorts global/system/builtin skills (`~/.config/opencode/skills`, `/etc/opencode/skills`, `/builtin/`) ahead of project-local skills (`.opencode/skills/`) via `isGlobalOrSystemSkill()`, preserving alphabetical `id.localeCompare` order per tier → maximizes `<available_skills>` prefix stability across workspaces.
+- **Large Project Skill/Agent Catalogs (`open-world` / `aurelith` Case Study) & `epoch_prefix` Protection**:
+  - `128` project skills + `57` project agents expand `frozen_initial` + `frozen_hooked_tools_json` (`~36.5K` tok pre-Caveman Ultra; `-42%` post-Caveman Ultra).
+  - OpenCode `epoch_prefix` table (`SessionEpochPrefix`) freezes `frozen_initial` + `frozen_hooked_tools_json` at session init → Turns 2+ restore exact frozen prefix (`96–99.7%` KV cache hit rate, `1.47s–12.67s` TTFT).
+- **Runtime V2 vs portable conventions**: OpenCode V2 runtime treats all frontmatter optional (does not enforce kebab-case, 1-64 char length, `name == id`). Enforce via `create-skill` for cross-repo portability.
+- **`autoinvoke: true` vs `subagent` permissions**:
+  - `autoinvoke: true` (default) publishes `{ id, name, description }` inside `<available_skills>` prompt catalog → top-level agent loads via `skill` tool.
+  - `autoinvoke: false` (or `metadata.opencode/autoinvoke: false` / `disable-model-invocation: true`) hides skill from auto catalog; loadable via `/skill` or `@skill-id`.
+  - Orthogonal to `subagent` permissions: `subagent` governs delegating to child agents (`explore`, subagents) in separate sessions; `skill` permissions + `autoinvoke` govern injecting markdown into active ctx.

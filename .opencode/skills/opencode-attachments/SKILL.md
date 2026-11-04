@@ -1,27 +1,28 @@
 ---
 name: opencode-attachments
-description: "Configure and construct OpenCode V2 prompt and command file attachments (`file://` and `data:` URIs, 1-based `?start=&end=` line spans, magic-byte sniffing, 20 MiB caps, supported text/SVG/image/PDF formats, and `media.image` auto-resize settings). Use for user input attachments and image normalization; use `opencode-messages-parts` for downloading tool output media and `opencode-references` for named external directory aliases."
+description: Configure construct OpenCode V2 prompt command file attachments line
+  spans magic byte sniffing 20MiB caps media image resize
 ---
 
 # OpenCode Attachments
 
-Attachments inject local files, line ranges, directory listings, images, or PDFs directly into an OpenCode V2 user prompt or slash command, and share `media.image` normalization rules with the built-in `read` tool.
+Attachments inject local files, line ranges, dir listings, images, PDFs into OpenCode V2 prompt/command. Share `media.image` normalization rules with `read` tool.
 
 ## Scope and Neighbor Boundaries
 
-- **This skill owns**: Prompt/command attachment input objects (`uri`, `name`, `description`, `mention`), `file://` URIs (including `?start=&end=` line spans and immediate directory listings), inline Base64 `data:` URIs, 20 MiB item/picker caps, raw magic-byte format detection, model modality fallback notes, and `media.image` configuration (`auto_resize`, `max_width`, `max_height`, `max_base64_bytes`).
-- **Use sibling skills for**:
-  - `` `opencode-messages-parts` `` — rendering transcript parts and retrieving **output** media produced by tools (`experimental.media.get` / `media:<sha256>`).
-  - `` `opencode-references` `` — named external directory/Git aliases (`references` config).
-  - `` `opencode-tools` `` — `read` tool text paging and `webfetch` for HTTP/HTTPS URLs.
-  - `` `opencode-models` `` / `` `opencode-providers` `` — declaring model image/PDF input modality support.
+- **Owns**: Prompt/command attachment input objects (`uri`, `name`, `description`, `mention`), `file://` URIs (line spans `?start=&end=`, immediate dir listings), inline Base64 `data:` URIs, 20 MiB item/picker caps, raw magic-byte format detection, model modality fallback notes, `media.image` config (`auto_resize`, `max_width`, `max_height`, `max_base64_bytes`).
+- **Sibling skills**:
+  - `opencode-messages-parts` — render transcript parts, retrieve output media (`experimental.media.get` / `media:<sha256>`).
+  - `opencode-references` — named external dir/Git aliases (`references` config).
+  - `opencode-tools` — `read` tool text paging, `webfetch` for HTTP/HTTPS URLs.
+  - `opencode-models` / `opencode-providers` — model image/PDF input modality spec.
 
-Read [attachment formats, limits, and image processing](references/attachment-formats-and-media.md) for complete URI syntax, format matrices, and resize pipeline details.
+Read `references/attachment-formats-and-media.md` for URI syntax, format matrices, resize pipeline details.
 
 ## Core Workflow
 
-1. **Construct valid V2 attachment descriptors** (on `session.prompt` or `session.command` `files` arrays):
-   - **Server-accessible file or directory (`file:` URI)**:
+1. **Construct V2 attachment descriptors** (`session.prompt` or `session.command` `files` array):
+   - **Server-accessible file/dir (`file:` URI)**:
      ```json
      {
        "uri": "file:///abs/path/to/project/src/server.ts?start=20&end=60",
@@ -29,7 +30,7 @@ Read [attachment formats, limits, and image processing](references/attachment-fo
        "description": "HTTP server entrypoint"
      }
      ```
-     Use positive 1-based `start` and `end` query parameters (`?start=20&end=60`) on text `file:` URIs to slice line ranges.
+     Use positive 1-based `start`/`end` query params (`?start=20&end=60`) on text `file:` URIs to slice line ranges.
    - **Inline payload (`data:` Base64 URI)**:
      ```json
      {
@@ -37,11 +38,11 @@ Read [attachment formats, limits, and image processing](references/attachment-fo
        "name": "greeting.txt"
      }
      ```
-   - **Never pass `http://` or `https://` URLs** as attachments—OpenCode rejects them before admitting the prompt.
+   - **Never pass `http://` or `https://` URLs** as attachments → OpenCode rejects before prompt admission.
 2. **Match attachment formats to active model modalities**:
-   - **Always visible (even on text-only models)**: UTF-8 text files, **SVG** files (decoded as text), and directory `file://` URIs (non-recursive immediate listing).
-   - **Multimodal-dependent**: `PNG`, `JPEG`, `GIF`, `WebP` (require image-capable model) and `PDF` (requires PDF-capable model). When the active model lacks that input modality, OpenCode substitutes a short fallback note—unless custom model config misdeclared image support, in which case the upstream text-only provider may reject the request!
-3. **Configure `media.image` normalization (`opencode.jsonc`)** (applies to both prompt attachments and `read` tool image reads):
+   - **Always visible (text-only models too)**: UTF-8 text, **SVG** (decoded as text), dir `file://` URIs (non-recursive immediate listing).
+   - **Multimodal-dependent**: `PNG`, `JPEG`, `GIF`, `WebP` (req image support), `PDF` (req PDF support). Lacking modality → OpenCode substitutes short fallback note. Misdeclared support in custom config → upstream text-only provider rejects req.
+3. **Configure `media.image` normalization (`opencode.jsonc`)** (affects prompt attachments and `read` tool):
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
@@ -59,10 +60,10 @@ Read [attachment formats, limits, and image processing](references/attachment-fo
 ## Key Invariants and Gotchas
 
 - **Pre-admission validation & 20 MiB caps**:
-  - OpenCode reads every attachment **before** admitting the prompt, rejecting invalid URLs, unreadable paths, special device/socket nodes, and any item over **20 MiB decoded** (two 12 MiB items pass per-item admission).
-  - The Desktop file picker enforces a **20 MiB combined total** per selection (two 12 MiB files exceed picker selection). Custom client uploaders should cap decoded file sizes at `<= 20 MiB` so accepted uploads do not fail at prompt admission.
-- **Magic-byte sniffing defeats extension/MIME spoofing**: OpenCode detects media type from raw byte headers. Renaming a binary to `.txt` or changing a `data:` MIME header will not expose unsupported binaries (`AVIF`, `BMP`, audio, video, executables); convert `BMP`/`AVIF` to `PNG`/`JPEG` or binaries to UTF-8 text first.
-- **Line-range URI syntax trap**: V2 `file:` URIs select line spans with query parameters (`?start=20&end=60`), not `#L20-L60` URL hash fragments used in Markdown links.
-- **`auto_resize` can mutate output MIME type**: When `auto_resize: true` (default), OpenCode scales oversized images down preserving aspect ratio and tries progressively smaller `PNG` and `JPEG` encodings to fit `max_base64_bytes`—so an oversized `WebP` or `GIF` can become `PNG` or `JPEG`. When `auto_resize: false`, any image exceeding any bound fails immediately.
-- **`max_base64_bytes` excludes the `data:` prefix**: Only the Base64-encoded payload characters count toward `max_base64_bytes` (e.g., `SGVsbG8=` counts as 8 bytes).
-- **Not a security boundary**: If the host image resizer is unavailable, OpenCode passes oversized images through unchanged, and upstream providers still enforce their own dimension, count, and byte limits after OpenCode processing.
+  - OpenCode reads attachments **before** prompt admission. Rejects invalid URLs, unreadable paths, special device/socket nodes, items > **20 MiB decoded** (two 12 MiB items pass per-item admission).
+  - Desktop file picker enforces **20 MiB combined total** per selection (two 12 MiB files fail picker). Custom client uploaders must cap decoded sizes `<= 20 MiB`.
+- **Magic-byte sniffing defeats extension/MIME spoofing**: Media type detected via raw byte headers. Renaming binary to `.txt` or changing `data:` MIME header fails for unsupported binaries (`AVIF`, `BMP`, audio, video, executables). Convert `BMP`/`AVIF` → `PNG`/`JPEG` or binary → UTF-8 text first.
+- **Line-range URI syntax trap**: V2 `file:` URIs select line spans via query params (`?start=20&end=60`), NOT `#L20-L60` Markdown hash fragments.
+- **`auto_resize` mutates output MIME type**: `auto_resize: true` (default) → scales down, preserves aspect ratio, iterates smaller `PNG`/`JPEG` encodings to fit `max_base64_bytes`. Oversized `WebP`/`GIF` may become `PNG`/`JPEG`. `auto_resize: false` → any image exceeding bounds errs immediately.
+- **`max_base64_bytes` excludes `data:` prefix**: Only Base64 payload chars count (`SGVsbG8=` = 8 bytes).
+- **Not security boundary**: Host image resizer unavailable → oversized images pass through unresized. Upstream providers enforce own dimension, count, byte limits downstream.

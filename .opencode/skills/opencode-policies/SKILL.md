@@ -1,23 +1,24 @@
 ---
 name: opencode-policies
-description: "Author and audit OpenCode V2 `policies` (`provider.use`, `tool.use`, `integration.use` with binary `allow`/`deny`), inverted broad-to-narrow config precedence (MDM and system overriding OpenCode Console, global, and project files), Console 1-minute workspace sync, and non-disableable built-in policy plugins. Use for hard organizational or host containment restrictions; use `opencode-permissions` for per-agent `allow`/`ask`/`deny` tool prompts."
+description: Author audit OpenCode V2 binary allow deny policies inverted broad narrow
+  precedence Console sync
 ---
 
 # OpenCode Policies
 
-Policies enforce binary (`allow` or `deny`), non-prompting restrictions across providers, tools, and integrations, evaluated with **inverted broad-to-narrow precedence** so system, MDM, and OpenCode Console rules cannot be weakened by user or repository config files.
+Policies enforce binary (`allow` or `deny`), non-prompting restrictions across providers, tools, integrations. Evaluated via inverted broad-to-narrow precedence: system, MDM, Console rules cannot be weakened by user/repo config.
 
-## Scope and Neighbor Boundaries
+## Scope & Boundaries
 
-- **This skill owns**: Top-level `policies` statements (and legacy `experimental.policies` merging), `provider.use`, `tool.use`, and `integration.use` resource patterns, binary `allow`/`deny` tightening semantics, partial-validation warning behavior, inverted 6-tier precedence (macOS MDM -> System -> OpenCode Console -> Global -> Direct project -> `.opencode` project), Console 1-minute sync & offline retention, and protected policy/Console plugins.
-- **Use sibling skills for**:
-  - `` `opencode-permissions` `` — per-agent `{action, resource, effect}` rules supporting `ask` prompts and saved `"Allow always"` grants.
-  - `` `opencode-providers` `` — configuring provider endpoints, models, and credentials (policies restrict provider usage; they never configure endpoints or credentials).
-  - `` `opencode-mcp-servers` ``, `` `opencode-skills` ``, and `` `opencode-plugins` `` — configuring integrations gated by `integration.use`.
+- **Owns**: Top-level `policies` (and legacy `experimental.policies` merging), `provider.use`, `tool.use`, `integration.use` resource patterns, binary `allow`/`deny` tightening, partial-validation warnings, 6-tier precedence, Console 1-minute sync/offline retention, protected policy/Console plugins.
+- **Neighbor skills**:
+  - `opencode-permissions` — per-agent `{action, resource, effect}` rules, `ask` prompts, saved `"Allow always"` grants.
+  - `opencode-providers` — configure provider endpoints, models, credentials.
+  - `opencode-mcp-servers`, `opencode-skills`, `opencode-plugins` — configure integrations gated by `integration.use`.
 
-Read [policy actions, inverted precedence, and Console sync](references/policy-precedence-and-console.md) for full resource syntax, authority rankings, and Console lifecycle tables.
+Read `references/policy-precedence-and-console.md` for full resource syntax, authority rankings, Console lifecycle.
 
-## Core Configuration Workflow
+## Core Config Workflow
 
 1. **Author ordered `{ action, resource, effect }` statements (`opencode.jsonc`)**:
    ```jsonc
@@ -38,31 +39,30 @@ Read [policy actions, inverted precedence, and Console sync](references/policy-p
      ]
    }
    ```
-   - Put broad statements first and exceptions after them: **last matching statement wins** (no specificity rule). If nothing matches, policy allows normal evaluation to proceed.
-2. **Place restrictions at the right authority tier**:
-   - Unlike normal settings where project configs win, **broader policy tiers evaluate later and override narrower tiers**:
+   - Put broad statements first, exceptions after: **last matching statement wins** (no specificity rule). If no match → normal evaluation proceeds.
+2. **Authority tier placement**:
+   - Inverted precedence: broader policy tiers evaluate later, override narrower tiers:
      1. macOS Managed Preferences (`/Library/Managed Preferences/[<user>/]ai.opencode.managed.plist`) — *highest*
      2. System `opencode.json(c)` (`/Library/Application Support/opencode`, `/etc/opencode`, `%ProgramData%\opencode`)
      3. Connected OpenCode Console workspace
      4. Global `~/.config/opencode/opencode.json(c)`
-     5. Direct `opencode.json(c)` (outer directories beat inner subdirectories)
-     6. `.opencode/opencode.json(c)` (outer directories beat inner subdirectories) — *lowest*
-3. **Check server logs after editing `deny` statements**:
-   - Invalid policy statements (for example, using `"effect": "ask"` or an unknown `action`) are **dropped with a server log warning** while remaining valid statements apply! Always inspect logs so a typo never silently drops a security boundary.
+     5. Direct `opencode.json(c)` (outer dirs override inner subdirs)
+     6. `.opencode/opencode.json(c)` (outer dirs override inner subdirs) — *lowest*
+3. **Verify server logs**:
+   - Invalid statements (e.g. `"effect": "ask"`, unknown `action`) dropped with server log warning; valid statements still apply. Inspect logs to prevent silent drop of security boundary.
 
-## Key Invariants and Gotchas
+## Key Invariants & Gotchas
 
-- **Policy `allow` ONLY lifts an earlier policy `deny`**: Policies only ever tighten access. `{ "action": "tool.use", "resource": "shell:git status *", "effect": "allow" }` never grants `shell` execution on its own—it merely lifts an earlier `"shell:*"` policy `deny`, leaving the active agent's `` `opencode-permissions` `` rules to allow, ask, or deny.
-- **`provider.use` hides providers completely**: Denied providers vanish from catalogs and model pickers even if valid API keys, OAuth accounts, environment variables, or built-in plugins exist. Replaces V1 `enabled_providers` / `disabled_providers`.
-- **`tool.use` overrides `"Allow always"` grants without prompting**: Runs **after** agent permissions and saved project approvals, failing immediately with `Blocked by configuration policy` (or `Blocked by <Workspace>'s policy` for Console denials). Trailing ` *` patterns also match bare commands (`"shell:git push *"` blocks `"git push"`).
-- **`integration.use` unloads MCP, skills, and plugins**: Matches `mcp:<server>`, `skill:<id>`, and `plugin:<unversioned-package-or-abs-path>`, preventing denied integrations from loading regardless of how they were discovered.
-- **No runtime sandboxing of already-loaded plugin code**: Denying a provider blocks OpenCode's normal provider/model pipeline, and `integration.use` can block loading a plugin—but policies do **not** sandbox raw network calls inside an allowed custom plugin's JavaScript code.
-- **Protected built-in plugins & Console offline persistence**: Neither the built-in policy enforcement plugin nor the OpenCode Console plugin can be disabled via `plugins`. Console policies refresh roughly **once per minute** and **remain enforced from cache if Console becomes unreachable** (cleared only on explicit disconnect or replaced on workspace switch).
-- **The 3-way allowlist trap for new built-in tools**:
-  - In hardened host environments (such as `/etc/aquanox-security/opencode/opencode.json`), `policies` defaults to `{ "action": "tool.use", "resource": "*", "effect": "deny" }` and `permissions` defaults to `*: * -> deny`.
-  - When introducing a new built-in control tool (such as `request_synthesis`), granting permissions in top-level `permissions` and `agents.<id>.permissions` is **insufficient**: the policy layer evaluates after permissions and immediately blocks the tool with `Blocked by configuration policy` unless an explicit policy statement is included:
-    `{ "action": "tool.use", "resource": "request_synthesis:*", "effect": "allow" }`.
-  - To authorize any new tool in hardened environments, the tool must be allowed across all 3 tiers: (1) top-level `policies`, (2) top-level `permissions`, and (3) per-agent `agents.<id>.permissions` (for both `general` and `explore`).
-- **Policy tier vs agent-level permissions boundary**:
-  - Policies enforce global non-prompting containment across providers, tools, and integrations, but they do not distinguish between agent personas (such as `general` vs `explore`).
-  - To enforce agent-specific containment—such as preventing `explore` from invoking `shell` while allowing `general` to run commands—pair top-level policies with **dual-layer agent permissions** (`plugin/agent.ts` + `agents.explore.permissions` in `opencode.json`) so top-level permission merging does not override agent-level security boundaries.
+- **`allow` only lifts earlier policy `deny`**: Policies only tighten access. `{ "action": "tool.use", "resource": "shell:git status *", "effect": "allow" }` never grants `shell` exec directly — only cancels earlier `"shell:*"` policy `deny`. Active agent `opencode-permissions` still decides `allow`/`ask`/`deny`.
+- **`provider.use` hides providers**: Denied providers disappear from catalogs/pickers despite valid API keys, OAuth, env vars, built-in plugins. Replaces V1 `enabled_providers` / `disabled_providers`.
+- **`tool.use` overrides `"Allow always"`**: Runs **after** agent permissions and saved approvals. Fails immediately with `Blocked by configuration policy` (or `Blocked by <Workspace>'s policy`). Trailing ` *` pattern also matches bare command (`"shell:git push *"` blocks `"git push"`).
+- **`integration.use` unloads MCP, skills, plugins**: Matches `mcp:<server>`, `skill:<id>`, `plugin:<unversioned-package-or-abs-path>`. Blocks integration load regardless of discovery path.
+- **No runtime sandboxing of loaded plugin code**: Blocks provider pipeline and plugin loading, but does NOT sandbox raw network calls inside allowed plugin JS code.
+- **Protected plugins & Console offline persistence**: Built-in policy plugin and Console plugin cannot be disabled via `plugins`. Console syncs ~1/min; offline cache stays enforced until explicit disconnect or workspace switch.
+- **3-way allowlist trap for built-in tools**:
+  - Hardened host env (e.g. `/etc/aquanox-security/opencode/opencode.json`): `policies` defaults to `{ "action": "tool.use", "resource": "*", "effect": "deny" }`, permissions default to `*: * -> deny`.
+  - Adding new built-in tool (e.g. `request_synthesis`): permissions in top-level `permissions` and `agents.<id>.permissions` insufficient. Policy layer blocks with `Blocked by configuration policy` unless explicit policy present: `{ "action": "tool.use", "resource": "request_synthesis:*", "effect": "allow" }`.
+  - Must allow across 3 tiers: (1) top-level `policies`, (2) top-level `permissions`, (3) per-agent `agents.<id>.permissions` (`general` and `explore`).
+- **Policy tier vs agent permission boundary**:
+  - Policies enforce global non-prompting containment; do not distinguish agent personas (`general` vs `explore`).
+  - Agent-specific containment (e.g. block `shell` for `explore`, allow for `general`) reqs pairing top-level policies with dual-layer agent permissions (`plugin/agent.ts` + `agents.explore.permissions` in `opencode.json`).

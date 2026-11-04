@@ -8,11 +8,11 @@ import { Permission } from "../../permission.js"
 export const name = "request_synthesis"
 
 export const CONFIRMATION =
-  "Synthesis mode activated. Emit your complete, concise final deliverable now without further tool calls."
+  "Synthesis mode activated. Emit final deliverable now (<= 2,000 tok) in Caveman Ultra (drop articles/filler, abbreviate DB/auth/config/req/res/fn/impl/ctx/env/err, causal arrows X -> Y, exact file:line symbols) without further tool calls."
 
 export const DESCRIPTION = [
-  "Call request_synthesis({}) once your discovery, inspection, or verification tool calls are complete to switch into final structured report synthesis.",
-  "After calling request_synthesis({}), emit your complete, concise final deliverable directly in a single pass without further tool calls.",
+  "Call request_synthesis({}) once discovery, inspection, or verification tool calls finish to switch into final structured report synthesis.",
+  "After calling request_synthesis({}), emit your complete final deliverable in a single pass using Caveman Ultra (or Caveman Full + Team Lead if Depth-0 user tail) without further tool calls.",
 ].join(" ")
 
 export const Input = Schema.Struct({
