@@ -71,9 +71,33 @@ const builtins = Layer.mock(InstructionBuiltIns.Service, {
 const discovery = Layer.mock(InstructionDiscovery.Service, {
   project: true,
   global: true,
-  load: () => Effect.succeed(Instructions.empty),
+  load: () =>
+    Effect.succeed(
+      Instructions.make({
+        key: Instructions.Key.make("core/instructions"),
+        codec: Schema.toCodecJson(Schema.String),
+        read: Effect.succeed("Global AGENTS.md"),
+        render: {
+          initial: (v) => `Discovery: ${v}`,
+          changed: (_p, v) => `Discovery changed: ${v}`,
+        },
+      }),
+    ),
 })
-const skills = Layer.mock(SkillInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
+const skills = Layer.mock(SkillInstructions.Service, {
+  load: () =>
+    Effect.succeed(
+      Instructions.make({
+        key: Instructions.Key.make("core/skill-guidance"),
+        codec: Schema.toCodecJson(Schema.String),
+        read: Effect.succeed("<available_skills/>"),
+        render: {
+          initial: (v) => `Skills: ${v}`,
+          changed: (_p, v) => `Skills changed: ${v}`,
+        },
+      }),
+    ),
+})
 const references = Layer.mock(ReferenceInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
 const mcp = Layer.mock(McpInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
 
@@ -316,6 +340,17 @@ describe("SessionContext", () => {
       expect(userMessages3[1].text).toContain("[Date rollover: 2026-10-31]")
       expect(userMessages3[1].text).toContain("Turn 2 continuation")
       expect(userMessages3[1].text).not.toContain("<system-reminder>")
+    }),
+  )
+  it.effect("orders core/instructions discovery ahead of core/skill-guidance for cross-repo prefix sharing", () =>
+    Effect.gen(function* () {
+      const { session, context } = yield* setup
+      const selection = yield* context.select(session.id)
+      const keys = selection.instructions.map((s) => s.key)
+      const discoveryIdx = keys.indexOf(Instructions.Key.make("core/instructions"))
+      const skillsIdx = keys.indexOf(Instructions.Key.make("core/skill-guidance"))
+      expect(discoveryIdx).toBeGreaterThanOrEqual(0)
+      expect(skillsIdx).toBeGreaterThan(discoveryIdx)
     }),
   )
 })

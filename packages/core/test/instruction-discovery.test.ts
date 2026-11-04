@@ -743,4 +743,57 @@ describe("ConfigInstructionPlugin.Plugin", () => {
       expect(observed.values).toEqual([{ targets: ["AGENTS.md"], start: repo, stop: repo, type: "file" }])
     }),
   )
+
+  it.live("deduplicates configured instruction files that have identical content to global AGENTS.md", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const globalDir = path.join(tmp.path, "global")
+        const systemDir = path.join(tmp.path, "etc", "opencode")
+        const projectDir = path.join(tmp.path, "repo")
+        const globalFile = path.join(globalDir, "AGENTS.md")
+        const systemFile = path.join(systemDir, "AGENTS.md")
+        const projectFile = path.join(projectDir, "AGENTS.md")
+        const sharedGlobalContent = "# Global OpenCode Instructions\nShared rules across all repos.\n"
+        return Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(globalDir, { recursive: true })
+            await fs.mkdir(systemDir, { recursive: true })
+            await fs.mkdir(projectDir, { recursive: true })
+            await fs.writeFile(globalFile, sharedGlobalContent)
+            await fs.writeFile(systemFile, sharedGlobalContent)
+            await fs.writeFile(projectFile, "# Project Instructions\nRepo rules.\n")
+          })
+          const discovery = yield* start()
+          const initialized = yield* readInitial(yield* discovery.load())
+          expect(initialized.text).toBe(
+            [
+              `Instructions from: ${globalFile}\n${sharedGlobalContent}`,
+              `Instructions from: ${projectFile}\n# Project Instructions\nRepo rules.\n`,
+            ].join("\n\n"),
+          )
+          expect(initialized.text).not.toContain(`Instructions from: ${systemFile}`)
+        }).pipe(
+          Effect.provide(
+            instructionLayer({
+              config: globalDir,
+              home: tmp.path,
+              instructions: [systemFile],
+              locationServiceLayer: Layer.succeed(
+                Location.Service,
+                Location.Service.of(
+                  location(
+                    { directory: AbsolutePath.make(projectDir) },
+                    { projectDirectory: AbsolutePath.make(projectDir) },
+                  ),
+                ),
+              ),
+            }),
+          ),
+        )
+      }),
+    ),
+  )
 })

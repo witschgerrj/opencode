@@ -196,7 +196,14 @@ export const Plugin = define({
           })
           loaded.current =
             Array.isArray(sources.global) && Array.isArray(sources.project) && Array.isArray(sources.configured)
-              ? { type: "available", files: [...sources.global, ...sources.project, ...sources.configured] }
+              ? {
+                  type: "available",
+                  files: deduplicateInstructionFiles([
+                    ...sources.global,
+                    ...sources.project,
+                    ...sources.configured,
+                  ]),
+                }
               : { type: "unavailable" }
           if (!file) return
           yield* Effect.logDebug("instructions rescanned", {
@@ -251,4 +258,18 @@ function ancestorDirectories(start: string, stop: string): string[] {
 
 function isUrl(source: string) {
   return URL.canParse(source) && /^https?:$/.test(new URL(source).protocol)
+}
+
+function deduplicateInstructionFiles(files: readonly InstructionDiscovery.File[]): InstructionDiscovery.File[] {
+  const seenContent = new Set<string>()
+  const result: InstructionDiscovery.File[] = []
+  for (const file of files) {
+    const normalized = file.content.replaceAll("\r\n", "\n").trim()
+    if (normalized.length > 0) {
+      if (seenContent.has(normalized)) continue
+      seenContent.add(normalized)
+    }
+    result.push(file)
+  }
+  return result
 }

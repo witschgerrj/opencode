@@ -29,7 +29,7 @@ Read [built-in tool catalog and Code Mode contracts](references/builtin-tools-an
    - `glob` matches relative paths (default 100 files, 30s timeout); `grep` searches file contents via regex or `literal: true` (default 100 matching lines, 30s timeout).
    - `edit` replaces unique (`replaceAll: false`) or all occurrences in an existing file; `write` creates or overwrites a file (creating parent directories); `patch` applies multi-file `*** Add File` / `*** Update File` / `*** Delete File` (including renames/moves) **only on supported OpenAI/GPT models** (other models receive `edit` and `write`).
 2. **Use `shell` with explicit `workdir` and bounded timeouts**:
-   - Pass `workdir` rather than embedding `cd`. Foreground calls default to a **2-minute (`120000` ms) timeout**.
+   - Pass `workdir` rather than embedding `cd`. Foreground calls default to a **10-minute (`600000` ms) timeout**.
    - Set `background: true` for long-running processes; background calls return immediately, notify the session upon exit, and **have no timeout unless `timeout` is explicitly supplied**.
    - Tune inline retention globally via `"tool_output": { "max_lines": 2000, "max_bytes": 51200 }`; oversized `shell` and `webfetch` outputs are shortened inline while full output is saved in a managed file.
 3. **Orchestrate parallel or filtered workflows with Code Mode (`execute`)**:
@@ -38,6 +38,11 @@ Read [built-in tool catalog and Code Mode contracts](references/builtin-tools-an
 
 ## Key Invariants and Gotchas
 
+- **Bounded Child Stdio Drain (`200ms` cap in `shell.ts`) & `600s` Default Timeout**:
+  - Foreground `shell` tool execution defaults to a **10-minute (`600,000` ms)** timeout (`timeout: 600000`).
+  - When commands spawn backgrounded child processes or daemons that inherit standard I/O file descriptors (`stdout`/`stderr`), standard Node.js stream listeners do not emit the `'close'` event upon child process exit because inherited descriptors remain open in descendant processes.
+  - In `shell.ts`, the runtime races stdout/stderr stream draining against a **`200ms` timeout** immediately upon receiving the child process `'exit'` event.
+  - **Hang prevention**: If the stream drain does not complete within 200ms after the primary process exits, the tool promptly finishes and returns collected output and the exit code, preventing orphaned child processes from hanging tool return until the `600,000ms` command timeout.
 - **Denying `execute` hides Code-Mode-only tools**: A `deny` on action `execute` (`resource: "*"`) removes Code Mode **and** hides every tool exposed exclusively inside it—including MCP server tools unless that server sets `"codemode": false`, `opencode.*` session/worktree helpers, and `browser.*`.
 - **Code Mode never bypasses permissions**: Every nested built-in, MCP, or plugin tool invoked inside `execute` still enforces its own permission rules across all affected resources.
 - **`grep` checks the pattern, NOT the search path**: `grep` evaluates permission action `grep` against the requested regex/literal `pattern` string—it does **not** check the `path` argument! Do not rely on `grep` rules to restrict directory access.

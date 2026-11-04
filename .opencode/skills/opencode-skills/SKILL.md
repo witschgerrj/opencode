@@ -36,6 +36,13 @@ OpenCode V2 skills package task-specific instructions and private supporting fil
 - **`<available_skills>` XML catalog bloat & `autoinvoke: false` scoping**:
   - An unfiltered global+project catalog of 50+ skills injects `5,000–6,500+` XML tokens into every prompt turn (the rendered `<available_skills>` XML format is `~20%` larger than raw JSON instruction blobs).
   - Adding `metadata.opencode/autoinvoke: false` (or `disable-model-invocation: true`) to frontmatter strips admin-only, platform-authoring, or meta skills from the automatic XML catalog while preserving explicit `@skill-id` and `skill` tool loading.
+- **Global-First Skill Sorting (`isGlobalOrSystemSkill` in `packages/core/src/skill/instructions.ts`)**:
+  - `SkillInstructions.load` sorts global, system, and builtin skills (`~/.config/opencode/skills`, `/etc/opencode/skills`, `/builtin/`) ahead of project-local skills (`.opencode/skills/`) via `isGlobalOrSystemSkill()`, while preserving deterministic alphabetical `id.localeCompare` order within each tier.
+  - **KV prefix stability**: Placing invariant global/system skills ahead of project-specific skills maximizes `<available_skills>` token prefix stability across different workspaces, enabling early cross-repository KV cache sharing.
+- **Impact of Large Project Skill/Agent Catalogs (`open-world` / `aurelith` Case Study)**:
+  - In massive codebases like `open-world` / `aurelith`, `128` project skills (`52.3 KB`) plus `57` project agents (`13.1 KB` serialized in the `subagent` tool schema) expand `frozen_initial` + `frozen_hooked_tools_json` to `~164 KB` (`~36,500` tokens after `AGENTS.md` deduplication).
+  - Uncached cold prefill on `~36.5K` tokens consumes `~170–190s` TTFT on pure-FP16 inference.
+  - **`epoch_prefix` table (`SessionEpochPrefix`) protection**: OpenCode's `epoch_prefix` table freezes `frozen_initial` and `frozen_hooked_tools_json` at session initialization. Across all subsequent turns (Turns 2+), the session restores this exact frozen prefix, delivering `96–99.7%` KV cache hit rates and reducing TTFT to `1.47s–12.67s`.
 - **Runtime V2 vs portable conventions**: OpenCode V2 runtime treats all frontmatter as optional and does not enforce lowercase kebab-case, 1-64 char length, or `name == id`; enforce those rules via `` `create-skill` `` for cross-repo portability without mislabeling them as V2 runtime errors.
 - **Orthogonal roles of `autoinvoke: true` vs `subagent` permissions**:
   - `autoinvoke: true` (default) publishes the skill's `{ id, name, description }` inside the `<available_skills>` prompt catalog, enabling the top-level agent to discover and load domain guidance on demand via the `skill` tool.

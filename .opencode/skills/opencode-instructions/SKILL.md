@@ -55,8 +55,15 @@ Read [instruction discovery, ordering, and session entry API](references/discove
   - OpenCode's `SessionContext.select` (`packages/core/src/session/context.ts:152-161`) appends `loaded.builtins` (`core/date` and `core/environment` `<env>Working directory: ...</env>`) plus `loaded.entries` at the **end of `system.content`**.
   - In chat templates where `system.content` renders *before* `\n\n## Tools` (such as DeepSeek V4.1 Flash and standard GGUF Jinja templates), any change to `<env>` (e.g. worktree switch) or `date` (midnight UTC rollover) mutates tokens immediately *before* `## Tools`, invalidating `~3,000–5,000` tool-schema KV tokens in the prefix cache!
   - **Mitigation**: Moving dynamic session metadata (`date`, `<env>`, dynamic context entries) out of `<｜System｜>` into `<｜User｜>` (such as inside a leading `<system-reminder>` block) preserves 100% byte-for-byte invariance for `<｜System｜> + instructions + ## Tools` across all worktrees, calendar days, and sessions.
-- **Instruction deduplication and skill catalog bloat**:
-  - When global config defines `"instructions": ["/etc/opencode/AGENTS.md"]` and the repository also contains `AGENTS.md`, OpenCode combines both additively (`~4,151` tokens). If global `AGENTS.md` is an authoring table already represented in `<available_skills>`, deduplicating it or setting `"instructions": []` in global config saves thousands of cold prefill tokens.
+- **Content-Hash Deduplication in `ConfigInstructionPlugin` (`packages/core/src/config/plugin/instruction.ts`)**:
+  - `refresh()` deduplicates loaded instruction files across `[...sources.global, ...sources.project, ...sources.configured]` by normalized non-empty content (`file.content.replaceAll("\r\n", "\n").trim()`).
+  - It keeps the first occurrence (`sources.global`'s `~/.config/opencode/AGENTS.md`) and drops redundant copies such as `/etc/opencode/AGENTS.md` from `configuredSource`.
+  - **Cold TTFT & KV impact**: Prevents `20,552` bytes (`~4,600` tokens / `~21.7s` cold TTFT on pure-FP16 inference) of duplicate global instructions from bloating `frozen_initial`.
+- **Cross-Repository Prefix Ordering in `SessionContext.select` (`packages/core/src/session/context.ts`)**:
+  - `loaded.discovery` (`core/instructions`, starting with `~/.config/opencode/AGENTS.md`) is ordered **ahead of** `loaded.skills` (`core/skill-guidance`) in `Instructions.combine([...])`.
+  - Placing `CodeModeInstructions` (`~900` tokens) + Global `AGENTS.md` (`~4,600` tokens) at the top of `<｜System｜>` guarantees an identical `~5,500`-token prefix across all repositories.
+  - **Checkpoint boundary crossing**: This crosses `llama-server`'s `4,096`-token `DSV4` recurrent-state checkpoint boundary (`seq_pos = 4096`) before any repository-specific `AGENTS.md` or `100+` project skills diverge, unlocking instant cross-workspace foundation prefix cache hits (`f_keep` hits) across distinct projects.
+- **Skill catalog bloat & `autoinvoke: false` scoping**:
   - Unfiltered advertising of 50+ skills injects `5,000–6,500+` tokens of `<available_skills>` XML into every prompt step. Use `metadata.opencode/autoinvoke: false` on admin/platform/meta skills to strip them from the automatic catalog while keeping them loadable by ID (see `` `opencode-skills` ``).
 - **Privileged content redaction**: Clients can observe *which* instruction sources changed, but raw instruction text remains privileged and is never exposed back to unprivileged client payloads.
 

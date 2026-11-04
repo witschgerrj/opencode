@@ -53,5 +53,13 @@ Read [session lifecycle contracts and config precedence](references/lifecycle-an
   - `location-activity.ts` must call `touch` on incoming streaming deltas and register active child subagents in `owners`, paired with `experimental: { todo: true, location_idle_timeout: false }` in configuration to prevent premature execution termination.
 - **Prefix immutability and SWA ring buffer protection (`to-llm-message.ts:156-184`)**:
   - Historical `{ type: "reasoning" }` blocks from `sameModel` turns (including errored or interrupted turns) must remain in the message history. Stripping reasoning parts alters token offsets and wipes `llama_kv_cache_dsv4` SWA ring buffers (`cache = 0`). Token `#0` system prompts must also remain strictly immutable across compactions.
+- **Sticky Parent-to-Child Buddy Block Affinity in Slot Leasing (`getPreferredBuddyBlock` in `packages/core/src/session/slot-lease.ts` / `packages/opencode/src/session/slot-lease.ts`)**:
+  - The 9-quantum dual-tier Buddy Arena (`9Q = 1,179,648` unified pure-`FP16` MLA+DSA tokens) partitions inference slots across three Buddy Blocks:
+    - Block 0: Slots `0, 1, 2`
+    - Block 1: Slots `3, 4, 5`
+    - Block 2: Slots `6, 7, 8`
+  - Primary Lead agents (`general`, etc.) default to the `256k` (`2Q = 262,144` tokens) context tier on slots `0, 3, 6` (occupying sub-slots `0` and `1`), leaving tail sibling slots `2, 5, 8` (`sib = 2`) 100% immune to Lead context expansion.
+  - When spawning a subagent, `getPreferredBuddyBlock` maps the parent Lead's slot to its owning block (`block = Math.floor(parentSlot / 3)`) and prioritizes the immune tail sibling slot in that exact block (`slot = 3 * block + 2`, i.e., slot `2`, `5`, or `8`) before falling back to the global tail-first lease sequence `[2, 5, 8, 1, 4, 7]`.
+  - **Memory locality & non-interference**: This sticky affinity keeps parent orchestrators and their child subagents co-located within the same Buddy Block while guaranteeing zero collision with the parent Lead's expanding context tier.
 - **Compaction object schema and watermark alignment**:
   - In `3 × 384K` environments (`limit.context = 393216`), configure `"compaction": { "auto": true, "buffer": 65536, "keep": { "tokens": 12288 } }` (`327,680` watermark). Note that `"keep"` must be an object (`keep: { tokens: ... }`); a bare number fails schema validation in `normalize.ts:374` and is silently ignored.
