@@ -6,6 +6,9 @@ import {
 import type { OpenAICompatibleChatPrompt } from "./openai-compatible-api-types.js"
 import { convertToBase64 } from "@ai-sdk/provider-utils"
 
+const sanitizeTemplateSpecialTokens = (value: string): string =>
+  value.includes("<｜deepseek_image｜>") ? value.replaceAll("<｜deepseek_image｜>", "<|deepseek_image|>") : value
+
 function getOpenAIMetadata(message: { providerOptions?: SharedV3ProviderOptions }) {
   return message?.providerOptions?.copilot ?? {}
 }
@@ -28,7 +31,7 @@ export function convertToOpenAICompatibleChatMessages(prompt: LanguageModelV3Pro
         if (content.length === 1 && content[0].type === "text") {
           messages.push({
             role: "user",
-            content: content[0].text,
+            content: sanitizeTemplateSpecialTokens(content[0].text),
             ...getOpenAIMetadata(content[0]),
           })
           break
@@ -40,7 +43,7 @@ export function convertToOpenAICompatibleChatMessages(prompt: LanguageModelV3Pro
             const partMetadata = getOpenAIMetadata(part)
             switch (part.type) {
               case "text": {
-                return { type: "text", text: part.text, ...partMetadata }
+                return { type: "text", text: sanitizeTemplateSpecialTokens(part.text), ...partMetadata }
               }
               case "file": {
                 if (part.mediaType.startsWith("image/")) {
@@ -93,7 +96,7 @@ export function convertToOpenAICompatibleChatMessages(prompt: LanguageModelV3Pro
 
           switch (part.type) {
             case "text": {
-              text += part.text
+              text += sanitizeTemplateSpecialTokens(part.text)
               break
             }
             case "reasoning": {
@@ -154,7 +157,7 @@ export function convertToOpenAICompatibleChatMessages(prompt: LanguageModelV3Pro
           messages.push({
             role: "tool",
             tool_call_id: toolResponse.toolCallId,
-            content: contentValue,
+            content: sanitizeTemplateSpecialTokens(contentValue),
             ...toolResponseMetadata,
           })
         }

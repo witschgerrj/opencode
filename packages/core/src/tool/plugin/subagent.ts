@@ -17,6 +17,101 @@ import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
+export const MAX_SUBAGENT_NAME_CHARS = 40
+
+export const deriveSubagentTaskName = (rawDescription?: string, rawPrompt?: string, fallbackAgent?: string): string => {
+  const source = (rawDescription || rawPrompt || fallbackAgent || "Subagent")
+    .replace(/^\s*You are a subagent spawned by another session\.?\s*/i, "")
+    .replace(/^\s*RESEARCH ONLY\s*[—\-:]\s*[^.!?]*[.!?]?\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!source) return fallbackAgent || "Subagent"
+  const stripped = source
+    .replace(/^(?:please\s+)?(?:investigate|research|analyze|audit|verify|check|inspect|explore|review|find|locate|diagnose|debug)\s+(?:the\s+)?/i, "")
+    .trim()
+  const base = stripped || source
+  const titled = base.charAt(0).toUpperCase() + base.slice(1)
+  return titled.length <= MAX_SUBAGENT_NAME_CHARS ? titled : titled.slice(0, MAX_SUBAGENT_NAME_CHARS).trimEnd()
+}
+
+export const generateSubagentNameWithDeepSeek = async (input: {
+  description?: string
+  prompt?: string
+  agent?: string
+  endpoint?: string
+}): Promise<string> => {
+  const fallback = deriveSubagentTaskName(input.description, input.prompt, input.agent)
+  if (process.env.AQUANOX_ISOLATED_VALIDATION === "1" && !input.endpoint) return fallback
+  const endpoint = input.endpoint ?? "http://127.0.0.1:8080/v1/chat/completions"
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(2500),
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        reasoning_effort: "low",
+        reasoning_budget_tokens: 32,
+        max_tokens: 96,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Call report_subagent_name with a concise task-representative agent name (2-5 words, Title Case, max 40 characters) that names the specialist subagent for its assigned task rather than a raw action verb.",
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              description: (input.description || "").slice(0, 300),
+              prompt: (input.prompt || "").slice(0, 800),
+              agent: input.agent || "",
+              fallback,
+            }),
+          },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "report_subagent_name",
+              description: "Report a concise task-representative agent name (max 40 characters) for an invoked subagent.",
+              parameters: {
+                type: "object",
+                properties: {
+                  name: { type: "string", maxLength: MAX_SUBAGENT_NAME_CHARS },
+                },
+                required: ["name"],
+              },
+            },
+          },
+        ],
+        tool_choice: {
+          type: "function",
+          function: { name: "report_subagent_name" },
+        },
+      }),
+    })
+    if (!response.ok) return fallback
+    const payload = (await response.json()) as {
+      choices?: Array<{
+        message?: {
+          tool_calls?: Array<{ function?: { arguments?: string } }>
+        }
+      }>
+    }
+    const rawArgs = payload.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments
+    if (!rawArgs) return fallback
+    const parsed = JSON.parse(rawArgs) as { name?: unknown }
+    if (typeof parsed.name === "string" && parsed.name.trim()) {
+      return parsed.name.trim().slice(0, MAX_SUBAGENT_NAME_CHARS)
+    }
+    return fallback
+  } catch {
+    return fallback
+  }
+}
+
 export const MAX_SUBAGENT_DEPTH = 3
 
 /**
@@ -388,12 +483,22 @@ export const Plugin = {
               if (existing !== undefined) {
                 yield* sessions.setMetadata({ sessionID: existing.id, metadata: childMetadata }).pipe(Effect.ignore)
               }
+              const resolvedTitle =
+                existing === undefined && isDeepSeekLocal
+                  ? yield* Effect.promise(() =>
+                      generateSubagentNameWithDeepSeek({
+                        description: input.description,
+                        prompt: input.prompt,
+                        agent: agent.name,
+                      }),
+                    )
+                  : input.description
               const child =
                 existing ??
                 (yield* sessions
                   .create({
                     parentID: context.sessionID,
-                    title: input.description,
+                    title: resolvedTitle,
                     agent: agent.id,
                     model,
                     metadata: childMetadata,
@@ -531,6 +636,96 @@ export const Plugin = {
                 }
                 if (preleasedSlot) {
                   SessionSlotLease.release(child.id)
+                }
+                // Automatically retry once in a fresh session when a newly spawned foreground subagent fails with a runtime/provider error.
+                if (
+                  result?.info.status === "error" &&
+                  existing === undefined &&
+                  !/no model is available/i.test(result.info.error ?? "")
+                ) {
+                  activeWriteScopes.delete(child.id)
+                  const retryChild = yield* sessions
+                    .create({
+                      parentID: context.sessionID,
+                      title: resolvedTitle,
+                      agent: agent.id,
+                      model,
+                      metadata: childMetadata,
+                    })
+                    .pipe(
+                      Effect.mapError(
+                        (error) => new ToolFailure({ message: `Parent session not found: ${context.sessionID}`, error }),
+                      ),
+                    )
+                  SessionSlotLease.registerChildSession(retryChild.id, context.sessionID)
+                  SessionSlotLease.setSessionTier(retryChild.id, resolvedTier)
+                  if (input.write_scope && input.write_scope.length > 0) {
+                    registerWriteScope(retryChild.id, input.write_scope)
+                  }
+                  yield* context.progress({ sessionID: retryChild.id, status: "running" })
+                  if (preleasedSlot) {
+                    yield* SessionSlotLease.acquireSubagentAsync({
+                      sessionID: retryChild.id,
+                      parentSessionID: context.sessionID,
+                      tier: resolvedTier,
+                    }).pipe(
+                      Effect.timeout("30 seconds"),
+                      Effect.catch(() => Effect.sync(() => SessionSlotLease.acquire(retryChild.id, true))),
+                    )
+                  }
+                  yield* sessions
+                    .prompt({
+                      sessionID: retryChild.id,
+                      text: [
+                        "You are a subagent spawned by another session.",
+                        input.prompt,
+                        `\n[Note: A prior subagent attempt (${child.id}) failed with error: ${result.info.error ?? "unknown error"}. Avoid repeating any command or action that triggered that error.]`,
+                      ].join("\n"),
+                    })
+                    .pipe(
+                      Effect.mapError(
+                        (error) => new ToolFailure({ message: `Failed to prompt retry subagent: ${retryChild.id}`, error }),
+                      ),
+                    )
+                  const retryRecovery = {
+                    kind: "subagent" as const,
+                    parentSessionID: context.sessionID,
+                    childSessionID: retryChild.id,
+                    agent: agent.name,
+                    description: resolvedTitle,
+                  }
+                  yield* subagents.start(retryRecovery)
+                  SessionSlotLease.release(context.sessionID)
+                  const retryResult = yield* jobs.block({ id: retryChild.id, sessionID: context.sessionID }).pipe(
+                    Effect.onInterrupt(() =>
+                      Effect.all([sessions.interrupt(retryChild.id), jobs.cancel(retryChild.id)], {
+                        discard: true,
+                      }),
+                    ),
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        SessionSlotLease.acquire(context.sessionID, Boolean(parent.parentID))
+                      }),
+                    ),
+                  )
+                  if (preleasedSlot) {
+                    SessionSlotLease.release(retryChild.id)
+                  }
+                  if (retryResult?.type === "backgrounded") {
+                    yield* subagents.notify(retryRecovery, retryResult.info.started_at)
+                    return backgroundResult(retryChild.id)
+                  }
+                  if (retryResult?.info.status === "error")
+                    return yield* new ToolFailure({
+                      message: `Subagent failed (sessionID: ${retryChild.id}): ${retryResult.info.error ?? "unknown error"}`,
+                    })
+                  if (retryResult?.info.status === "cancelled")
+                    return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${retryChild.id})` })
+                  return {
+                    sessionID: retryChild.id,
+                    status: "completed" as const,
+                    output: retryResult?.info.output ?? SubagentCompletion.NO_TEXT,
+                  }
                 }
                 // Failure surfaces keep the sessionID visible so the model can continue the child.
                 if (result?.info.status === "error")

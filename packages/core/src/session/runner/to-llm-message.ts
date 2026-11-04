@@ -17,6 +17,16 @@ import type { FileAttachment } from "@opencode/schema/prompt"
 
 const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 
+/**
+ * Neutralize literal DeepSeek special image tokens (<｜deepseek_image｜> with U+FF5C)
+ * inside text/tool/reasoning strings so llama-server's Jinja chat_template guard never
+ * throws 'Message content contains image special token <｜deepseek_image｜>' when a tool
+ * or user prompt inspects raw model templates or /props output.
+ */
+export const sanitizeTemplateSpecialTokens = (value: string): string =>
+  value.includes("<｜deepseek_image｜>") ? value.replaceAll("<｜deepseek_image｜>", "<|deepseek_image|>") : value
+
+
 const media = (file: FileAttachment): ContentPart => ({
   type: "media",
   media: Media.base64(file.data, file.mime),
@@ -134,8 +144,8 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
       name: tool.name,
       result:
         single?.type === "text"
-          ? { type: "text" as const, value: single.text }
-          : { type: "content" as const, value: content },
+          ? { type: "text" as const, value: sanitizeTemplateSpecialTokens(single.text) }
+          : { type: "content" as const, value: content.map((part) => (part.type === "text" ? { ...part, text: sanitizeTemplateSpecialTokens(part.text) } : part)) },
       providerExecuted: tool.executed,
       providerMetadata,
     })
@@ -144,7 +154,7 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
     return ToolResultPart.make({
       id: tool.id,
       name: tool.name,
-      result: { error: tool.state.error, content: tool.state.content ?? [] },
+      result: { error: { ...tool.state.error, message: sanitizeTemplateSpecialTokens(tool.state.error.message) }, content: (tool.state.content ?? []).map((part) => (part.type === "text" ? { ...part, text: sanitizeTemplateSpecialTokens(part.text) } : part)) },
       resultType: "error",
       providerExecuted: tool.executed,
       providerMetadata,
@@ -171,7 +181,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       return [
         {
           type: "text",
-          text: item.text,
+          text: sanitizeTemplateSpecialTokens(item.text),
           // Text can carry provider-bound state (e.g. Gemini thought signatures),
           // which is only replayable against the model that produced it.
           providerMetadata: reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
@@ -279,7 +289,7 @@ function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMe
     case "user":
       const content = [
         ...(message.skills ?? []).flatMap((skill) => (skill.text === undefined ? [] : [Message.text(skill.text)])),
-        ...(message.text === "" ? [] : [Message.text(message.text)]),
+        ...(message.text === "" ? [] : [Message.text(sanitizeTemplateSpecialTokens(message.text))]),
         ...userAttachmentContent(message.files ?? []),
       ]
       if (content.length === 0) return []
@@ -295,7 +305,7 @@ function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMe
         }),
       ]
     case "synthetic":
-      return [Message.make({ id: message.id, role: "user", content: message.text })]
+      return [Message.make({ id: message.id, role: "user", content: sanitizeTemplateSpecialTokens(message.text) })]
     case "skill":
       return [Message.make({ id: message.id, role: "user", content: message.text, metadata: message.metadata })]
     case "system":

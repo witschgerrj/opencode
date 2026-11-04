@@ -45,6 +45,10 @@ const MAX_TIMEOUT_RETRIES = 3
 const MAX_LOADING_MODEL_RETRIES = 60
 const LOADING_MODEL_DELAY_MS = Duration.toMillis("10 seconds")
 
+const isDeterministicTemplateError = (input: Input) =>
+  input.cause.reason._tag === "ProviderInternal" &&
+  /jinja exception/i.test(input.cause.reason.message)
+
 const isLoadingModel = (input: Input) =>
   input.cause.reason._tag === "ProviderInternal" &&
   input.cause.reason.http?.status === 503 &&
@@ -57,6 +61,7 @@ export const policy = Effect.gen(function* () {
   let loadingRetries = 0
   return (input: Input) =>
     Effect.gen(function* () {
+      if (isDeterministicTemplateError(input)) return undefined
       if (isLoadingModel(input)) {
         if (loadingRetries >= MAX_LOADING_MODEL_RETRIES) return undefined
         loadingRetries++

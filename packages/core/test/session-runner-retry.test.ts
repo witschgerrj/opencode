@@ -5,6 +5,7 @@ import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/core/provider"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionRunnerRetry } from "@opencode/core/session/runner/retry"
+import { sanitizeTemplateSpecialTokens } from "@opencode/core/session/runner/to-llm-message"
 import { toSessionError } from "@opencode/core/session/to-session-error"
 import { Effect } from "effect"
 import { it } from "./lib/effect"
@@ -61,6 +62,22 @@ describe("SessionRunnerRetry.policy", () => {
       expect(yield* policy(input(loading))).toEqual({ retry: false })
       // And the general transient failure budget is still intact:
       expect((yield* policy(input(internal))).retry).toBe(true)
+    }),
+  )
+
+  it.effect("does not retry deterministic Jinja template exceptions and sanitizes special image tokens", () =>
+    Effect.gen(function* () {
+      const jinjaError = new AIError({
+        reason: new ProviderInternalError({
+          message: "Jinja Exception: Message content contains image special token <｜deepseek_image｜>. Images should be provided as image content blocks.",
+          http: { url: "http://127.0.0.1:8080/v1/chat/completions", status: 500, headers: {} },
+        }),
+      })
+      const policy = yield* SessionRunnerRetry.policy(SessionSchema.ID.make("ses_retry_jinja"))
+      expect(yield* policy(input(jinjaError))).toEqual({ retry: false })
+      expect(sanitizeTemplateSpecialTokens("template token <｜deepseek_image｜> in /props")).toBe(
+        "template token <|deepseek_image|> in /props",
+      )
     }),
   )
 })
