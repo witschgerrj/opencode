@@ -186,6 +186,61 @@ const blockOwner: Record<0 | 1 | 2, string | undefined> = {
   2: undefined,
 }
 
+const externalBlockReservation: Record<0 | 1 | 2, boolean> = {
+  0: false,
+  1: false,
+  2: false,
+}
+
+function isBlockOccupied(b: 0 | 1 | 2): boolean {
+  if (blockOwner[b] !== undefined || blockMode[b] !== "idle") return true
+  const s0 = (b * 3) as PhysicalSlotID
+  const s1 = (b * 3 + 1) as PhysicalSlotID
+  const s2 = (b * 3 + 2) as PhysicalSlotID
+  return (
+    activeSessionsBySlot[s0].size > 0 ||
+    activeSessionsBySlot[s1].size > 0 ||
+    activeSessionsBySlot[s2].size > 0
+  )
+}
+
+export function setExternalBlockReservation(blockId: 0 | 1 | 2, reserved: boolean): boolean {
+  if (blockId !== 0 && blockId !== 1 && blockId !== 2) return false
+  const wantReserved = Boolean(reserved)
+  if (wantReserved && isBlockOccupied(blockId)) {
+    return false
+  }
+  externalBlockReservation[blockId] = wantReserved
+  generation++
+  return true
+}
+
+export function isExternalBlockReserved(blockId: 0 | 1 | 2): boolean {
+  return Boolean(externalBlockReservation[blockId])
+}
+
+export function getAllowedBuddyBlocks(): ReadonlySet<0 | 1 | 2> {
+  const raw = process.env.AQUANOX_ALLOWED_BUDDY_BLOCKS
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = new Set<0 | 1 | 2>()
+    for (const part of raw.split(",")) {
+      const trimmed = part.trim()
+      if (trimmed === "0") parsed.add(0)
+      else if (trimmed === "1") parsed.add(1)
+      else if (trimmed === "2") parsed.add(2)
+    }
+    return parsed
+  }
+  if (process.env.AQUANOX_ENV === "staging") {
+    return new Set<0 | 1 | 2>([2])
+  }
+  return new Set<0 | 1 | 2>([0, 1, 2])
+}
+
+function isBlockAllocatable(b: 0 | 1 | 2): boolean {
+  return getAllowedBuddyBlocks().has(b) && !externalBlockReservation[b]
+}
+
 const sessionSlotMap = new Map<string, PhysicalSlotID>()
 const sessionTierMap = new Map<string, "128k" | "256k" | "384k">()
 const sessionConversationMap = new Map<string, string>()
@@ -514,19 +569,27 @@ export function getConversationIdForSession(sessionID: string): string | undefin
 
 function computeCommittedQuanta(): number {
   let committed = 0
+  for (const b of BUDDY_BLOCKS) {
+    if (!isBlockAllocatable(b) && blockOwner[b] === undefined) {
+      committed += 3
+    }
+  }
   for (const conv of conversations.values()) {
     committed += 3 + Math.max(conv.reservedSubagentQuanta, conv.activeSubagentQuanta)
   }
   for (const [sessId, slot] of sessionSlotMap.entries()) {
     if (activeSessionsBySlot[slot].has(sessId) && !sessionConversationMap.has(sessId)) {
+      const b = Math.floor(slot / 3) as 0 | 1 | 2
+      if (!isBlockAllocatable(b) && blockOwner[b] === undefined) continue
       const tier = sessionTierMap.get(sessId) ?? (slot % 3 === 0 ? "384k" : "128k")
       committed += tier === "384k" ? 3 : 1
     }
   }
-  return committed
+  return Math.min(9, committed)
 }
 
 function isBlockFree(b: 0 | 1 | 2): boolean {
+  if (!isBlockAllocatable(b)) return false
   if (blockOwner[b] !== undefined || blockMode[b] === "384k_locked") return false
   return (
     activeSessionsBySlot[(b * 3) as PhysicalSlotID].size === 0 &&
@@ -567,11 +630,19 @@ export function admitConversation(input: ConversationAdmissionInput): Conversati
         ? input.resources.reservedSubagents.count * 3
         : input.resources.reservedSubagents.count
       : 0)
-  const reservedSubagentQuanta = Math.min(rawReserved, MAX_SUBAGENT_QUANTA_PER_CONVERSATION)
+  const sanitizedReserved =
+    typeof rawReserved === "number" && Number.isFinite(rawReserved)
+      ? Math.max(0, Math.trunc(rawReserved))
+      : 0
+  const reservedSubagentQuanta = Math.min(sanitizedReserved, MAX_SUBAGENT_QUANTA_PER_CONVERSATION)
 
   const rawMax = input.maxConcurrentSubagents ?? input.resources?.maxConcurrentSubagents
+  const sanitizedMax =
+    typeof rawMax === "number" && Number.isFinite(rawMax)
+      ? Math.max(0, Math.trunc(rawMax))
+      : MAX_CONCURRENT_SUBAGENTS_PER_CONVERSATION
   const maxConcurrentSubagents = Math.min(
-    rawMax ?? MAX_CONCURRENT_SUBAGENTS_PER_CONVERSATION,
+    sanitizedMax,
     MAX_CONCURRENT_SUBAGENTS_PER_CONVERSATION,
   )
 
@@ -935,6 +1006,7 @@ function tryAcquireSubagentSync(input: {
     if (sticky !== undefined) {
       const b = Math.floor(sticky / 3) as 0 | 1 | 2
       if (
+        isBlockAllocatable(b) &&
         blockMode[b] !== "384k_locked" &&
         activeSessionsBySlot[sticky].size === 0
       ) {
@@ -958,6 +1030,7 @@ function tryAcquireSubagentSync(input: {
 
     for (const s of SUBAGENT_SLOT_PREFERENCE) {
       const b = Math.floor(s / 3) as 0 | 1 | 2
+      if (!isBlockAllocatable(b)) continue
       if (blockMode[b] === "384k_locked") continue
       if (activeSessionsBySlot[s].size > 0) continue
 
@@ -988,6 +1061,7 @@ function tryAcquireSubagentSync(input: {
     return candidateSlot
   } else {
     for (const b of BUDDY_BLOCKS) {
+      if (!isBlockAllocatable(b)) continue
       if (blockMode[b] !== "idle" || blockOwner[b] !== undefined) continue
       if (
         activeSessionsBySlot[(b * 3) as PhysicalSlotID].size === 0 &&
@@ -1111,6 +1185,9 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   const convId = sessionConversationMap.get(sessionID)
   const conv = convId ? conversations.get(convId) : undefined
   if (conv && !isSub) {
+    if (!isBlockAllocatable(conv.leadBlockId)) {
+      return -1
+    }
     activeSessionsBySlot[conv.leadSlotId].add(sessionID)
     lastUsedAtPerSlot[conv.leadSlotId] = ++leaseClock
     recordPin(sessionID, conv.leadSlotId)
@@ -1130,7 +1207,7 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
     const b = Math.floor(sticky / 3) as 0 | 1 | 2
     const isLockedBy384k = blockMode[b] === "384k_locked" && sticky % 3 !== 0
     const ownedByOtherConv = blockOwner[b] !== undefined && blockOwner[b] !== convId
-    if (!isLockedBy384k && !ownedByOtherConv) {
+    if (isBlockAllocatable(b) && !isLockedBy384k && !ownedByOtherConv) {
       const isOwnerActive = activeSessionsBySlot[sticky].has(sessionID)
       const isIdle = activeSessionsBySlot[sticky].size === 0
       if (isOwnerActive || (isIdle && (conversations.size === 0 || isSub))) {
@@ -1155,12 +1232,21 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
     return -1
   }
 
-  const primaryPool: ReadonlyArray<PhysicalSlotID> = isSub ? [1, 2] : [0]
-  const fallbackPool: ReadonlyArray<PhysicalSlotID> = isSub ? [0] : [1, 2]
+  const allocatableBlocks = BUDDY_BLOCKS.filter(isBlockAllocatable)
+  if (allocatableBlocks.length === 0) {
+    return -1
+  }
+  const primaryBlock = allocatableBlocks[0]!
+  const baseSlot = (primaryBlock * 3) as PhysicalSlotID
+  const child1 = (primaryBlock * 3 + 1) as PhysicalSlotID
+  const child2 = (primaryBlock * 3 + 2) as PhysicalSlotID
+  const primaryPool: ReadonlyArray<PhysicalSlotID> = isSub ? [child1, child2] : [baseSlot]
+  const fallbackPool: ReadonlyArray<PhysicalSlotID> = isSub ? [baseSlot] : [child1, child2]
 
   const primaryIdle = primaryPool.filter((s) => {
     const b = Math.floor(s / 3) as 0 | 1 | 2
     return (
+      isBlockAllocatable(b) &&
       activeSessionsBySlot[s].size === 0 &&
       blockOwner[b] === undefined &&
       !(blockMode[b] === "384k_locked" && s % 3 !== 0)
@@ -1179,6 +1265,7 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   const fallbackIdle = fallbackPool.filter((s) => {
     const b = Math.floor(s / 3) as 0 | 1 | 2
     return (
+      isBlockAllocatable(b) &&
       activeSessionsBySlot[s].size === 0 &&
       blockOwner[b] === undefined &&
       !(blockMode[b] === "384k_locked" && s % 3 !== 0)
@@ -1569,6 +1656,7 @@ export function reset(): void {
   for (const b of BUDDY_BLOCKS) {
     blockMode[b] = "idle"
     blockOwner[b] = undefined
+    externalBlockReservation[b] = false
   }
   sessionSlotMap.clear()
   sessionTierMap.clear()
@@ -1679,14 +1767,22 @@ export function getResourceSnapshot(query?: {
   const canAdmitNewLeadConversation = freeFullBlocks384k >= 1 && unreservedFreeQuanta128k >= 3
 
   let activeQuanta = 0
-  for (const s of SLOTS) {
-    if (activeSessionsBySlot[s].size > 0) {
-      const b = Math.floor(s / 3) as 0 | 1 | 2
-      if (blockMode[b] === "384k_locked" && s % 3 === 0) {
+  for (const b of BUDDY_BLOCKS) {
+    const base = (b * 3) as PhysicalSlotID
+    const s1 = (b * 3 + 1) as PhysicalSlotID
+    const s2 = (b * 3 + 2) as PhysicalSlotID
+    if (blockMode[b] === "384k_locked") {
+      if (
+        activeSessionsBySlot[base].size > 0 ||
+        activeSessionsBySlot[s1].size > 0 ||
+        activeSessionsBySlot[s2].size > 0
+      ) {
         activeQuanta += 3
-      } else {
-        activeQuanta += 1
       }
+    } else {
+      if (activeSessionsBySlot[base].size > 0) activeQuanta += 1
+      if (activeSessionsBySlot[s1].size > 0) activeQuanta += 1
+      if (activeSessionsBySlot[s2].size > 0) activeQuanta += 1
     }
   }
 
@@ -1741,7 +1837,7 @@ export function getResourceSnapshot(query?: {
 
     const free128kSlots = SLOTS.filter((s) => {
       const b = Math.floor(s / 3) as 0 | 1 | 2
-      return blockMode[b] !== "384k_locked" && activeSessionsBySlot[s].size === 0
+      return isBlockAllocatable(b) && blockMode[b] !== "384k_locked" && activeSessionsBySlot[s].size === 0
     }).length
 
     const maxSpawnableNow128k = Math.min(allowedByCap, allowedByQuanta, totalAvailForConv, free128kSlots)
@@ -1829,3 +1925,17 @@ export function getResourceSnapshot(query?: {
 }
 
 export const snapshot = getResourceSnapshot
+
+export const SlotLeaseManager = {
+  setExternalBlockReservation,
+  isExternalBlockReserved,
+  getAllowedBuddyBlocks,
+  admitConversation,
+  bindConversationSession,
+  releaseConversation,
+  acquire,
+  release,
+  getResourceSnapshot,
+  reset,
+  resetForTesting,
+}
