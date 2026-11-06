@@ -21,7 +21,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
-import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
+import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
 import { eq } from "drizzle-orm"
@@ -155,6 +155,151 @@ describe("SessionExecution lifecycle", () => {
       expect(yield* execution.active).not.toContain(sessionID)
       expect(yield* execution.isActive(sessionID)).toBe(false)
     }),
+  )
+
+  it.effect(
+    "reconciles orphaned inactive sessions on interrupt by clearing inbox, updating subagent tool status, and setting interrupted idle state",
+    () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const store = yield* SessionStore.Service
+        const parent = Session.ID.make("ses_orphan_parent")
+        const childDone = Session.ID.make("ses_orphan_child_done")
+        const childRunning = Session.ID.make("ses_orphan_child_running")
+
+        yield* seedSessions(database, [parent], {
+          time_suspended: 1000,
+          time_idle: 500,
+          idle_outcome: "succeeded",
+        })
+        yield* seedSessions(database, [childDone], {
+          parent_id: parent,
+          time_idle: 900,
+          idle_outcome: "succeeded",
+        })
+        yield* seedSessions(database, [childRunning], {
+          parent_id: parent,
+          time_suspended: 950,
+        })
+
+        // Seed leftover synthetic subagent completion in parent's session_inbox
+        const orphanInboxID = SessionMessage.ID.create()
+        yield* database.db
+          .insert(SessionInboxTable)
+          .values({
+            id: orphanInboxID,
+            session_id: parent,
+            type: "synthetic",
+            payload: {
+              text: "<subagent state=\"completed\">done</subagent>",
+              description: "Child B",
+              metadata: { source: "subagent", childID: childDone, state: "completed" },
+            },
+            delivery: "steer",
+            enqueued_seq: 1,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        // Seed assistant message on parent with 2 background subagent tool calls still marked status: "running"
+        const assistantMsgID = SessionMessage.ID.create()
+        yield* database.db
+          .insert(SessionMessageTable)
+          .values({
+            id: assistantMsgID,
+            session_id: parent,
+            type: "assistant",
+            seq: 1,
+            time_created: 800,
+            // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+            data: {
+              agent: "general",
+              model: { id: "model", providerID: "provider" },
+              time: { created: 800, completed: 850 },
+              content: [
+                {
+                  type: "tool",
+                  id: "call_done",
+                  name: "subagent",
+                  executed: false,
+                  time: { created: 800, ran: 810, completed: 820 },
+                  state: {
+                    status: "completed",
+                    input: { prompt: "A" },
+                    content: [{ type: "text", text: "running in background" }],
+                    metadata: { sessionID: childDone, status: "running" },
+                  },
+                },
+                {
+                  type: "tool",
+                  id: "call_running",
+                  name: "subagent",
+                  executed: false,
+                  time: { created: 800, ran: 810, completed: 820 },
+                  state: {
+                    status: "completed",
+                    input: { prompt: "C" },
+                    content: [{ type: "text", text: "running in background" }],
+                    metadata: { sessionID: childRunning, status: "running" },
+                  },
+                },
+              ],
+            } as unknown as typeof SessionMessageTable.$inferInsert.data,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const scope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+        const context = yield* buildExecution(scope, () => Effect.never)
+        const execution = Context.get(context, SessionExecution.Service)
+
+        // Interrupting the inactive parent clears its inbox, updates subagent tool metadata, and marks it interrupted + idle
+        expect(yield* execution.interrupt(parent)).toBeTrue()
+        expect(yield* SessionInbox.list(database.db, parent)).toEqual([])
+
+        const parentInfo = yield* store.get(parent)
+        expect(parentInfo?.outcome).toBe("interrupted")
+        expect(parentInfo?.time.idle).toBeDefined()
+        expect((yield* claims(database))[parent]).toBe(false)
+
+        const parentMessages = yield* store.messages({ sessionID: parent, order: "asc" })
+        expect(parentMessages.at(-1)).toMatchObject({
+          type: "idle",
+          outcome: "interrupted",
+        })
+        const updatedAssistant = parentMessages.find((m) => m.id === assistantMsgID)
+        expect(updatedAssistant?.type).toBe("assistant")
+        if (updatedAssistant?.type === "assistant") {
+          expect(updatedAssistant.content).toMatchObject([
+            {
+              type: "tool",
+              id: "call_done",
+              state: { status: "completed", metadata: { sessionID: childDone, status: "completed" } },
+            },
+            {
+              type: "tool",
+              id: "call_running",
+              state: { status: "completed", metadata: { sessionID: childRunning, status: "interrupted" } },
+            },
+          ])
+        }
+
+        // Interrupting the inactive orphaned child sets its time_idle, idle_outcome = "interrupted", and appends idle message
+        expect(yield* execution.interrupt(childRunning)).toBeTrue()
+        const childInfo = yield* store.get(childRunning)
+        expect(childInfo?.outcome).toBe("interrupted")
+        expect(childInfo?.time.idle).toBeDefined()
+        expect((yield* claims(database))[childRunning]).toBe(false)
+        const childMessages = yield* store.messages({ sessionID: childRunning, order: "asc" })
+        expect(childMessages.at(-1)).toMatchObject({
+          type: "idle",
+          outcome: "interrupted",
+        })
+
+        // Calling interrupt again once already cleanly settled is a no-op
+        expect(yield* execution.interrupt(childRunning)).toBeFalse()
+      }),
   )
 
   it.effect("does not resume a user-cancelled background child whose notification was not admitted", () =>
@@ -1339,7 +1484,12 @@ function seedInbox(
 function seedSessions(
   database: Database.Service["Service"],
   sessionIDs: ReadonlyArray<Session.ID>,
-  values: Partial<Pick<typeof SessionTable.$inferInsert, "time_suspended" | "resume_attempts" | "parent_id">> = {},
+  values: Partial<
+    Pick<
+      typeof SessionTable.$inferInsert,
+      "time_suspended" | "resume_attempts" | "parent_id" | "time_idle" | "idle_outcome"
+    >
+  > = {},
 ) {
   return Effect.gen(function* () {
     yield* database.db
