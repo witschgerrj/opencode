@@ -25,6 +25,7 @@ interface MockBrokerState {
   closeCalls: number
   receivedEnvelopes: GpuBrokerClient.SignedBrokerEnvelope[]
   receivedParams: Record<string, unknown>[]
+  receivedBootstrapPayloads: Record<string, unknown>[]
   imageResponseOverride?: Record<string, unknown>
   imageStatusCodeOverride?: number
   godotResponseOverride?: Record<string, unknown>
@@ -46,11 +47,18 @@ function createMockBrokerServer(socketPath: string) {
     closeCalls: 0,
     receivedEnvelopes: [],
     receivedParams: [],
+    receivedBootstrapPayloads: [],
   }
 
   const rotateBrokerEpoch = (newBootId: string, newEpoch: number) => {
     state.bootId = newBootId
     state.epoch = newEpoch
+    state.hmacKeyHex = crypto.randomBytes(32).toString("hex")
+  }
+
+  const rotateHmacKeySameEpoch = (newBootId?: string, sameEpoch?: number) => {
+    if (newBootId !== undefined) state.bootId = newBootId
+    if (sameEpoch !== undefined) state.epoch = sameEpoch
     state.hmacKeyHex = crypto.randomBytes(32).toString("hex")
   }
 
@@ -80,6 +88,11 @@ function createMockBrokerServer(socketPath: string) {
 
       if (req.url === "/v1/auth/bootstrap_or_rekey" && req.method === "POST") {
         state.bootstrapCalls++
+        state.receivedBootstrapPayloads.push(body)
+        if (body.force_rekey === true) {
+          state.epoch += 1
+          state.hmacKeyHex = crypto.randomBytes(32).toString("hex")
+        }
         res.statusCode = 200
         res.end(
           JSON.stringify({
@@ -120,7 +133,7 @@ function createMockBrokerServer(socketPath: string) {
 
       const validSig = GpuBrokerClient.verifyBrokerRequestEnvelope(envelope, params, state.hmacKeyHex)
       if (!validSig) {
-        res.statusCode = 401
+        res.statusCode = 403
         res.end(
           JSON.stringify({
             ok: false,
@@ -212,6 +225,7 @@ function createMockBrokerServer(socketPath: string) {
   return {
     state,
     rotateBrokerEpoch,
+    rotateHmacKeySameEpoch,
     start: () =>
       new Promise<void>((resolve, reject) => {
         try {
@@ -1715,5 +1729,71 @@ describe("Aquanox v12.0 GPU Broker Client & Tool Plugins over Unix Domain Socket
     expect(elapsed).toBeGreaterThanOrEqual(1900) // at least one 2000ms retry backoff
     expect(res.output.ok).toBe(true)
     expect(typeof res.content).toBe("string")
+  })
+
+  test("GPU-043: automatic recovery on 403 ERR_INVALID_SIGNATURE with force_rekey: true, concurrent bootstrap deduplication, and exact QA S06 cat-hat parameters", async () => {
+    const client = GpuBrokerClient.getDefaultClient()
+
+    // 1. Concurrent bootstrapOrRekey(false) calls deduplicate via bootstrapInFlight
+    const [bootA, bootB] = await Promise.all([client.bootstrapOrRekey(false), client.bootstrapOrRekey(false)])
+    expect(bootA).toEqual(bootB)
+    expect(mockBroker.state.bootstrapCalls).toBe(1)
+    expect(mockBroker.state.receivedBootstrapPayloads[0]?.force_rekey).toBeUndefined()
+
+    // 2. Simulate broker restarting at epoch 7 with a new in-memory HMAC key (same epoch & boot_id as client's cached state)
+    mockBroker.rotateBrokerEpoch("boot_same_epoch_7", 7)
+    await client.bootstrapOrRekey(false)
+    expect(client.getCachedEpochState()?.broker_epoch).toBe(7)
+    const oldKey = client.getCachedEpochState()?.hmac_key_hex
+    expect(mockBroker.state.bootstrapCalls).toBe(2)
+
+    // Broker rotates its in-memory HMAC key while staying on epoch 7 (triggering 403 ERR_INVALID_SIGNATURE on next signed request)
+    mockBroker.rotateHmacKeySameEpoch("boot_same_epoch_7", 7)
+
+    // 3. Validate and execute with exact QA S06 parameters
+    const qaParams = {
+      prompt: "Photorealistic Siberian cat wearing a tiny knitted winter hat, studio lighting",
+      tier: "qwen_image_2512",
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      seed: 42,
+      lease_mode: "shared_worker",
+      output_path: "/home/rjwits/artifacts/qa-e2e32-S06-20261106T0623Z/cat-hat.png",
+    }
+
+    const validatedQa = GenerateImageTool.validateGenerateImageInput(qaParams)
+    expect(validatedQa.tier).toBe("qwen_image_2512")
+    expect(validatedQa.width).toBe(1024)
+    expect(validatedQa.height).toBe(1024)
+    expect(validatedQa.steps).toBe(28)
+    expect(validatedQa.seed).toBe(42)
+    expect(validatedQa.lease_mode).toBe("shared_worker")
+    expect(validatedQa.output_path).toBe("/home/rjwits/artifacts/qa-e2e32-S06-20261106T0623Z/cat-hat.png")
+    expect(validatedQa.worktree_root).toBe("/home/rjwits/artifacts/qa-e2e32-S06-20261106T0623Z")
+
+    const envCountBefore = mockBroker.state.receivedEnvelopes.length
+    const execRes = await Effect.runPromise(
+      GenerateImageTool.executeGenerateImage(qaParams, "ses_qa_s06_rekey"),
+    )
+
+    // First attempt got 403 ERR_INVALID_SIGNATURE -> triggered bootstrapOrRekey(true) with force_rekey: true -> rotated to epoch 8 and succeeded!
+    expect(execRes.output.ok).toBe(true)
+    expect(execRes.output.output_path).toBe("/home/rjwits/artifacts/qa-e2e32-S06-20261106T0623Z/cat-hat.png")
+    expect(mockBroker.state.bootstrapCalls).toBe(3)
+    const lastBootstrapPayload =
+      mockBroker.state.receivedBootstrapPayloads[mockBroker.state.receivedBootstrapPayloads.length - 1]!
+    expect(lastBootstrapPayload.force_rekey).toBe(true)
+
+    const newCachedState = client.getCachedEpochState()!
+    expect(newCachedState.broker_epoch).toBe(8)
+    expect(newCachedState.hmac_key_hex).not.toBe(oldKey)
+
+    const firstAttemptEnv = mockBroker.state.receivedEnvelopes[envCountBefore]!
+    const retriedAttemptEnv = mockBroker.state.receivedEnvelopes[envCountBefore + 1]!
+    expect(firstAttemptEnv.broker_epoch).toBe(7)
+    expect(retriedAttemptEnv.broker_epoch).toBe(8)
+    expect(retriedAttemptEnv.nonce).not.toBe(firstAttemptEnv.nonce)
+    expect(retriedAttemptEnv.signature).not.toBe(firstAttemptEnv.signature)
   })
 })

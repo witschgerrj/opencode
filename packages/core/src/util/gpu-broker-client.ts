@@ -333,6 +333,7 @@ interface RawHttpResult {
 
 export class Client {
   private epochState: BrokerEpochState | undefined
+  private bootstrapInFlight: Promise<BrokerEpochState> | undefined
   private readonly options: BrokerClientOptions
 
   constructor(options: BrokerClientOptions = {}) {
@@ -528,51 +529,71 @@ export class Client {
     if (force) {
       this.epochState = undefined
     }
-    const transport = this.resolveTransport()
-    const res = await this.sendRawPost(
-      "/v1/auth/bootstrap_or_rekey",
-      {
-        client_id: transport.clientId,
-        pid: process.pid,
-      },
-      {},
-      undefined,
-      signal,
-    )
-
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      const errCode = typeof res.body.error === "string" ? res.body.error : "ERR_BROKER_BOOTSTRAP_FAILED"
-      const errMsg =
-        typeof res.body.message === "string"
-          ? res.body.message
-          : `Failed to bootstrap/rekey with GPU Broker (HTTP ${res.statusCode})`
-      throw new GpuBrokerError(errMsg, res.statusCode, errCode, res.body)
+    if (!force && !signal && this.bootstrapInFlight) {
+      return this.bootstrapInFlight
     }
 
-    const broker_boot_id = String(res.body.broker_boot_id ?? "")
-    const broker_epoch = Number(res.body.broker_epoch ?? 0)
-    const hmac_key_hex = String(res.body.hmac_key_hex ?? "")
-
-    if (!broker_boot_id || !hmac_key_hex || !Number.isFinite(broker_epoch)) {
-      throw new GpuBrokerError(
-        "GPU Broker returned incomplete epoch credentials during bootstrap_or_rekey",
-        500,
-        "ERR_INVALID_BOOTSTRAP_RESPONSE",
-        res.body,
+    const run = async (): Promise<BrokerEpochState> => {
+      const transport = this.resolveTransport()
+      const res = await this.sendRawPost(
+        "/v1/auth/bootstrap_or_rekey",
+        {
+          client_id: transport.clientId,
+          pid: process.pid,
+          ...(force ? { force_rekey: true } : {}),
+        },
+        {},
+        undefined,
+        signal,
       )
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        const errCode = typeof res.body.error === "string" ? res.body.error : "ERR_BROKER_BOOTSTRAP_FAILED"
+        const errMsg =
+          typeof res.body.message === "string"
+            ? res.body.message
+            : `Failed to bootstrap/rekey with GPU Broker (HTTP ${res.statusCode})`
+        throw new GpuBrokerError(errMsg, res.statusCode, errCode, res.body)
+      }
+
+      const broker_boot_id = String(res.body.broker_boot_id ?? "")
+      const broker_epoch = Number(res.body.broker_epoch ?? 0)
+      const hmac_key_hex = String(res.body.hmac_key_hex ?? "")
+
+      if (!broker_boot_id || !hmac_key_hex || !Number.isFinite(broker_epoch)) {
+        throw new GpuBrokerError(
+          "GPU Broker returned incomplete epoch credentials during bootstrap_or_rekey",
+          500,
+          "ERR_INVALID_BOOTSTRAP_RESPONSE",
+          res.body,
+        )
+      }
+
+      this.epochState = {
+        broker_boot_id,
+        broker_epoch,
+        hmac_key_hex,
+      }
+      return { ...this.epochState }
     }
 
-    this.epochState = {
-      broker_boot_id,
-      broker_epoch,
-      hmac_key_hex,
+    if (!force && !signal) {
+      const promise = run().finally(() => {
+        if (this.bootstrapInFlight === promise) {
+          this.bootstrapInFlight = undefined
+        }
+      })
+      this.bootstrapInFlight = promise
+      return promise
     }
-    return { ...this.epochState }
+
+    return run()
   }
 
   /**
    * Sends a signed request to the GPU Broker and automatically handles 401 ERR_BROKER_EPOCH_MISMATCH
-   * by re-running bootstrapOrRekey(), re-signing with a fresh nonce and the new epoch, and retrying once.
+   * or 403 ERR_INVALID_SIGNATURE by re-running bootstrapOrRekey(), re-signing with a fresh nonce and
+   * the new epoch/key, and retrying once.
    */
   async requestWithAutoRekey<T = Record<string, unknown>>(input: {
     endpointPath: string
@@ -622,8 +643,12 @@ export class Client {
 
     let res = await attemptSignedPost(this.epochState!)
 
-    if (res.statusCode === 401 && res.body.error === "ERR_BROKER_EPOCH_MISMATCH") {
-      const newState = await this.bootstrapOrRekey(false, signal)
+    if (
+      (res.statusCode === 401 && res.body.error === "ERR_BROKER_EPOCH_MISMATCH") ||
+      (res.statusCode === 403 && res.body.error === "ERR_INVALID_SIGNATURE")
+    ) {
+      const forceRekey = res.statusCode === 403
+      const newState = await this.bootstrapOrRekey(forceRekey, signal)
       res = await attemptSignedPost(newState)
     }
 
