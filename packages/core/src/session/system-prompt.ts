@@ -24,5 +24,10 @@ export function render(prompt: string, tools: string[]) {
       "- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence.",
     )
   }
+  if (tools.includes("subagent")) {
+    instructions.push(
+      "- If a task can be split up into independent subtasks and subagent resources are available, do so and invoke subagents to help. Partition by disjoint module/directory scopes (<10% file overlap, <=5 turns / <=12-15 tool calls per child returning verbatim file:line snippets so Root never re-reads child files); read shared hubs or tightly coupled slices (<=10 files) directly in Root and delegate disjoint branches.",
+    )
+  }
   return prompt.replace("${OPENCODE_TOOL_GUIDANCE}", instructions.join("\n"))
 }

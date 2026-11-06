@@ -5,6 +5,8 @@ import { Cause, Duration, Effect, Fiber, Option, Queue, Scope, Stream } from "ef
 import { ChildProcess } from "effect/process"
 import type { ChildProcessHandle } from "effect/process/ChildProcessSpawner"
 import { Environment } from "../environment/index.js"
+import { scrubChildEnvironment } from "../util/env-scrub.js"
+import { buildSystemdLeafWrapCommand } from "../util/cgroup-wrap.js"
 
 /** Mirrors StdioClientTransport: wait this long for a graceful exit after stdin closes. */
 const CLOSE_GRACE = Duration.seconds(2)
@@ -81,10 +83,15 @@ export const make = Effect.fnUntraced(function* (options: Options) {
       state.phase = "starting"
       startup = Effect.runPromise(
         Effect.gen(function* () {
+          const wrapped = buildSystemdLeafWrapCommand(options.command, options.args, {
+            requestId: `mcp-${options.server}`,
+            tier: "build_test",
+            cwd: options.cwd,
+          })
           const handle = yield* environment.spawner.spawn(
-            ChildProcess.make(options.command, [...options.args], {
+            ChildProcess.make(wrapped.command, [...wrapped.args], {
               cwd: options.cwd,
-              env: options.environment,
+              env: scrubChildEnvironment(options.environment),
               extendEnv: true,
               stdin: { stream: Stream.encodeText(Stream.fromQueue(outgoing)), endOnDone: true },
               stdout: "pipe",

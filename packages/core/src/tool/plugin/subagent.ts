@@ -15,104 +15,35 @@ import { SessionSchema } from "../../session/schema.js"
 import { SessionSlotLease } from "../../session/slot-lease.js"
 import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
+import { GpuBrokerClient } from "../../util/gpu-broker-client.js"
 
 export const name = "subagent"
 export const MAX_SUBAGENT_NAME_CHARS = 40
 
 export const deriveSubagentTaskName = (rawDescription?: string, rawPrompt?: string, fallbackAgent?: string): string => {
-  const source = (rawDescription || rawPrompt || fallbackAgent || "Subagent")
-    .replace(/^\s*You are a subagent spawned by another session\.?\s*/i, "")
-    .replace(/^\s*RESEARCH ONLY\s*[—\-:]\s*[^.!?]*[.!?]?\s*/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-  if (!source) return fallbackAgent || "Subagent"
+  const cleanCandidate = (val?: string) =>
+    (val || "")
+      .replace(/^\s*You are a subagent spawned by another session\.?\s*/i, "")
+      .replace(/^\s*RESEARCH ONLY\s*[—\-:]\s*[^.!?]*[.!?]?\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+  const source = cleanCandidate(rawDescription) || cleanCandidate(rawPrompt) || cleanCandidate(fallbackAgent)
+  if (!source) return "Subagent"
   const stripped = source
-    .replace(/^(?:please\s+)?(?:investigate|research|analyze|audit|verify|check|inspect|explore|review|find|locate|diagnose|debug)\s+(?:the\s+)?/i, "")
+    .replace(/^(?:please\b\s*)?(?:(?:investigate|research|analyze|audit|verify|check|inspect|explore|review|find|locate|diagnose|debug)(?:\s+the\b|\b)\s*)?/i, "")
     .trim()
-  const base = stripped || source
+  const base = stripped || cleanCandidate(fallbackAgent) || source
   const titled = base.charAt(0).toUpperCase() + base.slice(1)
   return titled.length <= MAX_SUBAGENT_NAME_CHARS ? titled : titled.slice(0, MAX_SUBAGENT_NAME_CHARS).trimEnd()
 }
 
-export const generateSubagentNameWithDeepSeek = async (input: {
-  description?: string
-  prompt?: string
-  agent?: string
-  endpoint?: string
-}): Promise<string> => {
-  const fallback = deriveSubagentTaskName(input.description, input.prompt, input.agent)
-  if (process.env.AQUANOX_ISOLATED_VALIDATION === "1" && !input.endpoint) return fallback
-  const endpoint = input.endpoint ?? "http://127.0.0.1:8080/v1/chat/completions"
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(2500),
-      body: JSON.stringify({
-        model: "deepseek-v4.1-flash",
-        reasoning_effort: "low",
-        reasoning_budget_tokens: 32,
-        max_tokens: 96,
-        temperature: 0.2,
-        messages: [
-          {
-            role: "system",
-            content:
-              "Call report_subagent_name with a concise task-representative agent name (2-5 words, Title Case, max 40 characters) that names the specialist subagent for its assigned task rather than a raw action verb.",
-          },
-          {
-            role: "user",
-            content: JSON.stringify({
-              description: (input.description || "").slice(0, 300),
-              prompt: (input.prompt || "").slice(0, 800),
-              agent: input.agent || "",
-              fallback,
-            }),
-          },
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "report_subagent_name",
-              description: "Report a concise task-representative agent name (max 40 characters) for an invoked subagent.",
-              parameters: {
-                type: "object",
-                properties: {
-                  name: { type: "string", maxLength: MAX_SUBAGENT_NAME_CHARS },
-                },
-                required: ["name"],
-              },
-            },
-          },
-        ],
-        tool_choice: {
-          type: "function",
-          function: { name: "report_subagent_name" },
-        },
-      }),
-    })
-    if (!response.ok) return fallback
-    const payload = (await response.json()) as {
-      choices?: Array<{
-        message?: {
-          tool_calls?: Array<{ function?: { arguments?: string } }>
-        }
-      }>
-    }
-    const rawArgs = payload.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments
-    if (!rawArgs) return fallback
-    const parsed = JSON.parse(rawArgs) as { name?: unknown }
-    if (typeof parsed.name === "string" && parsed.name.trim()) {
-      return parsed.name.trim().slice(0, MAX_SUBAGENT_NAME_CHARS)
-    }
-    return fallback
-  } catch {
-    return fallback
-  }
-}
+export const MAX_SUBAGENT_DEPTH = 1
 
-export const MAX_SUBAGENT_DEPTH = 3
+export const resolveMaxSubagentDepth = (configuredLimit?: number): number => {
+  const hardMaxDepth = process.env.AQUANOX_FULL_SLOT_STATE_SAVE === "1" ? 2 : 1
+  const configured = configuredLimit ?? MAX_SUBAGENT_DEPTH
+  return Math.min(configured, hardMaxDepth)
+}
 
 /**
  * When spawning a child sub-agent without an explicit tool-call `model` override or `agent.model`,
@@ -200,8 +131,6 @@ const backgroundResult = (sessionID: SessionSchema.ID) => ({
 
 const activeWriteScopes = new Map<string, ReadonlyArray<string>>()
 
-export const getActiveWriteScopes = (): ReadonlyMap<string, ReadonlyArray<string>> => activeWriteScopes
-
 export const getActiveWriteScope = (sessionId: string): ReadonlyArray<string> | undefined =>
   activeWriteScopes.get(sessionId)
 
@@ -275,6 +204,11 @@ export const Output = Schema.Struct({
 })
 export const description = [
   "Spawns an agent in a child session to work on the specified task.",
+  "If a task can be split up into parallel or independent subtasks and resources are available, proactively invoke subagents to help.",
+  "GRAPH-COUPLED PARTITIONING & BOUNDED DELEGATION:",
+  "- Partition by disjoint module/directory subgraphs (<10% sibling file overlap), NEVER by blindly counting prompt nouns across a shared file.",
+  "- If subtasks share a central hub (e.g. session.ts, revert.ts) or total <= 10 coupled files, read the hub in Root first (or handle directly if single-module); spawn subagents only for disjoint spokes or when a scout step reveals 2+ orthogonal downstream branches.",
+  "- Give each subagent an explicit directory/file include/exclude scope, a bounded budget (<= 5 turns / <= 12-15 batched tool calls; avoid unbounded 'very thorough' prompts), and require verbatim file:line code snippets so you synthesize directly without re-reading child files.",
   "The output includes a sessionID you can pass back later to continue that specific conversation with the subagent.",
   "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
   "Foreground (default) runs the subagent to completion and returns its final response.",
@@ -351,7 +285,7 @@ export const Plugin = {
                 AquanoxTrace.recordFromSession(current)
               }
               const configuredLimit = Config.latest(yield* config.entries(), "experimental")?.subagent_depth
-              const limit = configuredLimit ?? MAX_SUBAGENT_DEPTH
+              const limit = resolveMaxSubagentDepth(configuredLimit)
               if (depth >= limit) {
                 const message =
                   limit === MAX_SUBAGENT_DEPTH
@@ -485,20 +419,14 @@ export const Plugin = {
               }
               const resolvedTitle =
                 existing === undefined && isDeepSeekLocal
-                  ? yield* Effect.promise(() =>
-                      generateSubagentNameWithDeepSeek({
-                        description: input.description,
-                        prompt: input.prompt,
-                        agent: agent.name,
-                      }),
-                    )
+                  ? deriveSubagentTaskName(input.description, input.prompt, agent.name)
                   : input.description
               const child =
                 existing ??
                 (yield* sessions
                   .create({
                     parentID: context.sessionID,
-                    title: resolvedTitle,
+                    title: resolvedTitle || deriveSubagentTaskName(input.description, input.prompt, agent.name),
                     agent: agent.id,
                     model,
                     metadata: childMetadata,
@@ -508,83 +436,154 @@ export const Plugin = {
                       (error) => new ToolFailure({ message: `Parent session not found: ${context.sessionID}`, error }),
                     ),
                   ))
-                            SessionSlotLease.registerChildSession(child.id, context.sessionID)
-              SessionSlotLease.setSessionTier(child.id, resolvedTier)
-              if (input.write_scope && input.write_scope.length > 0) {
-                registerWriteScope(child.id, input.write_scope)
-              }
-              if (parentCorr && subSpanId) {
-                AquanoxTrace.recordSubagentBinding({
-                  childSessionId: child.id,
-                  parentSessionId: context.sessionID,
-                  conversationId: parentCorr.conversationId,
-                  rootSessionId: parentCorr.rootSessionId,
-                  subSpanId,
-                  thinkingMode: childThinkingMode,
-                })
-              }
-
               const background = input.background === true
               const subStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
               const subModelLabel = model ? `${model.providerID}/${model.id}` : null
               const subSpanName = input.description
                 ? `subagent: ${agent.id} (${input.description})`
                 : `subagent: ${agent.id}`
-              if (traceEnabled && parentCorr && subSpanId) {
-                yield* AquanoxTrace.postTraceIngest({
-                  sessionBinding: {
-                    sessionId: child.id,
-                    conversationId: parentCorr.conversationId,
-                    rootSessionId: parentCorr.rootSessionId,
-                    parentSessionId: context.sessionID,
-                    parentSpanId: subSpanId,
-                    agentName: agent.id,
-                    isSubagent: true,
-                    title: input.description || child.title || null,
-                  },
-                  span: {
-                    spanId: subSpanId,
-                    conversationId: parentCorr.conversationId,
-                    parentSpanId: parentToolSpanId,
-                    rootSessionId: parentCorr.rootSessionId,
-                    sessionId: context.sessionID,
-                    parentSessionId: parent.parentID ?? null,
-                    layer: "opencode",
-                    kind: "subagent.invoke",
-                    name: subSpanName,
-                    status: "running",
-                    startUs: subStartUs,
-                    model: subModelLabel,
-                    thinkingMode: childThinkingMode,
-                    agentName: agent.id,
-                    isSubagent: true,
-                    subagentSessionId: child.id,
-                    attributes: {
-                      background,
-                      resumed: existing !== undefined,
-                      description: input.description,
-                    },
-                  },
-                })
-              }
-              yield* context.progress({ sessionID: child.id, status: "running" })
-
               const preleasedSlot = model !== undefined && String(model.providerID) === "deepseek-local"
-              if (preleasedSlot) {
-                yield* SessionSlotLease.acquireSubagentAsync({
-                  sessionID: child.id,
-                  parentSessionID: context.sessionID,
-                  tier: resolvedTier,
-                }).pipe(
-                  Effect.timeout("30 seconds"),
-                  Effect.catch(() =>
-                    Effect.sync(() => SessionSlotLease.acquire(child.id, true)),
-                  ),
-                )
-              }
               let jobStarted = false
+              let activeChildSessionID = child.id
 
               return yield* Effect.gen(function* () {
+                SessionSlotLease.registerChildSession(child.id, context.sessionID)
+                SessionSlotLease.setSessionTier(child.id, resolvedTier)
+                if (input.write_scope && input.write_scope.length > 0) {
+                  registerWriteScope(child.id, input.write_scope)
+                }
+                if (parentCorr && subSpanId) {
+                  AquanoxTrace.recordSubagentBinding({
+                    childSessionId: child.id,
+                    parentSessionId: context.sessionID,
+                    conversationId: parentCorr.conversationId,
+                    rootSessionId: parentCorr.rootSessionId,
+                    subSpanId,
+                    thinkingMode: childThinkingMode,
+                  })
+                }
+
+                if (traceEnabled && parentCorr && subSpanId) {
+                  yield* AquanoxTrace.postTraceIngest({
+                    sessionBinding: {
+                      sessionId: child.id,
+                      conversationId: parentCorr.conversationId,
+                      rootSessionId: parentCorr.rootSessionId,
+                      parentSessionId: context.sessionID,
+                      parentSpanId: subSpanId,
+                      agentName: agent.id,
+                      isSubagent: true,
+                      title: input.description || child.title || null,
+                    },
+                    span: {
+                      spanId: subSpanId,
+                      conversationId: parentCorr.conversationId,
+                      parentSpanId: parentToolSpanId,
+                      rootSessionId: parentCorr.rootSessionId,
+                      sessionId: context.sessionID,
+                      parentSessionId: parent.parentID ?? null,
+                      layer: "opencode",
+                      kind: "subagent.invoke",
+                      name: subSpanName,
+                      status: "running",
+                      startUs: subStartUs,
+                      model: subModelLabel,
+                      thinkingMode: childThinkingMode,
+                      agentName: agent.id,
+                      isSubagent: true,
+                      subagentSessionId: child.id,
+                      attributes: {
+                        background,
+                        resumed: existing !== undefined,
+                        description: input.description,
+                      },
+                    },
+                  })
+                }
+                yield* context.progress({ sessionID: child.id, status: "running" })
+
+                if (preleasedSlot) {
+                  const leaseSlot = yield* SessionSlotLease.acquireSubagentAsync({
+                    sessionID: child.id,
+                    parentSessionID: context.sessionID,
+                    tier: resolvedTier,
+                  }).pipe(
+                    Effect.timeout("180 seconds"),
+                    Effect.catch(() =>
+                      Effect.gen(function* () {
+                        activeWriteScopes.delete(child.id)
+                        yield* SessionSlotLease.releaseSubagentSession(child.id, { purge: true })
+                        return yield* new ToolFailure({
+                          message: `ERR_SUBAGENT_ADMISSION_TIMEOUT (sessionID: ${child.id}): Timed out waiting for subagent slot lease`,
+                        })
+                      }),
+                    ),
+                  )
+                  if (leaseSlot === -1) {
+                    activeWriteScopes.delete(child.id)
+                    yield* SessionSlotLease.releaseSubagentSession(child.id, { purge: true })
+                    return yield* new ToolFailure({
+                      message: `ERR_SUBAGENT_ADMISSION_TIMEOUT (sessionID: ${child.id}): Failed to acquire subagent slot lease`,
+                    })
+                  }
+                }
+
+                if (GpuBrokerClient.isBrokerConfiguredOrAvailable()) {
+                  const admissionResult = yield* Effect.promise(async () => {
+                    try {
+                      const res = await GpuBrokerClient.evaluateAdmission({
+                        new_request_mib: preleasedSlot ? 0 : 2048,
+                      })
+                      if (res?.admitted === false || res?.error === "ERR_HOST_MEM_FLOOR_VIOLATION") {
+                        const reason =
+                          (res?.reason as string) ||
+                          (res?.message as string) ||
+                          (res?.error as string) ||
+                          "ERR_HOST_MEM_FLOOR_VIOLATION"
+                        return { admitted: false, reason }
+                      }
+                      return { admitted: true }
+                    } catch (err: any) {
+                      if (
+                        err?.errorCode === "ERR_HOST_MEM_FLOOR_VIOLATION" ||
+                        err?.responseBody?.error === "ERR_HOST_MEM_FLOOR_VIOLATION" ||
+                        err?.responseBody?.admitted === false ||
+                        (err?.statusCode === 503 && String(err?.message || "").includes("ERR_HOST_MEM_FLOOR_VIOLATION"))
+                      ) {
+                        return { admitted: false, reason: err.message || "ERR_HOST_MEM_FLOOR_VIOLATION" }
+                      }
+                      const msg = String(err?.message ?? "")
+                      const code = String(err?.errorCode ?? err?.code ?? (err?.cause as any)?.code ?? "")
+                      const isOffline =
+                        code === "ENOENT" ||
+                        code === "ECONNREFUSED" ||
+                        code === "ERR_BROKER_UNAVAILABLE" ||
+                        msg.includes("ENOENT") ||
+                        msg.includes("ECONNREFUSED") ||
+                        msg.includes("ERR_BROKER_UNAVAILABLE")
+                      if (isOffline) {
+                        return { admitted: true, offline: true }
+                      }
+                      if (err?.statusCode === 503) {
+                        return { admitted: false, reason: err.message || "ERR_HOST_MEM_FLOOR_VIOLATION" }
+                      }
+                      return { admitted: false, reason: String(err?.message || err) }
+                    }
+                  }).pipe(
+                    Effect.catch((err) =>
+                      Effect.succeed({ admitted: false, reason: String((err as any)?.message || err) }),
+                    ),
+                  )
+
+                  if (!admissionResult.admitted) {
+                    activeWriteScopes.delete(child.id)
+                    yield* SessionSlotLease.releaseSubagentSession(child.id, { purge: true })
+                    return yield* new ToolFailure({
+                      message: `ERR_HOST_MEM_FLOOR_VIOLATION (sessionID: ${child.id}): GPU broker denied subagent admission: ${admissionResult.reason}`,
+                    })
+                  }
+                }
+
                 // Standard prompt admission outside the job: Job.start joining a running child skips
                 // its run effect, and the default wake starts an idle child or steers a running one.
                 yield* sessions
@@ -635,7 +634,7 @@ export const Plugin = {
                   return backgroundResult(child.id)
                 }
                 if (preleasedSlot) {
-                  SessionSlotLease.release(child.id)
+                  SessionSlotLease.releaseSubagentSession(child.id)
                 }
                 // Automatically retry once in a fresh session when a newly spawned foreground subagent fails with a runtime/provider error.
                 if (
@@ -644,6 +643,8 @@ export const Plugin = {
                   !/no model is available/i.test(result.info.error ?? "")
                 ) {
                   activeWriteScopes.delete(child.id)
+                  SessionSlotLease.releaseSubagentSession(child.id, { purge: true })
+                  jobStarted = false
                   const retryChild = yield* sessions
                     .create({
                       parentID: context.sessionID,
@@ -657,6 +658,7 @@ export const Plugin = {
                         (error) => new ToolFailure({ message: `Parent session not found: ${context.sessionID}`, error }),
                       ),
                     )
+                  activeChildSessionID = retryChild.id
                   SessionSlotLease.registerChildSession(retryChild.id, context.sessionID)
                   SessionSlotLease.setSessionTier(retryChild.id, resolvedTier)
                   if (input.write_scope && input.write_scope.length > 0) {
@@ -664,14 +666,29 @@ export const Plugin = {
                   }
                   yield* context.progress({ sessionID: retryChild.id, status: "running" })
                   if (preleasedSlot) {
-                    yield* SessionSlotLease.acquireSubagentAsync({
+                    const retryLeaseSlot = yield* SessionSlotLease.acquireSubagentAsync({
                       sessionID: retryChild.id,
                       parentSessionID: context.sessionID,
                       tier: resolvedTier,
                     }).pipe(
-                      Effect.timeout("30 seconds"),
-                      Effect.catch(() => Effect.sync(() => SessionSlotLease.acquire(retryChild.id, true))),
+                      Effect.timeout("180 seconds"),
+                      Effect.catch(() =>
+                        Effect.gen(function* () {
+                          activeWriteScopes.delete(retryChild.id)
+                          yield* SessionSlotLease.releaseSubagentSession(retryChild.id, { purge: true })
+                          return yield* new ToolFailure({
+                            message: `ERR_SUBAGENT_ADMISSION_TIMEOUT (sessionID: ${retryChild.id}): Timed out waiting for retry subagent slot lease`,
+                          })
+                        }),
+                      ),
                     )
+                    if (retryLeaseSlot === -1) {
+                      activeWriteScopes.delete(retryChild.id)
+                      yield* SessionSlotLease.releaseSubagentSession(retryChild.id, { purge: true })
+                      return yield* new ToolFailure({
+                        message: `ERR_SUBAGENT_ADMISSION_TIMEOUT (sessionID: ${retryChild.id}): Failed to acquire retry subagent slot lease`,
+                      })
+                    }
                   }
                   yield* sessions
                     .prompt({
@@ -695,6 +712,7 @@ export const Plugin = {
                     description: resolvedTitle,
                   }
                   yield* subagents.start(retryRecovery)
+                  jobStarted = true
                   SessionSlotLease.release(context.sessionID)
                   const retryResult = yield* jobs.block({ id: retryChild.id, sessionID: context.sessionID }).pipe(
                     Effect.onInterrupt(() =>
@@ -709,7 +727,7 @@ export const Plugin = {
                     ),
                   )
                   if (preleasedSlot) {
-                    SessionSlotLease.release(retryChild.id)
+                    SessionSlotLease.releaseSubagentSession(retryChild.id)
                   }
                   if (retryResult?.type === "backgrounded") {
                     yield* subagents.notify(retryRecovery, retryResult.info.started_at)
@@ -741,8 +759,13 @@ export const Plugin = {
                 }
               }).pipe(
                 Effect.onExit((exit) => {
-                  if (preleasedSlot && Exit.isFailure(exit) && (!jobStarted || !background)) {
-                    SessionSlotLease.release(child.id)
+                  if (Exit.isFailure(exit) && (!jobStarted || !background)) {
+                    activeWriteScopes.delete(child.id)
+                    SessionSlotLease.releaseSubagentSession(child.id, { purge: true })
+                    if (activeChildSessionID !== child.id) {
+                      activeWriteScopes.delete(activeChildSessionID)
+                      SessionSlotLease.releaseSubagentSession(activeChildSessionID, { purge: true })
+                    }
                   }
                   if (!traceEnabled || !parentCorr || !subSpanId) return Effect.void
                   const subEndUs = AquanoxTrace.nowUs()

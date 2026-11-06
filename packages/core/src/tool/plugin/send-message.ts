@@ -9,6 +9,7 @@ import { Session } from "../../session.js"
 import { AquanoxTrace } from "../../session/aquanox-trace.js"
 import { SessionInbox } from "../../session/inbox.js"
 import { SessionMessage } from "../../session/message.js"
+import { SessionSlotLease } from "../../session/slot-lease.js"
 
 export const name = "send_message"
 
@@ -23,7 +24,7 @@ const RelationshipSchema = Schema.Literals([
   "cross_conversation",
 ])
 const DeliverySchema = Schema.Literals(["steer", "queue"])
-const ActionSchema = Schema.Literals(["send", "list", "read"])
+const ActionSchema = Schema.Literals(["send", "list", "read", "delete"])
 
 export const PeerSession = Schema.Struct({
   sessionID: Session.ID,
@@ -56,6 +57,17 @@ export const DeliveredReceipt = Schema.Struct({
 })
 export type DeliveredReceipt = typeof DeliveredReceipt.Type
 
+export const DeletedReceipt = Schema.Struct({
+  sessionID: Session.ID,
+  rootSessionID: Session.ID,
+  conversationID: Schema.String.pipe(optional),
+  agent: Schema.String.pipe(optional),
+  title: Schema.String,
+  directory: Schema.String,
+  updatedAt: Schema.Number,
+})
+export type DeletedReceipt = typeof DeletedReceipt.Type
+
 export const MessagePreview = Schema.Struct({
   id: SessionMessage.ID,
   type: Schema.String,
@@ -69,11 +81,25 @@ export type MessagePreview = typeof MessagePreview.Type
 export const Input = Schema.Struct({
   action: ActionSchema.annotate({
     description:
-      "Operation to perform: 'send' delivers a message to a target agent/session or conversation; 'list' discovers sessions in the current conversation family and/or across other conversations; 'read' inspects recent messages and status of a target session or conversation without waking it. Defaults to 'list' when recipient is omitted, 'read' when recipient is provided without message, and 'send' when both recipient and message are provided.",
+      "Operation to perform: 'send' delivers a message to a target agent/session or conversation; 'list' discovers sessions in the current conversation family and/or across other conversations; 'read' inspects recent messages and status of a target session or conversation without waking it; 'delete' proposes deleting one or more idle conversations associated with the user's account (requires explicit user approval).",
   }).pipe(optional),
   recipient: Schema.String.annotate({
     description:
       "Target agent, session, or conversation. Supports: (1) intra-conversation targets: 'parent', 'root', 'siblings' (or 'peers'), 'children' (or 'subagents'), 'family', or a session ID ('ses_...'); (2) cross-conversation targets: an Aquanox conversation ID ('task_...'), another conversation's root/child session ID ('ses_...'), or a session/conversation title or agent name.",
+  }).pipe(optional),
+  recipients: Schema.Array(Schema.String)
+    .annotate({
+      description:
+        "When action='delete', optional list of target conversation IDs ('task_...'), root session IDs ('ses_...'), or titles to propose deleting.",
+    })
+    .pipe(optional),
+  olderThanHours: Schema.Finite.annotate({
+    description:
+      "When action='delete', select idle conversations whose last update is older than this many hours (e.g. 20).",
+  }).pipe(optional),
+  before: Schema.String.annotate({
+    description:
+      "When action='delete', ISO-8601 timestamp cutoff; selects idle conversations last updated strictly before this time.",
   }).pipe(optional),
   message: Schema.String.annotate({
     description:
@@ -96,14 +122,14 @@ export const Input = Schema.Struct({
   }).pipe(optional),
   query: Schema.String.annotate({
     description:
-      "Optional case-insensitive filter matched against session ID, conversation ID, title, agent, or directory when listing or resolving recipients.",
+      "Optional case-insensitive filter matched against session ID, conversation ID, title, agent, or directory when listing, resolving, or deleting conversations.",
   }).pipe(optional),
   includeSubagents: Schema.Boolean.annotate({
     description:
       "When listing cross-conversation targets, whether to also include child subagent sessions of other conversations (default: false).",
   }).pipe(optional),
   limit: PositiveInt.annotate({
-    description: "Maximum number of conversations or messages to return for 'list' or 'read' (default: 12, max: 50).",
+    description: "Maximum number of conversations or messages to return for 'list', 'read', or 'delete' (default: 12, max: 50).",
   }).pipe(optional),
 })
 export type Input = typeof Input.Type
@@ -118,6 +144,7 @@ export const Output = Schema.Struct({
     title: Schema.String,
   }),
   delivered: Schema.Array(DeliveredReceipt).pipe(optional),
+  deleted: Schema.Array(DeletedReceipt).pipe(optional),
   sameConversation: Schema.Array(PeerSession).pipe(optional),
   crossConversations: Schema.Array(PeerSession).pipe(optional),
   inspected: Schema.Struct({
@@ -128,12 +155,13 @@ export const Output = Schema.Struct({
 export type Output = typeof Output.Type
 
 export const DESCRIPTION = [
-  "Communicate with other DeepSeek agents within the same conversation (parent/root, child subagents, concurrent sibling subagents) or across different conversations.",
+  "Communicate with other DeepSeek agents within the same conversation (parent/root, child subagents, concurrent sibling subagents) or across different conversations, and propose owner-scoped conversation cleanup.",
   "",
   "Capabilities:",
   "- action='list': Discover active and recent sessions in the current conversation family ('sameConversation') and across other conversations ('crossConversations'), including sessionID, conversationID ('task_...'), agent type, title, active status, pending inbox count, and latest summary.",
   "- action='read': Inspect recent messages and status of a sibling session or another conversation without waking it or consuming an inference slot.",
   "- action='send': Deliver a structured '<agent-message>' to any recipient within the same conversation ('parent', 'root', 'siblings', 'children', 'family', or 'ses_...') or across conversations ('task_...', 'ses_...', or conversation title).",
+  "- action='delete': Propose permanent deletion of idle conversations associated with the user's account (by 'recipient'/'recipients', 'olderThanHours', 'before', or 'query'). Always presents a user approval card before deleting.",
   "",
   "Delivery guidance:",
   "- Use delivery='steer' (default) when handing off a contract/schema to a concurrently running sibling or steering an active session at its next step boundary.",
@@ -154,6 +182,30 @@ const extractConversationID = (session: Session.Info, rootSession: Session.Info)
     if (raw) return raw
   }
   return undefined
+}
+
+const extractOwnerUserID = (session: Session.Info, rootSession: Session.Info): string | undefined => {
+  for (const candidate of [session, rootSession]) {
+    const meta = candidate.metadata
+    if (!meta || typeof meta !== "object") continue
+    const raw =
+      (typeof meta.aquanoxOwnerUserId === "string" && meta.aquanoxOwnerUserId.trim()) ||
+      (typeof meta.ownerUserId === "string" && meta.ownerUserId.trim()) ||
+      undefined
+    if (raw) return raw
+  }
+  return undefined
+}
+
+const isSameOwnerOrUnscoped = (
+  senderOwnerUserID: string | undefined,
+  target: Session.Info,
+  targetRoot: Session.Info,
+): boolean => {
+  if (!senderOwnerUserID) return true
+  const targetOwner = extractOwnerUserID(target, targetRoot)
+  if (!targetOwner) return true
+  return targetOwner === senderOwnerUserID
 }
 
 const summarizeMessage = (msg: SessionMessage.Info): MessagePreview => {
@@ -479,6 +531,12 @@ export const Plugin = {
             .pipe(Effect.catchTag("Session.NotFoundError", () => Effect.succeed(undefined)))
           if (found) {
             const targetRoot = yield* resolveRoot(found)
+            const senderOwner = extractOwnerUserID(sender, senderRoot)
+            if (targetRoot.id !== senderRoot.id && !isSameOwnerOrUnscoped(senderOwner, found, targetRoot)) {
+              return yield* new ToolFailure({
+                message: `Session ${found.id} belongs to another account and cannot be accessed.`,
+              })
+            }
             if (scopeFilter === "same_conversation" && targetRoot.id !== senderRoot.id) {
               return yield* new ToolFailure({
                 message: `Session ${found.id} belongs to another conversation (${targetRoot.id}), but scope='same_conversation' was requested.`,
@@ -509,10 +567,13 @@ export const Plugin = {
 
         // Cross-conversation search across root sessions (by conversationID 'task_...', sessionID, title, or agent)
         if (scopeFilter !== "same_conversation") {
+          const senderOwner = extractOwnerUserID(sender, senderRoot)
           const rootsList = yield* sessions
             .list({ parentID: null, limit: 50 })
             .pipe(Effect.orElseSucceed(() => ({ data: [] as Session.Info[], cursor: {} })))
-          const otherRoots = rootsList.data.filter((r) => r.id !== senderRoot.id)
+          const otherRoots = rootsList.data.filter(
+            (r) => r.id !== senderRoot.id && isSameOwnerOrUnscoped(senderOwner, r, r),
+          )
 
           const exactConv = otherRoots.find((r) => {
             const cid = extractConversationID(r, r)
@@ -554,28 +615,52 @@ export const Plugin = {
             Effect.gen(function* () {
               const action: typeof ActionSchema.Type =
                 input.action ??
-                (input.recipient
-                  ? input.message && input.message.trim().length > 0
-                    ? "send"
-                    : "read"
-                  : "list")
+                (input.olderThanHours !== undefined || input.before !== undefined || (input.recipients?.length ?? 0) > 0
+                  ? "delete"
+                  : input.recipient
+                    ? input.message && input.message.trim().length > 0
+                      ? "send"
+                      : "read"
+                    : "list")
 
-              const resource = input.recipient?.trim() || action
-              yield* permissions
-                .assert({
-                  sessionID: context.sessionID,
-                  agent: context.agent,
-                  source: {
-                    type: "tool",
-                    messageID: context.messageID,
-                    id: context.id,
-                  },
-                  action: name,
-                  resources: [resource],
-                })
-                .pipe(
-                  Effect.mapError((error) => new ToolFailure({ message: "Permission denied for send_message", error })),
-                )
+              if (action !== "delete") {
+                const resource = input.recipient?.trim() || action
+                yield* permissions
+                  .assert({
+                    sessionID: context.sessionID,
+                    agent: context.agent,
+                    source: {
+                      type: "tool",
+                      messageID: context.messageID,
+                      id: context.id,
+                    },
+                    action: name,
+                    resources: [resource],
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ToolFailure({ message: "Permission denied for send_message", error }),
+                    ),
+                  )
+              } else {
+                yield* permissions
+                  .assertNotDenied({
+                    sessionID: context.sessionID,
+                    agent: context.agent,
+                    source: {
+                      type: "tool",
+                      messageID: context.messageID,
+                      id: context.id,
+                    },
+                    action: name,
+                    resources: ["delete:*"],
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ToolFailure({ message: "Permission denied for conversation deletion", error }),
+                    ),
+                  )
+              }
 
               const sender = yield* sessions
                 .get(context.sessionID)
@@ -586,6 +671,7 @@ export const Plugin = {
                 )
               const senderRoot = yield* resolveRoot(sender)
               const senderConversationID = extractConversationID(sender, senderRoot)
+              const senderOwnerUserID = extractOwnerUserID(sender, senderRoot)
               const senderAgent = String(sender.agent ?? context.agent)
               const scopeFilter = input.scope ?? "all"
               const limit = Math.min(50, Math.max(1, input.limit ?? 12))
@@ -619,6 +705,7 @@ export const Plugin = {
                     .pipe(Effect.orElseSucceed(() => ({ data: [] as Session.Info[], cursor: {} })))
                   for (const otherRoot of rootsList.data) {
                     if (otherRoot.id === senderRoot.id) continue
+                    if (!isSameOwnerOrUnscoped(senderOwnerUserID, otherRoot, otherRoot)) continue
                     if (crossConversations.length >= limit) break
                     const rootPeer = yield* buildPeerInfo(sender, senderRoot, otherRoot, otherRoot, activeSet, true)
                     if (matchesQuery(rootPeer, input.query)) {
@@ -669,6 +756,260 @@ export const Plugin = {
                     sender: senderSummary,
                     sameConversation,
                     crossConversations,
+                  },
+                }
+              }
+
+              if (action === "delete") {
+                const rawTokens: string[] = []
+                if (input.recipient && input.recipient.trim().length > 0) {
+                  const trimmed = input.recipient.trim()
+                  const split = trimmed
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                  if (split.length > 1 && split.every((s) => s.startsWith("task_") || s.startsWith("ses_"))) {
+                    rawTokens.push(...split)
+                  } else {
+                    rawTokens.push(trimmed)
+                  }
+                }
+                if (input.recipients && input.recipients.length > 0) {
+                  for (const item of input.recipients) {
+                    if (typeof item === "string" && item.trim().length > 0) {
+                      rawTokens.push(item.trim())
+                    }
+                  }
+                }
+
+                let cutoffMs: number | undefined
+                if (input.olderThanHours !== undefined) {
+                  if (!Number.isFinite(input.olderThanHours) || input.olderThanHours < 0) {
+                    return yield* new ToolFailure({
+                      message: "olderThanHours must be a non-negative number.",
+                    })
+                  }
+                  cutoffMs = Date.now() - input.olderThanHours * 3_600_000
+                }
+                if (input.before !== undefined && input.before.trim().length > 0) {
+                  const parsed = Date.parse(input.before.trim())
+                  if (!Number.isFinite(parsed)) {
+                    return yield* new ToolFailure({
+                      message: `Invalid ISO timestamp for 'before': ${JSON.stringify(input.before)}`,
+                    })
+                  }
+                  cutoffMs = cutoffMs === undefined ? parsed : Math.min(cutoffMs, parsed)
+                }
+
+                const hasFilter = Boolean(input.query?.trim()) || cutoffMs !== undefined
+                if (rawTokens.length === 0 && !hasFilter) {
+                  return yield* new ToolFailure({
+                    message:
+                      'action="delete" requires at least one selector: recipient, recipients, olderThanHours, before, or query.',
+                  })
+                }
+
+                // Prevent self-deletion when explicitly requested
+                for (const tok of rawTokens) {
+                  const lowerTok = tok.toLowerCase()
+                  if (
+                    lowerTok === sender.id.toLowerCase() ||
+                    lowerTok === senderRoot.id.toLowerCase() ||
+                    (senderConversationID && lowerTok === senderConversationID.toLowerCase()) ||
+                    lowerTok === "self" ||
+                    lowerTok === "root" ||
+                    lowerTok === "parent" ||
+                    lowerTok === "same_conversation"
+                  ) {
+                    return yield* new ToolFailure({
+                      message: `Cannot delete the currently running conversation (${senderConversationID ?? senderRoot.id}).`,
+                    })
+                  }
+                }
+
+                const rootsList = yield* sessions
+                  .list({ parentID: null, limit: 100 })
+                  .pipe(Effect.orElseSucceed(() => ({ data: [] as Session.Info[], cursor: {} })))
+
+                interface CandidateDelete {
+                  readonly root: Session.Info
+                  readonly peer: PeerSession
+                  readonly explicitByID: boolean
+                }
+                const candidates: CandidateDelete[] = []
+                const seenRoots = new Set<Session.ID>()
+
+                for (const otherRoot of rootsList.data) {
+                  if (otherRoot.id === senderRoot.id) continue
+                  if (!isSameOwnerOrUnscoped(senderOwnerUserID, otherRoot, otherRoot)) continue
+                  if (candidates.length >= limit) break
+
+                  const cid = extractConversationID(otherRoot, otherRoot)
+                  const title = otherRoot.title ?? otherRoot.id
+                  const updatedMs = DateTime.toEpochMillis(otherRoot.time.updated)
+
+                  let matched = false
+                  let explicitByID = false
+
+                  if (rawTokens.length > 0) {
+                    for (const tok of rawTokens) {
+                      const lowerTok = tok.toLowerCase()
+                      if (
+                        otherRoot.id.toLowerCase() === lowerTok ||
+                        (cid !== undefined && cid.toLowerCase() === lowerTok)
+                      ) {
+                        matched = true
+                        explicitByID = true
+                        break
+                      }
+                      if (
+                        title.toLowerCase() === lowerTok ||
+                        title.toLowerCase().includes(lowerTok) ||
+                        (cid !== undefined && cid.toLowerCase().includes(lowerTok))
+                      ) {
+                        matched = true
+                      }
+                    }
+                  } else {
+                    matched = true
+                  }
+
+                  if (!matched) continue
+                  if (cutoffMs !== undefined && updatedMs >= cutoffMs) continue
+
+                  const peer = yield* buildPeerInfo(sender, senderRoot, otherRoot, otherRoot, activeSet, false)
+                  if (!matchesQuery(peer, input.query)) continue
+
+                  const otherFamily = yield* collectFamilyTree(otherRoot)
+                  const familyActive = otherFamily.some((m) => activeSet.has(m.id))
+                  const meta = (otherRoot.metadata ?? {}) as Record<string, unknown>
+                  const unsafeStopping =
+                    meta.aquanoxWorkerStopUnconfirmed === true ||
+                    meta.workerStopUnconfirmed === true ||
+                    meta.stopping === true
+                  const needsHumanOrRecovery =
+                    Boolean(otherRoot.revert) ||
+                    meta.aquanoxRecoveryRequired === true ||
+                    meta.recoveryRequired === true ||
+                    meta.aquanoxHasRevertIntent === true ||
+                    meta.revertIntent === true ||
+                    meta.waitingForHuman === true ||
+                    peer.pendingInboxCount > 0
+
+                  if (familyActive || unsafeStopping) {
+                    if (explicitByID) {
+                      return yield* new ToolFailure({
+                        message: `Conversation ${cid ?? otherRoot.id} (${JSON.stringify(title)}) is currently active or stopping and cannot be deleted.`,
+                      })
+                    }
+                    continue
+                  }
+
+                  if (needsHumanOrRecovery && !explicitByID) {
+                    continue
+                  }
+
+                  if (!seenRoots.has(otherRoot.id)) {
+                    seenRoots.add(otherRoot.id)
+                    candidates.push({ root: otherRoot, peer, explicitByID })
+                  }
+                }
+
+                if (candidates.length === 0) {
+                  return yield* new ToolFailure({
+                    message: "No matching idle conversations associated with your account were found to delete.",
+                  })
+                }
+
+                const resources = candidates.map(({ peer }) => {
+                  const idLabel = peer.conversationID ?? peer.rootSessionID
+                  const iso = new Date(peer.updatedAt).toISOString()
+                  return `delete:${idLabel} (${peer.title} — updated ${iso})`
+                })
+
+                const proposalSummary = `Approve permanent deletion of ${candidates.length} conversation${candidates.length === 1 ? "" : "s"} associated with your account?`
+
+                yield* permissions
+                  .assert({
+                    sessionID: context.sessionID,
+                    agent: context.agent,
+                    source: {
+                      type: "tool",
+                      messageID: context.messageID,
+                      id: context.id,
+                    },
+                    action: name,
+                    resources,
+                    metadata: {
+                      kind: "conversation_delete_proposal",
+                      requireApproval: true,
+                      callerConversationID: senderConversationID ?? null,
+                      callerRootSessionID: senderRoot.id,
+                      ...(senderOwnerUserID ? { ownerUserId: senderOwnerUserID } : {}),
+                      proposalSummary,
+                      targets: candidates.map(({ peer, explicitByID }) => ({
+                        conversationID: peer.conversationID ?? null,
+                        sessionID: peer.rootSessionID,
+                        title: peer.title,
+                        directory: peer.directory,
+                        updatedAt: peer.updatedAt,
+                        explicit: explicitByID,
+                      })),
+                    },
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new ToolFailure({
+                          message: `Conversation deletion was not approved: ${error.message}`,
+                          error,
+                        }),
+                    ),
+                  )
+
+                const deletedReceipts: DeletedReceipt[] = []
+                for (const { peer } of candidates) {
+                  yield* sessions
+                    .remove(peer.rootSessionID)
+                    .pipe(
+                      Effect.catchTag("Session.NotFoundError", () => Effect.void),
+                      Effect.mapError(
+                        (error) =>
+                          new ToolFailure({
+                            message: `Failed to remove session ${peer.rootSessionID}: ${(error as { message?: string })?.message ?? String(error)}`,
+                            error,
+                          }),
+                      ),
+                    )
+                  SessionSlotLease.releaseConversation(
+                    peer.conversationID ?? `conv_${peer.rootSessionID}`,
+                    peer.rootSessionID,
+                  )
+                  deletedReceipts.push({
+                    sessionID: peer.sessionID,
+                    rootSessionID: peer.rootSessionID,
+                    ...(peer.conversationID ? { conversationID: peer.conversationID } : {}),
+                    ...(peer.agent ? { agent: peer.agent } : {}),
+                    title: peer.title,
+                    directory: peer.directory,
+                    updatedAt: peer.updatedAt,
+                  })
+                }
+
+                const lines = [
+                  `Deleted ${deletedReceipts.length} conversation${deletedReceipts.length === 1 ? "" : "s"} after user approval:`,
+                  ...deletedReceipts.map(
+                    (d) =>
+                      `- ${d.conversationID ?? d.rootSessionID} (session=${d.rootSessionID}, title=${JSON.stringify(d.title)}, updated=${new Date(d.updatedAt).toISOString()})`,
+                  ),
+                ]
+
+                return {
+                  content: lines.join("\n"),
+                  output: {
+                    action: "delete" as const,
+                    sender: senderSummary,
+                    deleted: deletedReceipts,
                   },
                 }
               }
@@ -924,6 +1265,17 @@ export const Plugin = {
         if (raw.delivery === undefined && (raw.mode === "steer" || raw.mode === "queue")) {
           raw.delivery = raw.mode
         }
+        if (raw.olderThanHours === undefined && typeof raw.older_than_hours === "number") {
+          raw.olderThanHours = raw.older_than_hours
+        }
+        if (raw.recipients === undefined) {
+          for (const key of ["targets", "conversationIDs", "conversation_ids", "sessionIDs", "session_ids"]) {
+            if (Array.isArray(raw[key])) {
+              raw.recipients = raw[key]
+              break
+            }
+          }
+        }
         if (typeof raw.query === "string") {
           const trimmed = raw.query.trim()
           if (trimmed.length > 0) raw.query = trimmed
@@ -931,10 +1283,16 @@ export const Plugin = {
         }
         delete raw.to
         delete raw.target
+        delete raw.targets
         delete raw.sessionID
         delete raw.session_id
+        delete raw.sessionIDs
+        delete raw.session_ids
         delete raw.conversationID
         delete raw.conversation_id
+        delete raw.conversationIDs
+        delete raw.conversation_ids
+        delete raw.older_than_hours
         delete raw.text
         delete raw.content
         delete raw.body

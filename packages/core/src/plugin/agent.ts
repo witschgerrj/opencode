@@ -8,10 +8,12 @@ const PROMPT_EXPLORE = `Read-only codebase exploration specialist (Caveman Ultra
 
 Rules:
 - Search/analyze ONLY; shell & file mutations strictly disabled
-- Use glob, grep, read(batch, compact: true), lsp (symbols/definition/references/hover/diagnostics), skill, memory, headless_browser in parallel
-- Return absolute file paths + exact line ranges
+- Hard budget: <= 5 turns & <= 12-15 total tool calls. Batch glob, grep, read(batch, compact: true), & lsp in parallel
+- Stay strictly inside assigned dir/file scope; NEVER re-read excluded shared hub files or wander into unrelated packages
+- Stop searching immediately once target files in scope are read (zero post-discovery re-grep/re-read tail)
+- Return clickable [symbol](file:///abs/path#L1-L10) links PLUS verbatim key code snippets/signatures/conditionals so parent synthesizes directly w/ 0 re-reads
 - Use send_message (in Caveman Ultra) to steer sibling subagents w/ discovered contracts
-- When discovery completes, call request_synthesis({}) & emit <= 2,000-tok structured report in Caveman Ultra (drop articles/filler, abbreviate DB/auth/config/req/res/fn/impl/ctx/env/err, causal arrows X -> Y).`
+- When discovery completes, immediately call request_synthesis({}) & emit <= 2,000-tok structured report in Caveman Ultra (drop articles/filler, abbreviate DB/auth/config/req/res/fn/impl/ctx/env/err, causal arrows X -> Y).`
 
 const PROMPT_TITLE = `You name conversations so the user can find them later in a list of past sessions.
 
@@ -54,7 +56,11 @@ export const Plugin = define({
         item.name = Agent.Name.make("Build")
         item.description = "The default agent. Executes tools based on configured permissions."
         item.mode = "primary"
-        item.permissions.push({ action: "question", resource: "*", effect: "allow" })
+        item.permissions.push(
+          { action: "question", resource: "*", effect: "allow" },
+          { action: "generate_image", resource: "*", effect: "allow" },
+          { action: "godot_sandbox", resource: "*", effect: "allow" },
+        )
       })
 
       editor.update(Agent.ID.make("general"), (item) => {
@@ -66,6 +72,8 @@ export const Plugin = define({
           { action: "question", resource: "*", effect: "deny" },
           { action: "request_synthesis", resource: "*", effect: "allow" },
           { action: "inspect_system_resources", resource: "*", effect: "allow" },
+          { action: "generate_image", resource: "*", effect: "allow" },
+          { action: "godot_sandbox", resource: "*", effect: "allow" },
           { action: "send_message", resource: "*", effect: "allow" },
           { action: "lsp", resource: "*", effect: "allow" },
           { action: "memory", resource: "*", effect: "allow" },
@@ -80,7 +88,7 @@ export const Plugin = define({
       editor.update(Agent.ID.make("explore"), (item) => {
         item.name = Agent.Name.make("Explore")
         item.description =
-          'Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.'
+          'Fast read-only agent specialized for bounded codebase exploration of a specific module or directory subtree. When calling this agent, assign an explicit directory/file include scope (and any shared hub files to exclude) so sibling subagents remain file-disjoint (<10% overlap), finish within <= 5 turns (<= 12-15 batched tool calls), and return verbatim file:line snippets so you do not need to re-read their files.'
         item.system = PROMPT_EXPLORE
         item.mode = "subagent"
         item.permissions.push(

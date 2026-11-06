@@ -154,6 +154,7 @@ const nonEmptyString = (value: unknown): string | undefined =>
 
 const AQUANOX_META_KEYS = [
   "aquanoxConversationId",
+  "aquanoxOwnerUserId",
   "aquanoxTurnSpanId",
   "aquanoxParentSpanId",
   "aquanoxRootSessionId",
@@ -176,11 +177,13 @@ export const mergeHeaderMetadata = <T extends Record<string, unknown> = Record<s
 ): T | undefined => {
   const extracted: Record<string, string> = {}
   const conv = nonEmptyString(headers["x-aquanox-conversation-id"])
+  const owner = nonEmptyString(headers["x-aquanox-owner-user-id"])
   const turn = nonEmptyString(headers["x-aquanox-turn-span-id"])
   const parent = nonEmptyString(headers["x-aquanox-parent-span-id"])
   const root = nonEmptyString(headers["x-aquanox-root-session-id"])
   const thinking = nonEmptyString(headers["x-aquanox-thinking-mode"])
   if (conv !== undefined) extracted.aquanoxConversationId = conv
+  if (owner !== undefined) extracted.aquanoxOwnerUserId = owner
   if (turn !== undefined) extracted.aquanoxTurnSpanId = turn
   if (parent !== undefined) extracted.aquanoxParentSpanId = parent
   if (root !== undefined) extracted.aquanoxRootSessionId = root

@@ -8,6 +8,8 @@ import { Bus } from "./bus.js"
 import { Location } from "./location.js"
 import { ShellSelect } from "./shell/select.js"
 import { lazy } from "./util/lazy.js"
+import { scrubChildEnvironment } from "./util/env-scrub.js"
+import { buildSystemdLeafWrapCommand } from "./util/cgroup-wrap.js"
 
 const BUFFER_LIMIT = 1024 * 1024 * 2
 // Exited sessions stay observable (status, exit code, retained output) until removed explicitly.
@@ -168,9 +170,12 @@ const layer = Layer.effect(
       const command = input.command || (yield* shell.resolve({ priority: "config" }))
       const args = ShellSelect.login(command) ? [...(input.args ?? []), "-l"] : [...(input.args ?? [])]
       const cwd = input.cwd || location.directory
-      const env = {
+      const baseEnv = scrubChildEnvironment({
         ...process.env,
         ...input.env,
+      })
+      const env = {
+        ...baseEnv,
         TERM: "xterm-256color",
         OPENCODE_TERMINAL: "1",
       } as Record<string, string>
@@ -179,9 +184,21 @@ const layer = Layer.effect(
         env.LC_CTYPE = "C.UTF-8"
         env.LANG = "C.UTF-8"
       }
-      yield* Effect.logInfo("creating session", { id, cmd: command, args, cwd })
+      const wrapped = buildSystemdLeafWrapCommand(command, args, {
+        requestId: id,
+        tier: "build_test",
+        cwd,
+      })
+      yield* Effect.logInfo("creating session", {
+        id,
+        cmd: wrapped.command,
+        args: wrapped.args,
+        cwd,
+        wrapped: wrapped.wrapped,
+        unitName: wrapped.unitName,
+      })
       const { spawn } = yield* Effect.promise(() => pty())
-      const proc = yield* Effect.sync(() => spawn(command, args, { name: "xterm-256color", cwd, env }))
+      const proc = yield* Effect.sync(() => spawn(wrapped.command, wrapped.args, { name: "xterm-256color", cwd, env }))
       const info: Info = {
         id,
         title: input.title || `Terminal ${id.slice(-4)}`,

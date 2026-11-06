@@ -36,6 +36,34 @@ const messagePrompt = (text: string) =>
   `Here is the first message of the conversation:\n\n<message>\n${text}\n</message>\n\nReply with only the title.`
 const conversationPrompt = (text: string) =>
   `Here is the conversation so far:\n\n<conversation>\n${text}\n</conversation>\n\nReply with only the title.`
+
+export const deriveFallbackTitle = (text: string): string => {
+  let inner = text
+  const messageMatch = /<message>([\s\S]*?)<\/message>/i.exec(text)
+  const convMatch = /<conversation>([\s\S]*?)<\/conversation>/i.exec(text)
+  if (messageMatch) {
+    inner = messageMatch[1]
+  } else if (convMatch) {
+    inner = convMatch[1]
+  }
+  const lines = inner
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line) return false
+      if (/^Original request:?$/i.test(line)) return false
+      if (/^Recent conversation:?$/i.test(line)) return false
+      return true
+    })
+  const firstLine = lines[0] ?? ""
+  const sanitized = firstLine
+    .replace(/^Original request:\s*/i, "")
+    .replace(/^User:\s*/i, "")
+    .replace(/^[#*\-•\d.]+\s*/, "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .trim()
+  return truncate(sanitized || "New Session")
+}
 export const isUntitled = (session: SessionSchema.Info) =>
   isExactRootFallback({
     title: session.title,
@@ -57,6 +85,9 @@ export const layer = Layer.effect(
       readonly text: string
       readonly model: SessionRunnerModel.Resolved
     }) {
+      if (String(input.model.ref.providerID) === "deepseek-local") {
+        return deriveFallbackTitle(input.text)
+      }
       const chunks: string[] = []
       let failed = false
       let usage: SessionUsage.Recorded | undefined
@@ -87,9 +118,6 @@ export const layer = Layer.effect(
         model: input.model,
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
         messages: [Message.user(input.text)],
-        ...(String(input.model.ref.providerID) === "deepseek-local"
-          ? { httpBody: { id_slot: -1, reasoning_budget_tokens: 0, chat_template_kwargs: { reasoning_effort: "minimal" } } }
-          : {}),
         ...(titleCorr && titleSpanId
           ? {
               aquanox: {

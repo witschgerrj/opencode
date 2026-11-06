@@ -70,6 +70,39 @@ const decodeInput = (tool: Tool.Info<any, any>, value: unknown) =>
     return result.value
   })
 
+export const coerceNumericStrings = (value: unknown): unknown => {
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      const num = Number(trimmed)
+      if (Number.isFinite(num)) {
+        return num
+      }
+    }
+    return value
+  }
+  if (Array.isArray(value)) {
+    let changed = false
+    const result = value.map((item) => {
+      const coerced = coerceNumericStrings(item)
+      if (coerced !== item) changed = true
+      return coerced
+    })
+    return changed ? result : value
+  }
+  if (isRecord(value)) {
+    let changed = false
+    const result: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(value)) {
+      const coerced = coerceNumericStrings(val)
+      if (coerced !== val) changed = true
+      result[key] = coerced
+    }
+    return changed ? result : value
+  }
+  return value
+}
+
 const validateInput = (
   schema: Tool.ValueSchema<any>,
   value: unknown,
@@ -78,10 +111,22 @@ const validateInput = (
   return Effect.gen(function* () {
     const codec = Schema.isSchema(schema) ? schema : yield* Cache.get(jsonSchemas, schema)
     if (codec === undefined) return { value }
-    return yield* Schema.decodeUnknownEffect(codec)(value, { errors: "all" }).pipe(
-      Effect.match({
-        onFailure: (error) => formatEffectIssues(error.issue),
-        onSuccess: (value) => ({ value }),
+    const decode = Schema.decodeUnknownEffect(codec)
+    return yield* decode(value, { errors: "all" }).pipe(
+      Effect.matchEffect({
+        onFailure: (error) => {
+          const coerced = coerceNumericStrings(value)
+          if (coerced !== value) {
+            return decode(coerced, { errors: "all" }).pipe(
+              Effect.match({
+                onFailure: () => formatEffectIssues(error.issue),
+                onSuccess: (value) => ({ value }),
+              }),
+            )
+          }
+          return Effect.succeed(formatEffectIssues(error.issue))
+        },
+        onSuccess: (value) => Effect.succeed({ value }),
       }),
     )
   })
@@ -173,6 +218,43 @@ const standardJsonSchema = (schema: StandardSchemaV1<any, any>, io: "input" | "o
   throw new Error(`Schema vendor "${schema["~standard"].vendor}" does not support JSON Schema conversion`)
 }
 
+const isNonFiniteStringEnum = (item: unknown): boolean => {
+  if (!isRecord(item)) return false
+  if (item.type !== "string" || !Array.isArray(item.enum)) return false
+  const set = new Set(item.enum)
+  return set.has("Infinity") && set.has("-Infinity") && set.has("NaN")
+}
+
+const isNumberBranch = (item: unknown): boolean => {
+  if (!isRecord(item)) return false
+  return item.type === "number" || item.type === "integer"
+}
+
+export const stripNonFiniteNumberUnion = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(stripNonFiniteNumberUnion)
+  if (!isRecord(value)) return value
+
+  const result: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(value)) {
+    result[key] = stripNonFiniteNumberUnion(val)
+  }
+
+  if (Array.isArray(result.anyOf)) {
+    const hasNonFiniteEnum = result.anyOf.some(isNonFiniteStringEnum)
+    const hasNumber = result.anyOf.some(isNumberBranch)
+    if (hasNonFiniteEnum && hasNumber) {
+      const filtered = result.anyOf.filter((item) => !isNonFiniteStringEnum(item))
+      if (filtered.length === 1 && isRecord(filtered[0])) {
+        const { anyOf: _, ...rest } = result
+        return { ...rest, ...filtered[0] }
+      }
+      result.anyOf = filtered
+    }
+  }
+
+  return result
+}
+
 const toJsonSchema = (schema: Schema.Top): JsonSchema.JsonSchema => {
   const document = Schema.toJsonSchemaDocument(schema, { onExcessProperty: "error" })
   // Effect emits valid JSON Schema that some inference providers handle poorly. Simplify it
@@ -186,7 +268,8 @@ const toJsonSchema = (schema: Schema.Top): JsonSchema.JsonSchema => {
       ? document.schema
       : { ...document.schema, $defs: document.definitions },
   )
-  return dropDefinitionsIfResolved(inlineLocalReferences(normalized)) as JsonSchema.JsonSchema
+  const inlined = dropDefinitionsIfResolved(inlineLocalReferences(normalized))
+  return stripNonFiniteNumberUnion(inlined) as JsonSchema.JsonSchema
 }
 
 const flattenAllOf = (value: unknown): unknown => {

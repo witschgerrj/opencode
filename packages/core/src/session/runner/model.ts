@@ -126,17 +126,38 @@ const layer = Layer.effect(
 
         const tier = resolveSessionContextTier(session, agentInfo)
         const limit = { ...baseResolved.limit }
-        if (tier === "128k") {
+        const isDeepseekLocal =
+          String(baseResolved.ref.providerID) === "deepseek-local" ||
+          baseResolved.ref.id.includes("deepseek") ||
+          baseResolved.ref.providerID.includes("deepseek")
+        const reconciled = isDeepseekLocal && SessionSlotLease.isBackendReconciled()
+        const configuredUnder96k =
+          isDeepseekLocal && typeof baseResolved.limit.context === "number" && baseResolved.limit.context > 0 && baseResolved.limit.context <= 98304
+
+        if (reconciled || configuredUnder96k) {
+          const leadTokens = reconciled
+            ? SessionSlotLease.getBackendLeadBlockTokens()
+            : baseResolved.limit.context
+          const quantumTokens = reconciled
+            ? SessionSlotLease.getBackendQuantumTokens()
+            : Math.max(1024, Math.floor(leadTokens / 3))
+          if (tier === "128k") {
+            limit.context = quantumTokens
+            limit.output = Math.min(limit.output ?? 16384, quantumTokens <= 32768 ? 8192 : 16384) || 8192
+          } else if (tier === "256k") {
+            limit.context = Math.min(262144, leadTokens)
+            limit.output = Math.min(limit.output ?? 32768, 32768) || 16384
+          } else if (tier === "384k") {
+            limit.context = leadTokens
+            limit.output = Math.max(limit.output ?? 32768, 32768)
+          }
+        } else if (tier === "128k") {
           limit.context = 131072
           limit.output = Math.min(limit.output ?? 16384, 16384) || 8192
         } else if (tier === "256k") {
           limit.context = 262144
           limit.output = Math.min(limit.output ?? 32768, 32768) || 16384
         } else if (tier === "384k") {
-          const isDeepseekLocal =
-            String(baseResolved.ref.providerID) === "deepseek-local" ||
-            baseResolved.ref.id.includes("deepseek") ||
-            baseResolved.ref.providerID.includes("deepseek")
           if (isDeepseekLocal) {
             limit.context = Math.max(limit.context ?? 393216, 393216)
             limit.output = Math.max(limit.output ?? 32768, 32768)

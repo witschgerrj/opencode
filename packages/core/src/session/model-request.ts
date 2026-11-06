@@ -37,6 +37,7 @@ import { AquanoxTrace } from "./aquanox-trace.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
+import { SessionSlotLease } from "./slot-lease.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
@@ -87,10 +88,26 @@ export interface Input {
 }
 
 /** The default output limit: the catalog limit, fitted to the room the prompt leaves in the context window. */
-export const outputLimit = (limit: Model.Info["limit"], inputTokens?: Input["inputTokens"]) => {
-  const requested = Math.min(limit.output > 0 ? limit.output : OUTPUT_TOKEN_FALLBACK, OUTPUT_TOKEN_MAX)
-  if (inputTokens === undefined || limit.context <= 0) return requested
-  const room = limit.context - inputTokens.measured - Math.ceil(inputTokens.estimated * (1 + ESTIMATE_ERROR))
+export const outputLimit = (
+  limit: Model.Info["limit"],
+  inputTokens?: Input["inputTokens"],
+  options?: { slotId?: number; tier?: SessionSlotLease.LeaseTier; providerID?: string },
+) => {
+  const effectiveContext =
+    options?.providerID === "deepseek-local" && SessionSlotLease.isBackendReconciled()
+      ? SessionSlotLease.getEffectiveSlotContextLimit(options.slotId, options.tier, limit.context)
+      : limit.context
+  const maxOutputForWindow =
+    effectiveContext > 0 && effectiveContext <= 32_768
+      ? Math.min(limit.output > 0 ? limit.output : OUTPUT_TOKEN_FALLBACK, 8_192)
+      : effectiveContext > 0 && effectiveContext <= 65_536
+        ? Math.min(limit.output > 0 ? limit.output : OUTPUT_TOKEN_FALLBACK, 16_384)
+        : limit.output > 0
+          ? limit.output
+          : OUTPUT_TOKEN_FALLBACK
+  const requested = Math.min(maxOutputForWindow, OUTPUT_TOKEN_MAX)
+  if (inputTokens === undefined || effectiveContext <= 0) return requested
+  const room = effectiveContext - inputTokens.measured - Math.ceil(inputTokens.estimated * (1 + ESTIMATE_ERROR))
   return Math.min(requested, Math.max(OUTPUT_TOKEN_MIN, room))
 }
 
@@ -260,6 +277,13 @@ export const layer = Layer.effect(
           (t) => [{ description: t.description, input: JSON.parse(JSON.stringify(t.inputSchema)) }, t] as const,
         ),
       )
+      const leasedSlot =
+        typeof input.httpBody?.["id_slot"] === "number" && input.httpBody["id_slot"] >= 0
+          ? (input.httpBody["id_slot"] as number)
+          : SessionSlotLease.peek(session.id, Boolean(session.parentID))
+      const sessionTier: SessionSlotLease.LeaseTier = session.parentID
+        ? (SessionSlotLease.getSessionTier(session.id) ?? "128k")
+        : "384k"
       // Hooks see the default output limit and may change or remove it. Titles and generate keep the provider default,
       // because their reasoning is hard to budget.
       const shaped = yield* shape(
@@ -270,7 +294,13 @@ export const layer = Layer.effect(
           messages: input.messages,
           options:
             kind === "primary" || kind === "compaction"
-              ? { maxTokens: outputLimit(model.limit, input.inputTokens) }
+              ? {
+                  maxTokens: outputLimit(model.limit, input.inputTokens, {
+                    slotId: leasedSlot,
+                    tier: sessionTier,
+                    providerID: String(model.ref.providerID),
+                  }),
+                }
               : {},
         },
         Object.fromEntries(Array.from(given, ([d, t]) => [t.name, d])),

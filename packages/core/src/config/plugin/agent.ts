@@ -195,6 +195,8 @@ const toolMapping: Record<string, readonly string[]> = {
   manage_task: ["manage_task"],
   schedule: ["schedule"],
   inspect_system_resources: ["inspect_system_resources"],
+  generate_image: ["generate_image"],
+  godot_sandbox: ["godot_sandbox"],
 }
 
 const standardAutonomousTools: readonly string[] = [
@@ -205,6 +207,8 @@ const standardAutonomousTools: readonly string[] = [
   "render_artifact",
   "request_synthesis",
   "inspect_system_resources",
+  "generate_image",
+  "godot_sandbox",
   "snapshot",
   "external_directory",
 ]

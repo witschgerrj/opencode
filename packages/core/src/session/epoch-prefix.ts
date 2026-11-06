@@ -14,6 +14,7 @@ import { Tool } from "../tool.js"
 import { InstructionState } from "./instruction-state.js"
 import type { SessionMessage } from "./message.js"
 import type { SessionSchema } from "./schema.js"
+import { SessionSlotLease } from "./slot-lease.js"
 import { type FrozenHookedToolsMap, SessionEpochPrefixTable, SessionTurnReminderTable } from "./sql.js"
 
 export const MAX_INSTRUCTION_DELTA_CHARS = 12_288
@@ -96,6 +97,34 @@ export function getWorkspaceSummary(cwd: string = process.cwd()): string {
       summary = summary.slice(0, 1196) + "\n..."
     }
     return summary
+  } catch {
+    return ""
+  }
+}
+
+export function getSubagentReminder(
+  sessionID: string,
+  tools: Tool.Snapshot,
+  isRootSession: boolean = true,
+  allowInTest: boolean = false,
+): string {
+  if (!allowInTest && (process.env.NODE_ENV === "test" || process.env.BUN_TEST || process.env.VITEST)) {
+    return ""
+  }
+  if (!isRootSession || !tools.definitions.some((t) => t.name === "subagent")) {
+    return ""
+  }
+  try {
+    const snapshot = SessionSlotLease.getResourceSnapshot({ sessionId: sessionID })
+    const maxPerConv = SessionSlotLease.MAX_CONCURRENT_SUBAGENTS_PER_CONVERSATION
+    const freeQuanta = snapshot.thisConversation
+      ? snapshot.thisConversation.guaranteedAvailable128k + snapshot.thisConversation.opportunisticAvailable128k
+      : Math.max(0, snapshot.unreservedFreeQuanta128k - 3)
+    const availSlots = snapshot.thisConversation
+      ? snapshot.thisConversation.maxSpawnableNow128k
+      : Math.min(maxPerConv, freeQuanta)
+    if (availSlots <= 0) return ""
+    return `[Subagents: ${availSlots}/${maxPerConv} concurrent 128k subagent slots available (${freeQuanta}/${snapshot.totalQuanta128k} arena quanta free). If this task can be split up and resources are available, do so and invoke subagents to help. Partition by disjoint module/directory subgraphs (<10% file overlap), not raw prompt nouns: spawn parallel bounded \`subagent\` (\`explore\`/\`general\`, <=5 turns / <=12-15 tool calls, explicit dir/file include/exclude scope, returning verbatim file:line snippets) for genuinely disjoint subsystems or after a quick root scout reveals 2+ orthogonal branches; handle single-file or tightly coupled slices (<=10 files) directly in Root and never re-read files already covered by subagents.]`
   } catch {
     return ""
   }
@@ -306,11 +335,12 @@ export const resolveEpochContext = Effect.fn("SessionEpochPrefix.resolveEpochCon
     const isRootSession = !input.session || !input.session.parentID
     const isTurn1 = compactionEntry === undefined
     const workspaceSummary = isRootSession && isTurn1 ? getWorkspaceSummary() : ""
+    const subagentReminder = getSubagentReminder(sessionID, tools, isRootSession)
     const renderedVolatile =
       volatileInstructions && volatileInstructions.length > 0
         ? Instructions.renderInitial(volatileInstructions, volatileValues)
         : ""
-    const reminderParts = [workspaceSummary, renderedVolatile].filter((p) => p.length > 0)
+    const reminderParts = [workspaceSummary, renderedVolatile, subagentReminder].filter((p) => p.length > 0)
     const frozenFirstReminder = reminderParts.join("\n\n")
     const initialIsoDate =
       volatileInstructions && volatileInstructions.length > 0 && currentObservedDate !== undefined
@@ -419,6 +449,12 @@ export const resolveEpochContext = Effect.fn("SessionEpochPrefix.resolveEpochCon
       const systemReminderParts: string[] = []
       let dateRolloverPart = ""
       let epochDirty = false
+
+      const isRootSession = !input.session || !input.session.parentID
+      const turnSubagentReminder = getSubagentReminder(sessionID, tools, isRootSession)
+      if (turnSubagentReminder.length > 0) {
+        systemReminderParts.push(turnSubagentReminder)
+      }
 
       const { currentRendered, liveRendered } = yield* InstructionState.renderLiveAndCurrent(
         db,

@@ -22,6 +22,57 @@ import { SessionSchema } from "./session/schema.js"
 import { Config } from "./config.js"
 import { ToolOutput } from "./tool-output.js"
 import { ShellResult } from "./shell/result.js"
+import { scrubChildEnvironment } from "./util/env-scrub.js"
+import { buildSystemdLeafWrapCommand, type SystemdLeafWrapResult } from "./util/cgroup-wrap.js"
+import { GpuBrokerClient } from "./util/gpu-broker-client.js"
+import { SessionSlotLease } from "./session/slot-lease.js"
+import { registerActiveSubprocUnit, unregisterActiveSubprocUnit, isSubprocActive, activeSubprocUnits } from "./tool/plugin/shell.js"
+
+export { isSubprocActive, activeSubprocUnits }
+
+export async function registerWrappedSubprocWithBroker(
+  wrap: SystemdLeafWrapResult,
+  sessionID?: string,
+  client: GpuBrokerClient.Client = GpuBrokerClient.getDefaultClient(),
+): Promise<boolean> {
+  if (!client.isBrokerConfiguredOrAvailable()) {
+    return false
+  }
+  const conversation_id = sessionID ? SessionSlotLease.getConversationIdForSession(sessionID) : undefined
+  const regResult = await client.registerSubproc({
+    request_id: wrap.unitName,
+    unit_name: `${wrap.unitName}.service`,
+    ...(conversation_id ? { conversation_id } : {}),
+    ...(sessionID ? { owner_session_id: sessionID } : {}),
+    memory_max_mib: wrap.tierSpec.memoryMaxMib,
+  })
+  if (regResult.admitted === false || regResult.ok === false) {
+    const reason = regResult.reason || "ERR_SUBPROC_MEM_FLOOR_VIOLATION"
+    throw new Error(
+      `ERR_SUBPROC_MEM_FLOOR_VIOLATION: GPU broker denied subproc admission for unit ${wrap.unitName}: ${reason}`,
+    )
+  }
+  registerActiveSubprocUnit(wrap.unitName)
+  return true
+}
+
+export async function releaseWrappedSubprocWithBroker(
+  wrap: SystemdLeafWrapResult,
+  client: GpuBrokerClient.Client = GpuBrokerClient.getDefaultClient(),
+): Promise<boolean> {
+  if (!client.isBrokerConfiguredOrAvailable()) {
+    unregisterActiveSubprocUnit(wrap.unitName)
+    return false
+  }
+  try {
+    await client.releaseSubproc(wrap.unitName)
+    return true
+  } catch {
+    return false
+  } finally {
+    unregisterActiveSubprocUnit(wrap.unitName)
+  }
+}
 
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Shell.NotFoundError", {
   id: Shell.ID,
@@ -32,10 +83,13 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Shell.No
 const EXITED_LIMIT = 25
 export const RETENTION = Duration.days(7)
 export const DIRECTORY = "shell"
+export const MAX_SHELL_OUTPUT_BYTES = 64 * 1024 * 1024
+export const OUTPUT_TRUNCATED_NOTICE = "\n[output truncated at 64 MiB limit]\n"
 
 type Info = Shell.Info
 type CreateInput = Shell.CreateInput & {
   shell?: string
+  maxOutputBytes?: number
 }
 
 type Active = {
@@ -49,6 +103,7 @@ type Active = {
   done: Deferred.Deferred<Info, NotFoundError>
   timeoutFiber?: Fiber.Fiber<void>
   timeout?: (duration: number) => Effect.Effect<void>
+  kill?: () => Effect.Effect<void>
 }
 
 type Ended = {
@@ -171,6 +226,7 @@ const layer = () =>
         if (!command) return
         commands.delete(id)
         if (command.timeoutFiber) yield* Fiber.interrupt(command.timeoutFiber)
+        if (command.kill) yield* command.kill()
         // Unblock any wait still pending when the command is removed before it terminated.
         yield* Deferred.fail(command.done, new NotFoundError({ id }))
         yield* Effect.promise(() => unlink(command.file).catch(() => {}))
@@ -270,13 +326,14 @@ const layer = () =>
           location.workspaceID !== undefined
             ? undefined
             : ((Schema.is(SessionSchema.ID)(sessionID) ? yield* environments.get(sessionID) : undefined) ?? process.env)
+        const scrubbedBase = baseEnv !== undefined ? scrubChildEnvironment(baseEnv) : undefined
         const invocation: ShellCreateBefore = {
           command: input.command,
           cwd: input.cwd ?? location.directory,
           timeout: input.timeout ?? 0,
           shell: input.shell ?? (yield* shell.resolve({ priority: "config" })),
           env: {
-            ...baseEnv,
+            ...scrubbedBase,
             TERM: "xterm-256color",
             OPENCODE_TERMINAL: "1",
           },
@@ -285,8 +342,16 @@ const layer = () =>
         if (before) yield* before(invocation)
 
         const id = Shell.ID.ascending()
-        const args = ShellSelect.args(invocation.shell, invocation.command)
+        const rawArgs = ShellSelect.args(invocation.shell, invocation.command)
         const file = path.join(outputDir, `${id}.out`)
+
+        const wrap = buildSystemdLeafWrapCommand(invocation.shell, rawArgs, {
+          requestId: id,
+          cwd: invocation.cwd,
+        })
+        const spawnCommand = wrap.command
+        const spawnArgs = wrap.args
+        const spawnEnv = scrubChildEnvironment(invocation.env)
 
         const info: Info = {
           id,
@@ -303,14 +368,39 @@ const layer = () =>
         // the managing fiber keeps its scope open until the command terminates (it awaits `done` at the
         // end). `create` returns once `ready` resolves with the registered command.
         const ready = Deferred.makeUnsafe<Active, AppProcess.AppProcessError>()
+        let subprocRegistered = false
+        let subprocReleased = false
+        const releaseSubprocOnce = () => {
+          if (subprocReleased || !subprocRegistered) return Effect.void
+          subprocReleased = true
+          return Effect.promise(async () => {
+            try {
+              return await releaseWrappedSubprocWithBroker(wrap)
+            } finally {
+              unregisterActiveSubprocUnit(wrap.unitName)
+            }
+          })
+        }
         runFork(
           Effect.scoped(
             Effect.gen(function* () {
+              const registered = yield* Effect.tryPromise({
+                try: () =>
+                  registerWrappedSubprocWithBroker(wrap, typeof sessionID === "string" ? sessionID : undefined),
+                catch: (cause) =>
+                  new AppProcess.AppProcessError({
+                    command: invocation.command,
+                    cause,
+                  }),
+              })
+              if (registered) {
+                subprocRegistered = true
+              }
               const handle = yield* environment.spawner
                 .spawn(
-                  ChildProcess.make(invocation.shell, args, {
+                  ChildProcess.make(spawnCommand, spawnArgs, {
                     cwd: invocation.cwd,
-                    env: invocation.env,
+                    env: spawnEnv,
                     stdin: "ignore",
                     detached: process.platform !== "win32",
                     forceKillAfter: Duration.seconds(3),
@@ -327,15 +417,73 @@ const layer = () =>
                 size: 0,
                 newlines: 0,
                 done: Deferred.makeUnsafe<Info, NotFoundError>(),
+                kill: () => handle.kill({ forceKillAfter: Duration.seconds(1) }).pipe(Effect.catch(() => Effect.void)),
               }
               commands.set(id, command)
 
+              const maxOutputBytes = input.maxOutputBytes ?? MAX_SHELL_OUTPUT_BYTES
               const stream = createWriteStream(file)
               const outputDone = Latch.makeUnsafe()
+              let truncated = false
+
+              const writeChunk = (data: Uint8Array): Effect.Effect<void> =>
+                Effect.callback<void>((resume) => {
+                  let settled = false
+                  const settle = () => {
+                    if (settled) return
+                    settled = true
+                    cleanup()
+                    resume(Effect.void)
+                  }
+                  const onDrain = () => settle()
+                  const onError = () => settle()
+                  const onClose = () => settle()
+                  const cleanup = () => {
+                    stream.removeListener("drain", onDrain)
+                    stream.removeListener("error", onError)
+                    stream.removeListener("close", onClose)
+                  }
+
+                  const ok = stream.write(data)
+                  if (ok) {
+                    resume(Effect.void)
+                    return
+                  }
+
+                  stream.once("drain", onDrain)
+                  stream.once("error", onError)
+                  stream.once("close", onClose)
+
+                  return Effect.sync(cleanup)
+                })
+
               const pump = handle.all.pipe(
                 Stream.runForEach((chunk: Uint8Array) =>
-                  Effect.sync(() => {
-                    stream.write(chunk)
+                  Effect.gen(function* () {
+                    if (truncated) return
+                    const remaining = maxOutputBytes - command.size
+                    if (chunk.length > remaining) {
+                      truncated = true
+                      const slice = remaining > 0 ? chunk.subarray(0, remaining) : null
+                      if (slice && slice.length > 0) {
+                        yield* writeChunk(slice)
+                        command.size += slice.length
+                        for (let index = slice.indexOf(10); index !== -1; index = slice.indexOf(10, index + 1))
+                          command.newlines++
+                      }
+                      const noticeBytes = Buffer.from(OUTPUT_TRUNCATED_NOTICE)
+                      yield* writeChunk(noticeBytes)
+                      command.size += noticeBytes.length
+                      for (let index = noticeBytes.indexOf(10); index !== -1; index = noticeBytes.indexOf(10, index + 1))
+                        command.newlines++
+
+                      runFork(
+                        handle.kill({ forceKillAfter: Duration.seconds(1) }).pipe(Effect.catch(() => Effect.void)),
+                      )
+                      return yield* Effect.fail("truncated")
+                    }
+
+                    yield* writeChunk(chunk)
                     command.size += chunk.length
                     // Count while streaming so truncation notices never rescan the output file.
                     for (let index = chunk.indexOf(10); index !== -1; index = chunk.indexOf(10, index + 1))
@@ -410,7 +558,10 @@ const layer = () =>
                   // sees it never reads a partial file.
                   yield* outputDone.await
                   // A removed command already failed its waiters and published its exit and deletion.
-                  if (commands.get(id) !== command) return
+                  if (commands.get(id) !== command) {
+                    yield* releaseSubprocOnce()
+                    return
+                  }
                   command.info = produce(command.info, (draft) => {
                     draft.status = outcome.status
                     if (outcome.exit !== undefined) draft.exit = outcome.exit
@@ -419,6 +570,7 @@ const layer = () =>
                   })
                   // Resolve waiters before retention eviction, so an evicted command still reports its
                   // terminal Info rather than the removal NotFoundError.
+                  yield* releaseSubprocOnce()
                   yield* Deferred.succeed(command.done, command.info)
                   yield* bus.publish(Shell.Event.Exited, {
                     id,
@@ -444,7 +596,7 @@ const layer = () =>
               // Hold the handle's scope open until the command terminates; closing it earlier would
               // release (kill) the process before its exit is observed.
               yield* Deferred.await(command.done).pipe(Effect.catch(() => Effect.void))
-            }),
+            }).pipe(Effect.ensuring(releaseSubprocOnce())),
           ).pipe(Effect.catchTag("AppProcessError", (error) => Deferred.fail(ready, error))),
         )
 

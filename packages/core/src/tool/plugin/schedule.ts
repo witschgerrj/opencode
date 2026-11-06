@@ -6,7 +6,7 @@ import path from "node:path"
 import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Global } from "@opencode/util/global"
-import { Effect, Predicate, Schema } from "effect"
+import { Effect, Predicate, Schema, Stream } from "effect"
 import { Permission } from "../../permission.js"
 import { NonNegativeInt, PositiveInt, optional } from "../../schema.js"
 import { Session } from "../../session.js"
@@ -207,6 +207,20 @@ export const Plugin = {
         const schedule = file.schedules[id]
         if (!schedule || schedule.status !== "active") return
 
+        const targetExists = yield* sessions
+          .get(Session.ID.make(schedule.targetSessionID))
+          .pipe(
+            Effect.as(true),
+            Effect.catchTag("Session.NotFoundError", () => Effect.succeed(false)),
+            Effect.orElseSucceed(() => true),
+          )
+        if (!targetExists) {
+          schedule.status = "cancelled"
+          clearHandle(id)
+          yield* Effect.promise(() => saveSchedulesAtomic(schedulesPath, file))
+          return
+        }
+
         const syntheticText = [
           `<scheduled-wakeup schedule_id="${schedule.id}" kind="${schedule.kind}">`,
           schedule.prompt,
@@ -301,6 +315,33 @@ export const Plugin = {
         }
       }
     }).pipe(Effect.catch(() => Effect.void))
+
+    if (ctx.event?.subscribe) {
+      yield* ctx.event
+        .subscribe({ types: ["session.deleted"] })
+        .pipe(
+          Stream.runForEach((event) =>
+            Effect.gen(function* () {
+              const deletedID = (event as { properties?: { sessionID?: string } }).properties?.sessionID
+              if (!deletedID) return
+              const file = yield* Effect.promise(() => loadSchedulesFile(schedulesPath))
+              let mutated = false
+              for (const s of Object.values(file.schedules)) {
+                if (s.targetSessionID === deletedID && s.status === "active") {
+                  s.status = "cancelled"
+                  clearHandle(s.id)
+                  mutated = true
+                }
+              }
+              if (mutated) {
+                yield* Effect.promise(() => saveSchedulesAtomic(schedulesPath, file))
+              }
+            }).pipe(Effect.catch(() => Effect.void)),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        .pipe(Effect.catch(() => Effect.void))
+    }
 
     yield* ctx.tool
       .transform((editor) =>
@@ -478,6 +519,26 @@ export const Plugin = {
               if (action === "list") {
                 const file = yield* Effect.promise(() => loadSchedulesFile(schedulesPath))
                 const list = Object.values(file.schedules).filter((s) => s.directory === dirStr)
+                let mutated = false
+                for (const s of list) {
+                  if (s.status === "active") {
+                    const exists = yield* sessions
+                      .get(Session.ID.make(s.targetSessionID))
+                      .pipe(
+                        Effect.as(true),
+                        Effect.catchTag("Session.NotFoundError", () => Effect.succeed(false)),
+                        Effect.orElseSucceed(() => true),
+                      )
+                    if (!exists) {
+                      s.status = "cancelled"
+                      clearHandle(s.id)
+                      mutated = true
+                    }
+                  }
+                }
+                if (mutated) {
+                  yield* Effect.promise(() => saveSchedulesAtomic(schedulesPath, file))
+                }
                 list.sort((a, b) => b.createdAt - a.createdAt)
 
                 const lines = [

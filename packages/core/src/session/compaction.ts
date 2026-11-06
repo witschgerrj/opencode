@@ -3,6 +3,7 @@ export * as SessionCompaction from "./compaction.js"
 import {
   AIError,
   type ContentPart,
+  HttpOptions,
   InvalidProviderOutputError,
   InvalidRequestError,
   isContextOverflowFailure,
@@ -79,6 +80,8 @@ export interface Interface extends State.Transformable<Editor> {
     context: Effect.Effect<SessionContext.Loaded, E>,
     estimate?: Estimate,
   ) => Effect.Effect<void, E>
+  readonly interruptPrecompute: (sessionID: string) => Effect.Effect<void>
+  readonly awaitPrecompute: (sessionID: string) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -248,6 +251,418 @@ const NUDGE =
 /** Summaries written with the previous template carry this catch-all heading. */
 const LEGACY_HEADING = "## Additional Context"
 
+export const COMPACTION_SLOT_UNAVAILABLE_ERROR =
+  "ERR_COMPACTION_SLOT_UNAVAILABLE: Cannot execute local LLM compaction without an active leased Buddy Slot (0..8)"
+
+export function resolveCompactionLeaseOrFail(
+  sessionID: string,
+  isSubagent: boolean,
+): { slot: SessionSlotLease.PhysicalSlotID; wasAlreadyHeldByTurn: boolean } {
+  const existingSlot = SessionSlotLease.isActivelyHeld(sessionID)
+  if (existingSlot !== undefined && existingSlot >= 0) {
+    return { slot: existingSlot, wasAlreadyHeldByTurn: true }
+  }
+  const syncSlot = SessionSlotLease.acquire(sessionID, isSubagent)
+  if (syncSlot >= 0) {
+    return { slot: syncSlot as SessionSlotLease.PhysicalSlotID, wasAlreadyHeldByTurn: false }
+  }
+  throw new Error(COMPACTION_SLOT_UNAVAILABLE_ERROR)
+}
+
+export function resolveCompactionSlotOrFail(
+  sessionID: string,
+  isSubagent: boolean,
+): SessionSlotLease.PhysicalSlotID {
+  return resolveCompactionLeaseOrFail(sessionID, isSubagent).slot
+}
+
+export function acquireCompactionSlotEffect(
+  sessionID: string,
+  isSubagent: boolean,
+  options?: {
+    parentSessionID?: string
+    tier?: SessionSlotLease.LeaseTier
+    queueWhenBusy?: boolean
+  },
+): Effect.Effect<{ slot: SessionSlotLease.PhysicalSlotID; wasAlreadyHeldByTurn: boolean }, Error> {
+  return Effect.gen(function* () {
+    const existingSlot = SessionSlotLease.isActivelyHeld(sessionID)
+    if (existingSlot !== undefined && existingSlot >= 0) {
+      return { slot: existingSlot, wasAlreadyHeldByTurn: true }
+    }
+    const syncSlot = SessionSlotLease.acquire(sessionID, isSubagent)
+    if (syncSlot >= 0) {
+      return { slot: syncSlot as SessionSlotLease.PhysicalSlotID, wasAlreadyHeldByTurn: false }
+    }
+    if (options?.queueWhenBusy && isSubagent) {
+      const tier = options.tier ?? SessionSlotLease.getSessionTier(sessionID) ?? "128k"
+      const queuedSlot = yield* SessionSlotLease.acquireSubagentAsync({
+        sessionID,
+        parentSessionID: options.parentSessionID,
+        tier,
+      })
+      if (queuedSlot >= 0) {
+        return { slot: queuedSlot as SessionSlotLease.PhysicalSlotID, wasAlreadyHeldByTurn: false }
+      }
+    }
+    return yield* Effect.fail(new Error(COMPACTION_SLOT_UNAVAILABLE_ERROR))
+  })
+}
+
+export function shouldPrecompute(settings: { precompute?: boolean; auto?: boolean }): boolean {
+  return Boolean(settings.precompute && settings.auto)
+}
+
+export const activePrecomputeFibers = new Map<string, Fiber.Fiber<Result, Failure>>()
+
+export const interruptPrecompute = (sessionID: string): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const fiber = activePrecomputeFibers.get(sessionID)
+    if (fiber) {
+      activePrecomputeFibers.delete(sessionID)
+      yield* Fiber.interrupt(fiber)
+    }
+  })
+
+export const awaitPrecompute = (sessionID: string): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const fiber = activePrecomputeFibers.get(sessionID)
+    if (fiber) {
+      yield* Fiber.await(fiber).pipe(Effect.catch(() => Effect.void))
+    }
+  })
+
+export interface ExtractCompactionSlotInput {
+  sessionId?: string
+  sessionID?: string
+  request?: unknown
+  options?: unknown
+  leasedSlot?: number
+}
+
+function readSlotFromCarrier(carrier: unknown): number | undefined {
+  if (!carrier || typeof carrier !== "object") return undefined
+  const obj = carrier as Record<string, any>
+  const candidates: unknown[] = [
+    obj.id_slot,
+    obj.body?.id_slot,
+    obj.httpBody?.id_slot,
+    obj.http?.body?.id_slot,
+    obj.providerOptions?.["deepseek-local"]?.id_slot,
+    obj.providerOptions?.openaiCompatible?.id_slot,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
+      return candidate
+    }
+  }
+  return undefined
+}
+
+export function extractCompactionSlot(
+  sessionOrInput?: string | ExtractCompactionSlotInput | unknown,
+  requestArg?: unknown,
+  optionsArg?: unknown,
+  leasedSlotArg?: number,
+): number | undefined {
+  const isWrapperObj =
+    typeof sessionOrInput === "object" &&
+    sessionOrInput !== null &&
+    ("sessionId" in sessionOrInput ||
+      "sessionID" in sessionOrInput ||
+      "request" in sessionOrInput ||
+      "options" in sessionOrInput ||
+      "leasedSlot" in sessionOrInput)
+
+  const wrapper = isWrapperObj ? (sessionOrInput as ExtractCompactionSlotInput) : undefined
+  const explicitLeasedCandidates: unknown[] = [
+    wrapper?.leasedSlot,
+    leasedSlotArg,
+    typeof sessionOrInput === "number" ? sessionOrInput : undefined,
+  ]
+  for (const c of explicitLeasedCandidates) {
+    if (typeof c === "number" && Number.isFinite(c) && c >= 0) {
+      return c
+    }
+  }
+
+  const carriers: unknown[] = isWrapperObj
+    ? [wrapper?.options, wrapper?.request, requestArg, optionsArg]
+    : [optionsArg, requestArg, sessionOrInput]
+  for (const carrier of carriers) {
+    const found = readSlotFromCarrier(carrier)
+    if (found !== undefined) {
+      return found
+    }
+  }
+
+  const sessionCandidates: unknown[] = [
+    wrapper?.sessionId,
+    wrapper?.sessionID,
+    typeof sessionOrInput === "string" ? sessionOrInput : undefined,
+    typeof requestArg === "string" ? requestArg : undefined,
+    typeof optionsArg === "string" ? optionsArg : undefined,
+  ]
+  for (const s of sessionCandidates) {
+    if (typeof s === "string" && s.length > 0) {
+      const active = SessionSlotLease.isActivelyHeld(s)
+      if (typeof active === "number" && Number.isFinite(active) && active >= 0) {
+        return active
+      }
+      const snapSlot = SessionSlotLease.getResourceSnapshot({ sessionId: s }).thisConversation?.leadSlotId
+      if (typeof snapSlot === "number" && Number.isFinite(snapSlot) && snapSlot >= 0) {
+        return snapSlot
+      }
+    }
+  }
+
+  return undefined
+}
+
+export const resolveCompactionRequestSlot = extractCompactionSlot
+
+export function attachSlotToRequest(request: LLMRequest, slot: number | undefined): LLMRequest {
+  if (typeof slot !== "number" || !Number.isFinite(slot) || slot < 0) return request
+  const existingHttpBody =
+    (request.http?.body && typeof request.http.body === "object"
+      ? (request.http.body as Record<string, unknown>)
+      : undefined) ??
+    ((request as any)?.httpBody && typeof (request as any).httpBody === "object"
+      ? ((request as any).httpBody as Record<string, unknown>)
+      : {})
+  const nextBody = {
+    ...existingHttpBody,
+    id_slot: slot,
+  }
+  const existingProviderOptions =
+    request.providerOptions && typeof request.providerOptions === "object"
+      ? (request.providerOptions as Record<string, unknown>)
+      : {}
+  const existingDeepSeekLocal =
+    existingProviderOptions["deepseek-local"] && typeof existingProviderOptions["deepseek-local"] === "object"
+      ? (existingProviderOptions["deepseek-local"] as Record<string, unknown>)
+      : {}
+  const existingOpenaiCompatible =
+    existingProviderOptions.openaiCompatible && typeof existingProviderOptions.openaiCompatible === "object"
+      ? (existingProviderOptions.openaiCompatible as Record<string, unknown>)
+      : {}
+  const nextProviderOptions = {
+    ...existingProviderOptions,
+    "deepseek-local": { ...existingDeepSeekLocal, id_slot: slot },
+    openaiCompatible: { ...existingOpenaiCompatible, id_slot: slot },
+  }
+  const nextHttp = new HttpOptions({
+    ...(request.http ?? {}),
+    body: nextBody,
+  })
+  let updated: LLMRequest
+  try {
+    updated = LLMRequest.update(request, {
+      http: nextHttp,
+      providerOptions: nextProviderOptions,
+    })
+  } catch {
+    updated = {
+      ...(request as any),
+      http: nextHttp,
+      providerOptions: nextProviderOptions,
+    } as LLMRequest
+  }
+  try {
+    Object.assign(updated as any, {
+      id_slot: slot,
+      body: nextBody,
+      httpBody: nextBody,
+    })
+  } catch {
+    // Ignore if frozen
+  }
+  return updated
+}
+
+export function attachSlotToOptions(options: StreamOptions | undefined, slot: number | undefined): StreamOptions {
+  const base = (options ?? {}) as Record<string, unknown>
+  if (typeof slot !== "number" || !Number.isFinite(slot) || slot < 0) return base as StreamOptions
+  const existingHttpBody =
+    base.httpBody && typeof base.httpBody === "object" ? (base.httpBody as Record<string, unknown>) : {}
+  const existingBody =
+    base.body && typeof base.body === "object" ? (base.body as Record<string, unknown>) : {}
+  const existingHttp =
+    base.http && typeof base.http === "object" && typeof base.http !== "function"
+      ? (base.http as Record<string, unknown>)
+      : undefined
+  const existingProviderOptions =
+    base.providerOptions && typeof base.providerOptions === "object"
+      ? (base.providerOptions as Record<string, unknown>)
+      : {}
+  const existingDeepSeekLocal =
+    existingProviderOptions["deepseek-local"] && typeof existingProviderOptions["deepseek-local"] === "object"
+      ? (existingProviderOptions["deepseek-local"] as Record<string, unknown>)
+      : {}
+  const existingOpenaiCompatible =
+    existingProviderOptions.openaiCompatible && typeof existingProviderOptions.openaiCompatible === "object"
+      ? (existingProviderOptions.openaiCompatible as Record<string, unknown>)
+      : {}
+  return {
+    ...base,
+    id_slot: slot,
+    body: { ...existingBody, id_slot: slot },
+    httpBody: { ...existingHttpBody, id_slot: slot },
+    ...(existingHttp
+      ? {
+          http: {
+            ...existingHttp,
+            body: {
+              ...(existingHttp.body && typeof existingHttp.body === "object"
+                ? (existingHttp.body as Record<string, unknown>)
+                : {}),
+              id_slot: slot,
+            },
+          },
+        }
+      : {}),
+    providerOptions: {
+      ...existingProviderOptions,
+      "deepseek-local": { ...existingDeepSeekLocal, id_slot: slot },
+      openaiCompatible: { ...existingOpenaiCompatible, id_slot: slot },
+    },
+  } as unknown as StreamOptions
+}
+
+export function isLocalSlotBudgetedModel(context: SessionContext.Loaded): boolean {
+  const defaultBody = context.model.model.route.defaults.http?.body
+  return (
+    String(context.model.ref.providerID) === "deepseek-local" ||
+    (defaultBody !== undefined &&
+      typeof defaultBody === "object" &&
+      defaultBody !== null &&
+      "reasoning_budget_tokens" in defaultBody)
+  )
+}
+
+export function withCompactionLeaseAndTurnstile<A, E, R>(
+  input: {
+    sessionID: string
+    isSubagent: boolean
+    parentSessionID?: string
+    localSlotBudgeted: boolean
+    allowReentrantTurnstile?: boolean
+    leasedSlot?: number
+  },
+  use: (leasedSlot: number | undefined, turnstileSessionKey: string) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> {
+  return Effect.gen(function* () {
+    const turnstileKey = input.allowReentrantTurnstile
+      ? input.sessionID
+      : `${input.sessionID}:background_compaction`
+    const existingResolvedSlot = extractCompactionSlot({
+      sessionId: input.sessionID,
+      leasedSlot: input.leasedSlot,
+    })
+    const shouldManageSlot =
+      input.localSlotBudgeted || input.leasedSlot !== undefined || existingResolvedSlot !== undefined
+
+    if (!shouldManageSlot) {
+      return yield* use(undefined, turnstileKey)
+    }
+
+    const isSlotOrSessionBusyInTurnstile = (targetSlot: number | undefined): boolean => {
+      if (input.allowReentrantTurnstile) return false
+      const activeSlots = SessionSlotLease.getTelemetry().activeComputeSlots
+      return activeSlots.some(
+        (entry) =>
+          entry.sessionID === input.sessionID ||
+          entry.sessionID === turnstileKey ||
+          (targetSlot !== undefined && targetSlot >= 0 && entry.slot === targetSlot),
+      )
+    }
+
+    while (
+      isSlotOrSessionBusyInTurnstile(
+        input.leasedSlot ??
+          extractCompactionSlot(input.sessionID) ??
+          SessionSlotLease.peek(input.sessionID, input.isSubagent),
+      )
+    ) {
+      yield* Effect.sleep("5 millis")
+    }
+
+    let compactionOwnsLease = false
+    let leasedSlot: number | undefined
+
+    const activeNow = SessionSlotLease.isActivelyHeld(input.sessionID)
+    if (activeNow !== undefined && activeNow >= 0) {
+      leasedSlot = activeNow
+      compactionOwnsLease = false
+    } else if (input.leasedSlot !== undefined && input.leasedSlot >= 0) {
+      const syncAcq = SessionSlotLease.acquire(input.sessionID, input.isSubagent)
+      if (syncAcq >= 0) {
+        leasedSlot = syncAcq
+        compactionOwnsLease = true
+      } else {
+        leasedSlot = input.leasedSlot
+        compactionOwnsLease = false
+      }
+    } else {
+      const syncAcq = SessionSlotLease.acquire(input.sessionID, input.isSubagent)
+      if (syncAcq >= 0) {
+        leasedSlot = syncAcq
+        compactionOwnsLease = true
+      } else if (input.isSubagent) {
+        const tier = SessionSlotLease.getSessionTier(input.sessionID) ?? "128k"
+        const queuedSlot = yield* SessionSlotLease.acquireSubagentAsync({
+          sessionID: input.sessionID,
+          parentSessionID: input.parentSessionID,
+          tier,
+        })
+        if (queuedSlot < 0) {
+          if (input.localSlotBudgeted) {
+            return yield* Effect.die(new Error(COMPACTION_SLOT_UNAVAILABLE_ERROR))
+          }
+          leasedSlot = undefined
+        } else {
+          leasedSlot = queuedSlot
+          compactionOwnsLease = true
+        }
+      } else if (input.localSlotBudgeted) {
+        leasedSlot = resolveCompactionSlotOrFail(input.sessionID, input.isSubagent)
+        compactionOwnsLease = true
+      } else {
+        leasedSlot = existingResolvedSlot
+        compactionOwnsLease = false
+      }
+    }
+
+    while (isSlotOrSessionBusyInTurnstile(leasedSlot)) {
+      yield* Effect.sleep("5 millis")
+    }
+
+    if (leasedSlot !== undefined && leasedSlot >= 0 && SessionSlotLease.isActivelyHeld(input.sessionID) === undefined) {
+      const reacquired = SessionSlotLease.acquire(input.sessionID, input.isSubagent)
+      if (reacquired >= 0) {
+        leasedSlot = reacquired
+        compactionOwnsLease = true
+      }
+    }
+
+    return yield* SessionSlotLease.withComputeTurnstile(turnstileKey, leasedSlot, () =>
+      use(leasedSlot, turnstileKey),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (compactionOwnsLease && leasedSlot !== undefined && leasedSlot >= 0) {
+            if (input.isSubagent) {
+              SessionSlotLease.releaseSubagentSession(input.sessionID)
+            } else {
+              SessionSlotLease.release(input.sessionID)
+            }
+          }
+        }),
+      ),
+    )
+  })
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -272,6 +687,13 @@ export const layer = Layer.effect(
       }),
     })
 
+    const sessionCeilingOptions = (session: SessionContext.Loaded["session"]) => ({
+      slotId: SessionSlotLease.peek(session.id, Boolean(session.parentID)),
+      tier: (session.parentID
+        ? (SessionSlotLease.getSessionTier(session.id) ?? "128k")
+        : "384k") as SessionSlotLease.LeaseTier,
+    })
+
     /** The model that writes the summary, and the request size it aims for. */
     const selectModel = Effect.fnUntraced(function* (
       context: SessionContext.Loaded,
@@ -285,11 +707,12 @@ export const layer = Layer.effect(
             .resolve({ ...context.session, model: agent.model }, catalog.available)
             .pipe(Effect.orElseSucceed(() => undefined)))) ??
         context.model
-      const ceiling = calculateCeiling(model.limit, buffer, model.ref.providerID)
+      const ceilingOpts = sessionCeilingOptions(context.session)
+      const ceiling = calculateCeiling(model.limit, buffer, model.ref.providerID, ceilingOpts)
       // An unknown window never triggers auto compaction, but the compaction request still needs a size to aim for.
       const cap = Number.isFinite(ceiling)
         ? ceiling
-        : calculateCeiling({ ...model.limit, context: UNKNOWN_WINDOW }, buffer, model.ref.providerID)
+        : calculateCeiling({ ...model.limit, context: UNKNOWN_WINDOW }, buffer, model.ref.providerID, ceilingOpts)
       return { context: model === context.model ? context : { ...context, model }, cap }
     })
 
@@ -301,11 +724,21 @@ export const layer = Layer.effect(
       if (trigger.reason !== "manual" && !settings.auto) return { status: "skipped" }
       if (
         trigger.reason === "auto" &&
-        !due(context, calculateCeiling(context.model.limit, settings.buffer, context.model.ref.providerID), trigger.estimate)
+        !due(
+          context,
+          calculateCeiling(
+            context.model.limit,
+            settings.buffer,
+            context.model.ref.providerID,
+            sessionCeilingOptions(context.session),
+          ),
+          trigger.estimate,
+        )
       )
         return { status: "skipped" }
       const held = precomputed.get(context.session.id)
       precomputed.delete(context.session.id)
+      activePrecomputeFibers.delete(context.session.id)
       const native = context.model.compaction?.type === "native"
       const model = yield* selectModel(context, settings.buffer, native)
       // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
@@ -418,14 +851,27 @@ export const layer = Layer.effect(
       given?: Estimate,
     ) {
       const settings = state.get()
+      if (!shouldPrecompute(settings)) return
       const context = yield* load
       const isDeepSeekLocal = String(context.model.ref.providerID) === "deepseek-local"
-      if (!isDeepSeekLocal && (!settings.precompute || !settings.auto)) return
       if (context.model.compaction?.type === "native") return
-      const ceiling = calculateCeiling(context.model.limit, settings.buffer, context.model.ref.providerID)
+      const ceiling = calculateCeiling(
+        context.model.limit,
+        settings.buffer,
+        context.model.ref.providerID,
+        sessionCeilingOptions(context.session),
+      )
       if (!Number.isFinite(ceiling)) return
       const estimate = given ?? estimatePrompt(context)
       if (due(context, ceiling, estimate)) return
+      if (
+        isDeepSeekLocal &&
+        Boolean(context.session.parentID) &&
+        ceiling <= 24_576 &&
+        estimateConversationMessageTokens(context.messages) < 4_096
+      ) {
+        return
+      }
       if (isDeepSeekLocal) {
         const floor = Math.floor(ceiling * PRECOMPUTE_RATIO)
         if (total(estimate) < floor) return
@@ -450,6 +896,7 @@ export const layer = Layer.effect(
         if (index >= 0 && (existing.keepID === anchor.id || failures >= PRECOMPUTE_MAX_FAILURES)) return
         yield* Fiber.interrupt(existing.fiber)
         precomputed.delete(sessionID)
+        activePrecomputeFibers.delete(sessionID)
       }
       // After a model switch nothing is cached for the new model yet; wait until its first response has written it.
       if (anchor.model.id !== context.model.ref.id || anchor.model.variant !== context.model.ref.variant) return
@@ -459,7 +906,17 @@ export const layer = Layer.effect(
       const fiber = yield* summarize({ reason: "auto", context: model.context }, model.cap, settings.keep, {
         messages: context.messages.slice(0, anchorIndex),
         usage: (recorded) => usage.push(recorded),
-      }).pipe(Effect.forkIn(scope))
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (activePrecomputeFibers.get(sessionID) === fiber) {
+              activePrecomputeFibers.delete(sessionID)
+            }
+          }),
+        ),
+        Effect.forkIn(scope),
+      )
+      activePrecomputeFibers.set(sessionID, fiber)
       precomputed.set(sessionID, {
         firstID: context.messages[0]?.id,
         keepID: anchor.id,
@@ -504,17 +961,6 @@ export const layer = Layer.effect(
       return { ...exit.value, metadata: { keepID: held.keepID, ...exit.value.metadata } }
     })
 
-    const due = (context: SessionContext.Loaded, ceiling: number, estimate?: Estimate) => {
-      const messages = context.messages
-      // A compaction just completed; let the runner rebuild the request from it first.
-      const last = messages.at(-1)
-      if (last?.type === "compaction" && last.status === "completed") return false
-      // An encrypted native window estimates as nothing, so wait for a response to measure it.
-      const measured = messages.findLastIndex((message) => hasMeasuredPrompt(message, context.model.ref))
-      if (measured < messages.findLastIndex(SessionHistory.isNativeCompaction)) return false
-      return total(estimate ?? estimatePrompt(context)) >= ceiling
-    }
-
     /**
      *   first:  [E1 … E8][E9 E10]                  →  [S1 + "E9 E10"]
      *   again:  [S1 + "E9 E10"][E11 … E18][E19]    →  [S2 + "E19"]      S2 covers the whole current conversation
@@ -552,63 +998,95 @@ export const layer = Layer.effect(
       const prompt = buildPrompt(previous !== undefined, previous?.summary.includes(LEGACY_HEADING) ?? false)
       const headings = SUMMARY_TEMPLATE.split("\n").filter((line) => line.startsWith("##"))
       const filled = (text: string) => text.split("\n").some((line) => headings.includes(line.trim()))
-      const prepared = yield* prepare(context, messages, budget)
-      // Size the unchanged request with the number that decided to compact: the last response's count plus an
-      // estimate of what came after it. Characters overstate a conversation whose old reasoning the provider drops.
-      // A hook can still make this request larger than that count; the provider then rejects it and it is resent as
-      // text. An overflow already proved the count low, so it keeps the character estimate.
-      const measured = trigger.reason === "overflow" ? undefined : measuredPrompt({ ...context, messages })
+      const isSubagent = Boolean(context.session.parentID)
 
-      // Hooks saw the request without the summary prompt, so it is appended here. A reply that ignores the
-      // template gets one reminder before it counts as a failure.
-      const send = (request: LLMRequest, size?: Estimate) =>
-        Effect.gen(function* () {
-          const prompted = fitOutput(
-            LLMRequest.update(request, { messages: [...request.messages, Message.user(prompt)] }),
-            context.model.limit,
-            size && { ...size, estimated: size.estimated + Token.estimate(prompt) },
-          )
-          const reply = yield* stream(context, prompted, prepared.options, background)
-          if (filled(reply.text)) return reply
+      return yield* withCompactionLeaseAndTurnstile(
+        {
+          sessionID: context.session.id,
+          isSubagent,
+          parentSessionID: context.session.parentID ? String(context.session.parentID) : undefined,
+          localSlotBudgeted: isLocalSlotBudgetedModel(context),
+          allowReentrantTurnstile: trigger.reason === "overflow",
+        },
+        (leasedSlot, turnstileSessionKey) =>
+          Effect.gen(function* () {
+            const prepared = yield* prepare(context, messages, budget, undefined, leasedSlot)
+            // Size the unchanged request with the number that decided to compact: the last response's count plus an
+            // estimate of what came after it. Characters overstate a conversation whose old reasoning the provider drops.
+            // A hook can still make this request larger than that count; the provider then rejects it and it is resent as
+            // text. An overflow already proved the count low, so it keeps the character estimate.
+            const measured = trigger.reason === "overflow" ? undefined : measuredPrompt({ ...context, messages })
 
-          const nudged = fitOutput(
-            LLMRequest.update(prompted, { messages: [...prompted.messages, Message.user(NUDGE)] }),
-            context.model.limit,
-            size && { ...size, estimated: size.estimated + Token.estimate(prompt) + Token.estimate(NUDGE) },
-          )
-          const retry = yield* stream(context, nudged, prepared.options, background)
-          if (filled(retry.text)) return retry
-          return yield* Effect.fail<Failure>({
-            error: {
-              type: "compaction.failed",
-              message: retry.text.trim()
-                ? "Compaction summary did not match the required template"
-                : "Compaction produced no summary",
-            },
-          })
-        })
+            // Hooks saw the request without the summary prompt, so it is appended here. A reply that ignores the
+            // template gets one reminder before it counts as a failure.
+            const send = (request: LLMRequest, size?: Estimate) =>
+              Effect.gen(function* () {
+                const prompted = fitOutput(
+                  LLMRequest.update(request, { messages: [...request.messages, Message.user(prompt)] }),
+                  context.model.limit,
+                  size && { ...size, estimated: size.estimated + Token.estimate(prompt) },
+                )
+                const reply = yield* stream(
+                  context,
+                  prompted,
+                  prepared.options,
+                  background,
+                  leasedSlot,
+                  turnstileSessionKey,
+                )
+                if (filled(reply.text)) return reply
 
-      const overhead = Token.estimate(prompt) + Token.estimate(NUDGE)
-      // Automatic compaction starts past the ceiling, so the whole conversation is sent unchanged while the window can
-      // still fit the summary. Below that, the history before the tail is sent instead, as before: unchanged when it fits,
-      // which still reuses the cache for that shorter prefix, and as text otherwise. Dropping exchanges to make room
-      // for the tail would leave them in neither the summary nor the tail. Where 15% of the window is under
-      // `RESERVE_MIN`, the ceiling equals `summaryRoom`, so automatic compaction always takes this fallback.
-      const fit =
-        trigger.reason === "overflow"
-          ? budget
-          : Math.max(budget, summaryRoom(context.model.limit, prepared.request.generation?.maxTokens))
-      const result = yield* deliver(
-        trigger,
-        prepared,
-        budget - overhead,
-        send,
-        { fit: fit - overhead, history: withoutTail(prepared.request, keepID), measured },
-        background,
+                const nudged = fitOutput(
+                  LLMRequest.update(prompted, { messages: [...prompted.messages, Message.user(NUDGE)] }),
+                  context.model.limit,
+                  size && { ...size, estimated: size.estimated + Token.estimate(prompt) + Token.estimate(NUDGE) },
+                )
+                const retry = yield* stream(
+                  context,
+                  nudged,
+                  prepared.options,
+                  background,
+                  leasedSlot,
+                  turnstileSessionKey,
+                )
+                if (filled(retry.text)) return retry
+                return yield* Effect.fail<Failure>({
+                  error: {
+                    type: "compaction.failed",
+                    message: retry.text.trim()
+                      ? "Compaction summary did not match the required template"
+                      : "Compaction produced no summary",
+                  },
+                })
+              })
+
+            const overhead = Token.estimate(prompt) + Token.estimate(NUDGE)
+            // Automatic compaction starts past the ceiling, so the whole conversation is sent unchanged while the window can
+            // still fit the summary. Below that, the history before the tail is sent instead, as before: unchanged when it fits,
+            // which still reuses the cache for that shorter prefix, and as text otherwise. Dropping exchanges to make room
+            // for the tail would leave them in neither the summary nor the tail. Where 15% of the window is under
+            // `RESERVE_MIN`, the ceiling equals `summaryRoom`, so automatic compaction always takes this fallback.
+            const fit =
+              trigger.reason === "overflow"
+                ? budget
+                : Math.max(budget, summaryRoom(context.model.limit, prepared.request.generation?.maxTokens))
+            const result = yield* deliver(
+              trigger,
+              prepared,
+              budget - overhead,
+              send,
+              {
+                fit: fit - overhead,
+                history: attachSlotToRequest(withoutTail(prepared.request, keepID), leasedSlot),
+                measured,
+              },
+              background,
+            )
+            if (!keepID) return result
+            // A compaction hook may choose its own kept range.
+            return { ...result, metadata: { keepID, ...result.metadata } }
+          }),
       )
-      if (!keepID) return result
-      // A compaction hook may choose its own kept range.
-      return { ...result, metadata: { keepID, ...result.metadata } }
     })
 
     /**
@@ -632,35 +1110,53 @@ export const layer = Layer.effect(
       if (!context.messages.some(SessionRecentText.messageToText)) return yield* Effect.fail(NOTHING_TO_COMPACT)
       const unsupported = (message: string) =>
         Effect.fail<Failure>({ error: { type: "provider.unsupported-operation", message } })
-      const prepared = yield* prepare(context, context.messages, budget, "session")
+      const isSubagent = Boolean(context.session.parentID)
 
-      const toResult = (window: ReadonlyArray<Message>, usage: Usage | undefined) =>
-        spend(context.session.id, usage && SessionUsage.record(usage, context.model.cost)).pipe(
-          Effect.as<Result>({
-            text: "",
-            // Plain JSON, not the schema encoder: provider metadata can hold undefined entries, which it rejects.
-            native: { messages: JSON.parse(JSON.stringify(window)) },
+      return yield* withCompactionLeaseAndTurnstile(
+        {
+          sessionID: context.session.id,
+          isSubagent,
+          parentSessionID: context.session.parentID ? String(context.session.parentID) : undefined,
+          localSlotBudgeted: isLocalSlotBudgetedModel(context),
+          allowReentrantTurnstile: trigger.reason === "overflow",
+        },
+        (leasedSlot) =>
+          Effect.gen(function* () {
+            const prepared = yield* prepare(context, context.messages, budget, "session", leasedSlot)
+
+            const toResult = (window: ReadonlyArray<Message>, usage: Usage | undefined) =>
+              spend(context.session.id, usage && SessionUsage.record(usage, context.model.cost)).pipe(
+                Effect.as<Result>({
+                  text: "",
+                  // Plain JSON, not the schema encoder: provider metadata can hold undefined entries, which it rejects.
+                  native: { messages: JSON.parse(JSON.stringify(window)) },
+                }),
+              )
+
+            const send = (request: LLMRequest) => {
+              const reqWithSlot = attachSlotToRequest(request, leasedSlot)
+              const optsWithSlot = attachSlotToOptions(prepared.options, leasedSlot)
+              if (LLMClient.canCompact(reqWithSlot, { mechanism: "trigger" })) {
+                return Effect.gen(function* () {
+                  const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
+                  const retained = recentUserMessages(history, context.model, keep)
+                  const response = yield* llm.compact(reqWithSlot, { ...optsWithSlot, mechanism: "trigger" })
+                  return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
+                })
+              }
+              if (LLMClient.canCompact(reqWithSlot)) {
+                return llm
+                  .compact(reqWithSlot, { mechanism: "endpoint", http: optsWithSlot.http })
+                  .pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
+              }
+              return unsupported(
+                `Native compaction is not supported for ${reqWithSlot.model.provider}/${reqWithSlot.model.route.id}`,
+              )
+            }
+
+            return yield* deliver(trigger, prepared, budget, send)
           }),
-        )
-
-      const send = (request: LLMRequest) => {
-        if (LLMClient.canCompact(request, { mechanism: "trigger" })) {
-          return Effect.gen(function* () {
-            const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
-            const retained = recentUserMessages(history, context.model, keep)
-            const response = yield* llm.compact(request, { ...prepared.options, mechanism: "trigger" })
-            return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
-          })
-        }
-        if (LLMClient.canCompact(request)) {
-          return llm
-            .compact(request, { mechanism: "endpoint", http: prepared.options.http })
-            .pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
-        }
-        return unsupported(`Native compaction is not supported for ${request.model.provider}/${request.model.route.id}`)
-      }
-
-      return yield* deliver(trigger, prepared, budget, send)
+      )
     })
 
     /**
@@ -848,64 +1344,83 @@ export const layer = Layer.effect(
       request: LLMRequest,
       options: StreamOptions,
       background?: Background,
+      leasedSlot?: number,
+      turnstileSessionKey?: string,
     ) => {
       const sessionID = context.session.id
+      const isSubagent = Boolean(context.session.parentID)
       const unusable = (error: SessionError.Error) => Effect.fail<Failure>({ error })
+      const slot = extractCompactionSlot({
+        sessionId: sessionID,
+        request,
+        options,
+        leasedSlot,
+      })
+      const requestWithSlot = attachSlotToRequest(request, slot)
+      const optionsWithSlot = attachSlotToOptions(options, slot)
 
-      return llm.stream(request, options).pipe(
-        Stream.runFoldEffect(
-          (): Streamed => ({ text: "" }),
-          (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
-            if (LLMEvent.is.providerError(event)) {
-              if (event.classification === undefined)
-                return unusable({ type: "provider.error", message: event.message })
-              return Effect.fail(
-                new AIError({
-                  reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
-                }),
-              )
-            }
-
-            if (LLMEvent.is.textDelta(event)) {
-              const next = { ...streamed, text: streamed.text + event.text }
-              if (background) return Effect.succeed(next)
-              return bus.publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text }).pipe(Effect.as(next))
-            }
-
-            if (LLMEvent.is.stepFinish(event)) {
-              return spend(sessionID, SessionUsage.record(event.usage, context.model.cost), background?.usage).pipe(
-                Effect.as(streamed),
-              )
-            }
-
-            if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
-            switch (event.reason.normalized) {
-              case "unknown":
+      const execution = Effect.suspend(() => {
+        if (slot !== undefined && slot >= 0 && SessionSlotLease.isActivelyHeld(sessionID) === undefined) {
+          SessionSlotLease.acquire(sessionID, isSubagent)
+        }
+        return llm.stream(requestWithSlot, optionsWithSlot).pipe(
+          Stream.runFoldEffect(
+            (): Streamed => ({ text: "" }),
+            (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
+              if (LLMEvent.is.providerError(event)) {
+                if (event.classification === undefined)
+                  return unusable({ type: "provider.error", message: event.message })
                 return Effect.fail(
                   new AIError({
-                    reason: new InvalidProviderOutputError({
-                      message: "The provider response ended with an unknown finish reason.",
-                      classification: "incomplete-stream",
-                    }),
+                    reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
                   }),
                 )
-              case "error":
-                return Effect.fail(
-                  new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
+              }
+
+              if (LLMEvent.is.textDelta(event)) {
+                const next = { ...streamed, text: streamed.text + event.text }
+                if (background) return Effect.succeed(next)
+                return bus.publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text }).pipe(Effect.as(next))
+              }
+
+              if (LLMEvent.is.stepFinish(event)) {
+                return spend(sessionID, SessionUsage.record(event.usage, context.model.cost), background?.usage).pipe(
+                  Effect.as(streamed),
                 )
-              case "length":
-                return unusable({
-                  type: "compaction.failed",
-                  message: "Compaction summary reached the output token limit",
-                })
-              case "content-filter":
-                return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
-              default:
-                return Effect.succeed(streamed)
-            }
-          },
-        ),
-      )
+              }
+
+              if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
+              switch (event.reason.normalized) {
+                case "unknown":
+                  return Effect.fail(
+                    new AIError({
+                      reason: new InvalidProviderOutputError({
+                        message: "The provider response ended with an unknown finish reason.",
+                        classification: "incomplete-stream",
+                      }),
+                    }),
+                  )
+                case "error":
+                  return Effect.fail(
+                    new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
+                  )
+                case "length":
+                  return unusable({
+                    type: "compaction.failed",
+                    message: "Compaction summary reached the output token limit",
+                  })
+                case "content-filter":
+                  return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
+                default:
+                  return Effect.succeed(streamed)
+              }
+            },
+          ),
+        )
+      })
+
+      const effectiveTurnstileKey = turnstileSessionKey ?? `${sessionID}:background_compaction`
+      return SessionSlotLease.withComputeTurnstile(effectiveTurnstileKey, slot, () => execution)
     }
 
     /**
@@ -921,50 +1436,116 @@ export const layer = Layer.effect(
       messages: ReadonlyArray<SessionMessage.Info>,
       budget: number,
       webSocket?: "session",
+      preLeasedSlot?: number,
     ) => {
       const base = transcript(context, messages)
       const traceActive =
         AquanoxTrace.isEnabled() || AquanoxTrace.hasExplicitCorrelation(context.session.id, context.session.metadata)
       const corr = traceActive ? AquanoxTrace.resolveSessionCorrelationSync(context.session) : undefined
-      const defaultBody = context.model.model.route.defaults.http?.body
-      const localSlotBudgeted =
-        String(context.model.ref.providerID) === "deepseek-local" ||
-        (defaultBody !== undefined &&
-          typeof defaultBody === "object" &&
-          defaultBody !== null &&
-          "reasoning_budget_tokens" in defaultBody)
-      const compactionEffect = requests.compaction({
-        session: context.session,
-        agent: context.agent.id,
-        model: context.model,
-        tools: context.tools,
-        system: base.system,
-        messages: base.messages,
-        webSocket,
-        inputTokens: { measured: budget, estimated: 0 },
-        ...(localSlotBudgeted
-          ? {
-              httpBody: {
-                id_slot: SessionSlotLease.acquire(context.session.id, Boolean(context.session.parentID)),
-                reasoning_budget_tokens: 2048,
-              },
-            }
-          : {}),
-        ...(corr
-          ? {
-              aquanox: {
-                conversationId: corr.conversationId,
-                rootSessionId: corr.rootSessionId,
-                parentSpanId:
-                  AquanoxTrace.getActiveCompactSpan(context.session.id) ??
-                  AquanoxTrace.getActiveTurnSpan(context.session.id) ??
-                  corr.parentTurnSpanId,
-                thinkingMode: context.model.ref.variant ?? corr.thinkingMode,
-              },
-            }
-          : {}),
-      })
-      return localSlotBudgeted
+      const localSlotBudgeted = isLocalSlotBudgetedModel(context)
+      const isSubagent = Boolean(context.session.parentID)
+      const managedExternally = preLeasedSlot !== undefined && preLeasedSlot >= 0
+      const existingSlot = managedExternally
+        ? preLeasedSlot
+        : localSlotBudgeted
+          ? SessionSlotLease.isActivelyHeld(context.session.id)
+          : extractCompactionSlot(context.session.id)
+      const wasAlreadyHeldByTurn = managedExternally || (existingSlot !== undefined && existingSlot >= 0)
+      const syncSlot =
+        localSlotBudgeted && !wasAlreadyHeldByTurn
+          ? SessionSlotLease.acquire(context.session.id, isSubagent)
+          : undefined
+      const leasedSlot = wasAlreadyHeldByTurn
+        ? existingSlot
+        : syncSlot !== undefined && syncSlot >= 0
+          ? syncSlot
+          : undefined
+
+      const makeCompactionEffect = (slotForRequest: number | undefined) => {
+        if (
+          slotForRequest !== undefined &&
+          slotForRequest >= 0 &&
+          SessionSlotLease.isActivelyHeld(context.session.id) === undefined
+        ) {
+          SessionSlotLease.acquire(context.session.id, isSubagent)
+        }
+        const effectiveModel =
+          localSlotBudgeted && SessionSlotLease.isBackendReconciled()
+            ? {
+                ...context.model,
+                limit: {
+                  ...context.model.limit,
+                  context: SessionSlotLease.getEffectiveSlotContextLimit(
+                    slotForRequest,
+                    isSubagent ? (SessionSlotLease.getSessionTier(context.session.id) ?? "128k") : "384k",
+                    context.model.limit.context,
+                  ),
+                },
+              }
+            : context.model
+        return requests
+          .compaction({
+            session: context.session,
+            agent: context.agent.id,
+            model: effectiveModel,
+            tools: context.tools,
+            system: base.system,
+            messages: base.messages,
+            webSocket,
+            inputTokens: { measured: budget, estimated: 0 },
+            ...(slotForRequest !== undefined && slotForRequest >= 0
+              ? {
+                  httpBody: {
+                    id_slot: slotForRequest,
+                    ...(localSlotBudgeted ? { reasoning_budget_tokens: 2048 } : {}),
+                  },
+                }
+              : {}),
+            ...(corr
+              ? {
+                  aquanox: {
+                    conversationId: corr.conversationId,
+                    rootSessionId: corr.rootSessionId,
+                    parentSpanId:
+                      AquanoxTrace.getActiveCompactSpan(context.session.id) ??
+                      AquanoxTrace.getActiveTurnSpan(context.session.id) ??
+                      corr.parentTurnSpanId,
+                    thinkingMode: context.model.ref.variant ?? corr.thinkingMode,
+                  },
+                }
+              : {}),
+          })
+          .pipe(
+            Effect.map((prepared) =>
+              slotForRequest !== undefined && slotForRequest >= 0
+                ? {
+                    ...prepared,
+                    request: attachSlotToRequest(prepared.request, slotForRequest),
+                    options: attachSlotToOptions(prepared.options, slotForRequest),
+                  }
+                : prepared,
+            ),
+          )
+      }
+
+      if (localSlotBudgeted && leasedSlot === undefined) {
+        if (isSubagent) {
+          return SessionSlotLease.withSubagentLease(
+            context.session.id,
+            (queuedSlot) => {
+              if (queuedSlot < 0) {
+                return Effect.die(new Error(COMPACTION_SLOT_UNAVAILABLE_ERROR))
+              }
+              return makeCompactionEffect(queuedSlot)
+            },
+            { parentSessionID: context.session.parentID ? String(context.session.parentID) : undefined },
+          )
+        }
+        resolveCompactionSlotOrFail(context.session.id, isSubagent)
+      }
+
+      const compactionEffect = makeCompactionEffect(leasedSlot)
+      return !managedExternally && localSlotBudgeted && !wasAlreadyHeldByTurn && leasedSlot !== undefined && leasedSlot >= 0
         ? compactionEffect.pipe(
             Effect.ensuring(Effect.sync(() => SessionSlotLease.release(context.session.id))),
           )
@@ -1056,6 +1637,8 @@ export const layer = Layer.effect(
           Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
         ),
       precompute,
+      interruptPrecompute: (sessionID: string) => interruptPrecompute(sessionID),
+      awaitPrecompute: (sessionID: string) => awaitPrecompute(sessionID),
     })
   }),
 )
@@ -1224,6 +1807,47 @@ export const recentUserMessages = (
   return sendable.slice(oldestToDrop(sendable, estimateMessage, keep))
 }
 
+export const estimateConversationMessageTokens = (messages: ReadonlyArray<SessionMessage.Info>): number => {
+  const lastCompletedCompactionIndex = messages.findLastIndex(
+    (msg) => msg.type === "compaction" && msg.status === "completed",
+  )
+  const slice = lastCompletedCompactionIndex >= 0 ? messages.slice(lastCompletedCompactionIndex + 1) : messages
+  let sum = 0
+  for (const msg of slice) {
+    if (msg.type === "compaction") continue
+    const text = SessionRecentText.messageToBudgetText(msg) || SessionRecentText.messageToText(msg) || ""
+    if (text) {
+      sum += Token.estimate(text)
+    }
+  }
+  return sum
+}
+
+export const due = (context: SessionContext.Loaded, ceiling: number, estimate?: Estimate) => {
+  const messages = context.messages
+  // A compaction just completed; let the runner rebuild the request from it first.
+  const last = messages.at(-1)
+  if (last?.type === "compaction" && last.status === "completed") return false
+  // An encrypted native window estimates as nothing, so wait for a response to measure it.
+  const measured = messages.findLastIndex((message) => hasMeasuredPrompt(message, context.model.ref))
+  if (measured < messages.findLastIndex(SessionHistory.isNativeCompaction)) return false
+  const promptTotal = total(estimate ?? estimatePrompt(context))
+  if (promptTotal < ceiling) return false
+  if (
+    String(context.model.ref.providerID) === "deepseek-local" &&
+    Boolean(context.session.parentID) &&
+    ceiling <= 24_576
+  ) {
+    const msgTokens = estimateConversationMessageTokens(messages)
+    // When static system + tool schemas (~23.5k tokens) dominate a 32k subagent slot,
+    // do not waste ~90s auto-compacting < 4k tokens of conversation while > 4k tokens of slot headroom remain.
+    if (msgTokens < 4_096 && promptTotal < ceiling + 4_096) {
+      return false
+    }
+  }
+  return true
+}
+
 const total = (estimate: Estimate) => estimate.measured + estimate.estimated
 
 export const estimateContext = (context: SessionContext.Loaded) => total(estimatePrompt(context))
@@ -1261,16 +1885,69 @@ export const estimatePrompt = (context: SessionContext.Loaded): Estimate => {
  * to give up `RESERVE_MIN` keeps `RESERVE_SHARE`.
  */
 export const calculateCeiling = (
-  limit: SessionContext.Loaded["model"]["limit"],
-  buffer: number | undefined,
-  providerID?: string,
+  limit:
+    | SessionContext.Loaded["model"]["limit"]
+    | {
+        context?: number
+        input?: number
+        output?: number
+        contextLimit?: number
+        outputLimit?: number
+        reserveBuffer?: number
+      },
+  bufferOrProviderID?: number | string,
+  providerIDOrOptions?: string | { slotId?: number; tier?: SessionSlotLease.LeaseTier },
+  optionsArg?: { slotId?: number; tier?: SessionSlotLease.LeaseTier },
 ) => {
+  const buffer =
+    typeof bufferOrProviderID === "number"
+      ? bufferOrProviderID
+      : typeof (limit as any)?.reserveBuffer === "number"
+        ? (limit as any).reserveBuffer
+        : undefined
+  const providerID =
+    typeof bufferOrProviderID === "string"
+      ? bufferOrProviderID
+      : typeof providerIDOrOptions === "string"
+        ? providerIDOrOptions
+        : undefined
+  const options =
+    typeof providerIDOrOptions === "object" && providerIDOrOptions !== null
+      ? providerIDOrOptions
+      : optionsArg
+
   // Unknown limits are reported as 0. An unknown input limit falls back to the context window; with no window at
   // all, only a provider rejection can limit the request.
-  const window = limit.input || limit.context
-  if (window <= 0) return Number.POSITIVE_INFINITY
+  const rawWindow = (limit as any).input || (limit as any).context || (limit as any).contextLimit || 0
+  if (rawWindow <= 0) return Number.POSITIVE_INFINITY
 
   const isDeepSeekLocal = String(providerID) === "deepseek-local"
+  const window =
+    isDeepSeekLocal &&
+    SessionSlotLease.isBackendReconciled() &&
+    (options?.slotId !== undefined || options?.tier !== undefined)
+      ? Math.min(rawWindow, SessionSlotLease.getEffectiveSlotContextLimit(options?.slotId, options?.tier, rawWindow))
+      : rawWindow
+
+  // 32k dedicated_3gpu subagent quantum: window <= 32,768, default buffer = 8,192 -> ceiling = 24,576
+  if (isDeepSeekLocal && window <= 32768) {
+    const effectiveBuffer = buffer !== undefined && buffer < window ? Math.min(buffer, 8192) : 8192
+    return window - effectiveBuffer
+  }
+
+  // 64k dedicated_3gpu 2-quantum slot: window <= 65,536, default buffer = 12,288 -> ceiling = 53,248
+  if (isDeepSeekLocal && window <= 65536) {
+    const effectiveBuffer = buffer !== undefined && buffer < window ? Math.min(buffer, 12288) : 12288
+    return window - effectiveBuffer
+  }
+
+  // 96k dedicated_3gpu Lead block: window <= 98,304, 85% floor = 83,558 (buffer = 14,746)
+  if (isDeepSeekLocal && window <= 98304) {
+    const floor = Math.floor(0.85 * window)
+    const maxBuffer = window - floor
+    const effectiveBuffer = buffer !== undefined && buffer < window ? Math.min(buffer, maxBuffer) : maxBuffer
+    return Math.max(window - effectiveBuffer, floor)
+  }
 
   // 128k dual-tier: effectiveBuffer = 32768, ceiling = window - 32768 = 98304 (skip 0.85 floor clamp)
   if (isDeepSeekLocal && window <= 131072) {
@@ -1289,8 +1966,8 @@ export const calculateCeiling = (
       ? window - buffer
       : window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
   // Ensure deepseek-local never triggers premature < 320K compaction below 0.85 * contextLimit (~334K of 393,216)
-  if (isDeepSeekLocal && (limit.context > 0 || (limit.input ?? 0) > 0)) {
-    const contextLimit = limit.context || limit.input || 393_216
+  if (isDeepSeekLocal && (((limit as any).context ?? (limit as any).contextLimit ?? 0) > 0 || ((limit as any).input ?? 0) > 0)) {
+    const contextLimit = window || 393_216
     const floor = Math.floor(0.85 * contextLimit)
     if (ceiling < floor) {
       ceiling = floor

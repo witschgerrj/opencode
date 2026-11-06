@@ -9,6 +9,13 @@ export const SystemResourcesHandler = HttpApiBuilder.group(Api, "system.resource
       .handle(
         "system.resources.snapshot",
         Effect.fn("system.resources.snapshot")(function* (ctx) {
+          if (
+            !SessionSlotLease.isBackendReconciled() &&
+            process.env.NODE_ENV !== "test" &&
+            !process.env.BUN_TEST
+          ) {
+            yield* Effect.promise(() => SessionSlotLease.reconcileBackendSlotCapacities().catch(() => false))
+          }
           const snapshot = SessionSlotLease.getResourceSnapshot({
             conversationId: ctx.query.conversationId,
             sessionId: ctx.query.sessionId,

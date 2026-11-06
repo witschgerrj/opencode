@@ -1,4 +1,6 @@
 export * as ServerProcess from "./server-process"
+import { loadAndScrubStartupCredentials, scrubChildEnvironment } from "../../core/src/util/env-scrub"
+export { loadAndScrubStartupCredentials, scrubChildEnvironment }
 
 import { NodeServices } from "@effect/platform-node"
 import { Service } from "@opencode/client/effect/service"
@@ -79,6 +81,7 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       if (findIncumbent !== undefined && (yield* findIncumbent) !== undefined) return
       // Desktop can launch the service directly without injecting its saved environment.
       Object.assign(process.env, ServiceConfig.processEnv(config.env))
+      const startupCredentials = loadAndScrubStartupCredentials()
       // Keep a package-manager or curl install replaceable while the service runs; Desktop updates its own copy.
       if (options.mode === "service" && process.platform === "win32" && RetainedImage.installed(global.home))
         yield* RetainedImage.retain(global.cache, "service")
@@ -91,10 +94,11 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       }
       const password =
         options.mode === "service"
-          ? config.password || randomBytes(32).toString("base64url")
-          : environmentPassword
-            ? Redacted.value(environmentPassword)
-            : randomBytes(32).toString("base64url")
+          ? config.password || startupCredentials.serverPassword || randomBytes(32).toString("base64url")
+          : startupCredentials.serverPassword ??
+            (environmentPassword
+              ? Redacted.value(environmentPassword)
+              : randomBytes(32).toString("base64url"))
       if (!password) return yield* Effect.fail(new Error("Missing server password"))
       const instanceID = randomUUID()
       const transform = yield* WebUi.handler()
@@ -207,7 +211,8 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       }
       const url = HttpServer.formatAddress(server.address)
       console.log(options.mode === "stdio" ? JSON.stringify({ url }) : `server listening on ${url}`)
-      if (foreground && !environmentPassword) console.log(`server password ${password}`)
+      if (foreground && !environmentPassword && !startupCredentials.serverPassword)
+        console.log(`server password ${password}`)
       return yield* options.mode === "service"
         ? server.shutdown
         : options.mode === "stdio"

@@ -78,7 +78,7 @@ export function evaluate(action: string, resource: string, ...rulesets: Permissi
       .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
       action,
       resource: "*",
-      effect: "ask",
+      effect: action === "generate_image" || action === "godot_sandbox" ? "allow" : "ask",
     }
   )
 }
@@ -164,7 +164,11 @@ const layer = Layer.effect(
       if (denied(input, rules)) return { effect: "deny" as const, rules }
       const all = [...rules, ...(yield* savedRules())]
       const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
-      const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
+      const requireApproval =
+        input.metadata?.requireApproval === true || input.metadata?.kind === "conversation_delete_proposal"
+      const effect: Permission.Effect = requireApproval || effects.includes("ask") ? "ask" : "allow"
+      const defaultMessage =
+        typeof input.metadata?.proposalSummary === "string" ? input.metadata.proposalSummary : undefined
       const event = yield* hooks.trigger("permission", "evaluate", {
         sessionID: input.sessionID,
         agent: input.agent,
@@ -173,8 +177,9 @@ const layer = Layer.effect(
         metadata: input.metadata,
         source: input.source,
         effect,
+        ...(defaultMessage ? { message: defaultMessage } : {}),
       })
-      return { effect: event.effect, message: event.message, rules: all }
+      return { effect: event.effect, message: event.message ?? defaultMessage, rules: all }
     })
 
     function request(input: AssertInput, message?: string): Request {

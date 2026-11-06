@@ -24,13 +24,20 @@ export const Input = Schema.Struct({
 export const Output = Schema.Record(Schema.String, Schema.Unknown)
 
 function formatSnapshotMarkdown(s: SessionSlotLease.SystemResourceSnapshot): string {
+  const quantumK = Math.round((s.backendQuantumTokens ?? 131072) / 1024)
+  const leadK = Math.round((s.backendLeadBlockTokens ?? 393216) / 1024)
   const lines: string[] = [
     `# System Resource Coordinator Snapshot (Gen ${s.generation})`,
     "",
-    `**Quanta Overview:** ${s.committedQuanta128k} / 9 committed (128k quanta), ${s.activeQuanta128k} active, ${s.unreservedFreeQuanta128k} unreserved free (${Math.round(s.unreservedFreeTokens / 1024)}k tokens).`,
-    `**Full 384k Blocks Free:** ${s.freeFullBlocks384k} / 3. **Lead Admission Ready:** ${s.canAdmitNewLeadConversation ? "YES" : "NO"}.`,
+    `**Quanta Overview:** ${s.committedQuanta128k} / 9 committed (${quantumK}k quanta), ${s.activeQuanta128k} active, ${s.unreservedFreeQuanta128k} unreserved free (${Math.round(s.unreservedFreeTokens / 1024)}k tokens).`,
+    `**Full ${leadK}k Blocks Free:** ${s.freeFullBlocks384k} / 3. **Lead Admission Ready:** ${s.canAdmitNewLeadConversation ? "YES" : "NO"}.`,
+    ...(s.capacityMismatch
+      ? [
+          `**Capacity Reconciliation Warning:** Configured model context (${s.configuredContextTokens} tokens) exceeds active backend Lead block capacity (${s.backendLeadBlockTokens} tokens); clamped to live backend slot capacities.`,
+        ]
+      : []),
     "",
-    "### Buddy Blocks (3 x 384k)",
+    `### Buddy Blocks (3 x ${leadK}k)`,
   ]
 
   for (const b of s.blocks) {
@@ -88,6 +95,13 @@ export const Plugin = {
               .pipe(
                 Effect.mapError(
                   (error) => new ToolFailure({ message: "Unable to inspect system resources", error }),
+                ),
+                Effect.andThen(() =>
+                  !SessionSlotLease.isBackendReconciled() &&
+                  process.env.NODE_ENV !== "test" &&
+                  !process.env.BUN_TEST
+                    ? Effect.promise(() => SessionSlotLease.reconcileBackendSlotCapacities().catch(() => false))
+                    : Effect.void,
                 ),
                 Effect.map(() => {
                   const snapshot = SessionSlotLease.getResourceSnapshot({

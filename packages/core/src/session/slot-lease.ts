@@ -1,15 +1,23 @@
 export * as SessionSlotLease from "./slot-lease.js"
 
+import * as fs from "node:fs"
 import { Effect } from "effect"
 
 export type SlotID = -1 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
 export type PhysicalSlotID = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
 export type ChildSlotID = 1 | 2 | 4 | 5 | 7 | 8
+export type LeaseTier = "128k" | "256k" | "384k"
 
 export const SLOTS: ReadonlyArray<PhysicalSlotID> = [0, 1, 2, 3, 4, 5, 6, 7, 8] as const
 export const BUDDY_BLOCKS: ReadonlyArray<0 | 1 | 2> = [0, 1, 2] as const
 export const MAX_CONCURRENT_SUBAGENTS_PER_CONVERSATION = 3
 export const MAX_SUBAGENT_QUANTA_PER_CONVERSATION = 3
+export const SUBAGENT_SLOT_PREFERENCE: ReadonlyArray<PhysicalSlotID> = [2, 5, 8, 1, 4, 7, 0, 3, 6] as const
+export const DEFAULT_STRIDE_ALIGNED_COMPUTE_STREAMS = 3
+export const MAX_ACTIVE_COMPUTE_STREAMS = 4
+export const COMPUTE_STARVATION_THRESHOLD_MS = 15_000
+export const COMPUTE_STARVATION_MAX_BYPASSED_WAVES = 2
+export const aquanox_slot_lease_v12_0 = "aquanox_slot_lease_v12_0"
 
 const MAX_PINNED_SESSIONS = 256
 
@@ -55,6 +63,7 @@ export interface AdmittedConversation {
 }
 
 export interface SystemResourceSnapshot {
+  protocolVersion?: string
   generation: number
   totalQuanta128k: number
   totalTokens: number
@@ -64,6 +73,18 @@ export interface SystemResourceSnapshot {
   unreservedFreeTokens: number
   freeFullBlocks384k: number
   canAdmitNewLeadConversation: boolean
+  activeLeads: number
+  subagentCommitmentsMib: number
+  active_leads: number
+  subagent_commitments_mib: number
+  backendReconciled?: boolean
+  backendLeadBlockTokens?: number
+  backendQuantumTokens?: number
+  configuredContextTokens?: number
+  capacityMismatch?: boolean
+  deferredReleaseSessions?: number
+  deferredReleaseSessionIds?: string[]
+  quarantinedConversations?: number
   blocks: Array<{
     blockId: 0 | 1 | 2
     mode: "idle" | "384k_locked" | "128k_split"
@@ -72,7 +93,7 @@ export interface SystemResourceSnapshot {
   }>
   slots: Array<{
     slotId: number
-    capacityTokens: 131072 | 393216
+    capacityTokens: number
     busy: boolean
     lockedBy384k: boolean
     activeSessionIds: string[]
@@ -91,6 +112,8 @@ export interface SystemResourceSnapshot {
   thisConversation?: {
     conversationId: string
     leadContextTier: "384k"
+    leadContextTokens?: number
+    subagentQuantumTokens?: number
     leadSlotId: number
     reservedSubagents128k: number
     activeSubagents: number
@@ -110,6 +133,33 @@ interface SubagentWaiter {
   readonly tier: "128k" | "256k" | "384k"
   readonly conversationId?: string
   readonly resume: (effect: Effect.Effect<SlotID>) => void
+}
+
+interface ComputeWaiter {
+  readonly id: string
+  readonly sessionID: string
+  readonly slot: number
+  readonly tier: LeaseTier
+  readonly enqueuedAtMs: number
+  bypassedWaves: number
+  readonly grant: () => void
+}
+
+export interface ComputeTurnstileTelemetry {
+  activeComputeStreamsCount: number
+  queuedComputeWaitersCount: number
+  maxComputeStreams: number
+  deferredReleaseSessions: number
+  deferredReleaseSessionIds: string[]
+  quarantinedConversations: number
+  activeComputeSlots: Array<{ sessionID: string; slot: number }>
+  queuedComputeWaiters: Array<{
+    sessionID: string
+    slot: number
+    tier: LeaseTier
+    enqueuedAtMs: number
+    bypassedWaves: number
+  }>
 }
 
 const activeSessionsBySlot: Record<PhysicalSlotID, Set<string>> = {
@@ -143,6 +193,11 @@ const childParentMap = new Map<string, string>()
 const conversations = new Map<string, AdmittedConversation>()
 const conversationBlockMap = new Map<string, 0 | 1 | 2>()
 const waiterQueue: SubagentWaiter[] = []
+const activeComputeSlotBySession = new Map<string, number>()
+export const activeComputeBySession = new Map<string, { count: number; slot: number; startedAt: number }>()
+const pendingDeferredReleaseSessions = new Map<string, { purge: boolean }>()
+const quarantinedConversations = new Map<string, { purgeSessionID?: string }>()
+const computeWaiters: ComputeWaiter[] = []
 
 const lastUsedAtPerSlot: Record<PhysicalSlotID, number> = {
   0: 0,
@@ -158,6 +213,249 @@ const lastUsedAtPerSlot: Record<PhysicalSlotID, number> = {
 
 let leaseClock = 0
 let generation = 1
+
+export const DEFAULT_LEAD_BLOCK_TOKENS = 393_216
+export const DEFAULT_QUANTUM_TOKENS = 131_072
+
+let backendLeadBlockTokens = DEFAULT_LEAD_BLOCK_TOKENS
+let backendQuantumTokens = DEFAULT_QUANTUM_TOKENS
+let backendSlotCapacities: Partial<Record<PhysicalSlotID, number>> = {}
+let backendReconciled = false
+let configuredModelContextTokens: number | undefined
+
+function isTestRuntime(): boolean {
+  return (
+    process.env.NODE_ENV === "test" ||
+    Boolean(process.env.BUN_TEST) ||
+    Boolean(process.env.VITEST) ||
+    process.argv.some((arg) => arg.includes(".test.") || arg === "test")
+  )
+}
+
+function readSystemBackendCtxConfig(): { ctxSize?: number; configuredContextTokens?: number } {
+  const envCtx = process.env.AQUANOX_BACKEND_CTX_SIZE
+  if (envCtx !== undefined && envCtx.trim() !== "") {
+    const parsed = Number.parseInt(envCtx.trim(), 10)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { ctxSize: parsed }
+    }
+  }
+  if (isTestRuntime()) {
+    return {}
+  }
+  let ctxSize: number | undefined
+  let configuredContextTokens: number | undefined
+  try {
+    const envFile = "/etc/default/deepseek-flash"
+    if (fs.existsSync(envFile)) {
+      const raw = fs.readFileSync(envFile, "utf8")
+      const match = /^CTX_SIZE=(\d+)/m.exec(raw)
+      if (match?.[1]) {
+        const parsed = Number.parseInt(match[1], 10)
+        if (Number.isFinite(parsed) && parsed > 0) {
+          ctxSize = parsed
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const configPath =
+      process.env.OPENCODE_CONFIG_PATH ||
+      (process.env.HOME
+        ? `${process.env.HOME}/.config/opencode/opencode.json`
+        : "/home/rjwits/.config/opencode/opencode.json")
+    if (fs.existsSync(configPath)) {
+      const parsedJson = JSON.parse(fs.readFileSync(configPath, "utf8")) as any
+      const cfgCtx = parsedJson?.providers?.["deepseek-local"]?.models?.["deepseek-v4.1-flash"]?.limit?.context
+      if (typeof cfgCtx === "number" && cfgCtx > 0) {
+        configuredContextTokens = cfgCtx
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return { ctxSize, configuredContextTokens }
+}
+
+export function setBackendSlotCapacities(input: {
+  slots?: ReadonlyArray<{ id?: number; slot_id?: number; n_ctx: number }>
+  defaultNCtx?: number
+  configuredContextTokens?: number
+}): void {
+  if (input.configuredContextTokens !== undefined && input.configuredContextTokens > 0) {
+    configuredModelContextTokens = input.configuredContextTokens
+  }
+  if (input.slots && input.slots.length > 0) {
+    const explicitById = new Map<number, number>()
+    for (let i = 0; i < input.slots.length; i++) {
+      const item = input.slots[i]!
+      const id = typeof item.id === "number" ? item.id : typeof item.slot_id === "number" ? item.slot_id : i
+      if (typeof item.n_ctx === "number" && item.n_ctx > 0) {
+        explicitById.set(id, item.n_ctx)
+      }
+    }
+    const leadNCtx =
+      explicitById.get(0) ??
+      explicitById.get(3) ??
+      explicitById.get(6) ??
+      input.defaultNCtx ??
+      Math.max(...Array.from(explicitById.values()), 0)
+    if (leadNCtx > 0) {
+      backendLeadBlockTokens = leadNCtx
+      const tailQuantum = explicitById.get(2) ?? explicitById.get(5) ?? explicitById.get(8)
+      backendQuantumTokens =
+        tailQuantum !== undefined && tailQuantum > 0
+          ? tailQuantum
+          : Math.max(1024, Math.floor(leadNCtx / 3))
+      const nextCapacities: Partial<Record<PhysicalSlotID, number>> = {}
+      for (const s of SLOTS) {
+        const direct = explicitById.get(s) ?? explicitById.get(s % 3)
+        if (direct !== undefined && direct > 0) {
+          nextCapacities[s] = direct
+        } else {
+          nextCapacities[s] =
+            s % 3 === 0
+              ? backendLeadBlockTokens
+              : s % 3 === 1
+                ? backendQuantumTokens * 2
+                : backendQuantumTokens
+        }
+      }
+      backendSlotCapacities = nextCapacities
+      backendReconciled = true
+      generation++
+      return
+    }
+  }
+  if (input.defaultNCtx !== undefined && input.defaultNCtx > 0) {
+    backendLeadBlockTokens = input.defaultNCtx
+    backendQuantumTokens = Math.max(1024, Math.floor(input.defaultNCtx / 3))
+    const nextCapacities: Partial<Record<PhysicalSlotID, number>> = {}
+    for (const s of SLOTS) {
+      nextCapacities[s] =
+        s % 3 === 0
+          ? backendLeadBlockTokens
+          : s % 3 === 1
+            ? backendQuantumTokens * 2
+            : backendQuantumTokens
+    }
+    backendSlotCapacities = nextCapacities
+    backendReconciled = true
+    generation++
+  }
+}
+
+export async function reconcileBackendSlotCapacities(
+  baseUrl?: string,
+  options?: { configuredContextTokens?: number; timeoutMs?: number },
+): Promise<boolean> {
+  if (options?.configuredContextTokens !== undefined && options.configuredContextTokens > 0) {
+    configuredModelContextTokens = options.configuredContextTokens
+  }
+  const rawBase = baseUrl || process.env.AQUANOX_LLAMA_SERVER_URL || "http://127.0.0.1:8080"
+  const normalizedBase = rawBase.replace(/\/v1\/?$/, "").replace(/\/+$/, "")
+  const timeoutMs = options?.timeoutMs ?? 1500
+  try {
+    const res = await fetch(`${normalizedBase}/slots`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) return false
+    const data = (await res.json()) as unknown
+    const slotArray = Array.isArray(data)
+      ? data
+      : data && typeof data === "object" && Array.isArray((data as any).slots)
+        ? (data as any).slots
+        : undefined
+    if (!slotArray || slotArray.length === 0) return false
+    const parsedSlots: Array<{ id: number; n_ctx: number }> = []
+    for (let i = 0; i < slotArray.length; i++) {
+      const item = slotArray[i]
+      if (item && typeof item === "object") {
+        const id = typeof item.id === "number" ? item.id : typeof item.slot_id === "number" ? item.slot_id : i
+        const n_ctx = typeof item.n_ctx === "number" ? item.n_ctx : undefined
+        if (n_ctx !== undefined && n_ctx > 0) {
+          parsedSlots.push({ id, n_ctx })
+        }
+      }
+    }
+    if (parsedSlots.length === 0) return false
+    setBackendSlotCapacities({
+      slots: parsedSlots,
+      configuredContextTokens: options?.configuredContextTokens,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function isBackendReconciled(): boolean {
+  return backendReconciled
+}
+
+export function getBackendLeadBlockTokens(): number {
+  return backendLeadBlockTokens
+}
+
+export function getBackendQuantumTokens(): number {
+  return backendQuantumTokens
+}
+
+export function getEffectiveSlotContextLimit(
+  slotId?: number,
+  tier?: LeaseTier,
+  configuredContext?: number,
+): number {
+  if (configuredContext !== undefined && configuredContext > 0 && configuredModelContextTokens === undefined) {
+    configuredModelContextTokens = configuredContext
+  }
+  let slotLimit: number
+  if (slotId !== undefined && slotId >= 0 && slotId <= 8) {
+    const s = slotId as PhysicalSlotID
+    const b = Math.floor(s / 3) as 0 | 1 | 2
+    const isChildOrSplit = s % 3 !== 0 || tier === "128k" || blockMode[b] === "128k_split"
+    if (isChildOrSplit) {
+      slotLimit = Math.min(backendQuantumTokens, backendSlotCapacities[s] ?? backendQuantumTokens)
+    } else {
+      slotLimit = Math.min(backendLeadBlockTokens, backendSlotCapacities[s] ?? backendLeadBlockTokens)
+    }
+  } else if (tier === "128k") {
+    slotLimit = backendQuantumTokens
+  } else if (tier === "256k") {
+    slotLimit = backendReconciled ? Math.min(backendLeadBlockTokens, 262_144) : 262_144
+  } else {
+    slotLimit = backendLeadBlockTokens
+  }
+  if (configuredContext !== undefined && configuredContext > 0) {
+    return Math.min(configuredContext, slotLimit)
+  }
+  return slotLimit
+}
+
+function applyInitialBackendCapacities(): void {
+  const sysCfg = readSystemBackendCtxConfig()
+  if (sysCfg.ctxSize !== undefined && sysCfg.ctxSize > 0) {
+    setBackendSlotCapacities({
+      defaultNCtx: sysCfg.ctxSize,
+      configuredContextTokens: sysCfg.configuredContextTokens,
+    })
+  } else {
+    backendLeadBlockTokens = DEFAULT_LEAD_BLOCK_TOKENS
+    backendQuantumTokens = DEFAULT_QUANTUM_TOKENS
+    backendSlotCapacities = {}
+    backendReconciled = false
+    configuredModelContextTokens = sysCfg.configuredContextTokens
+  }
+}
+
+applyInitialBackendCapacities()
+if (!isTestRuntime()) {
+  void reconcileBackendSlotCapacities().catch(() => false)
+}
 
 function recordPin(sessionID: string, slot: PhysicalSlotID): void {
   sessionSlotMap.delete(sessionID)
@@ -406,17 +704,96 @@ export function bindConversationSession(input: {
   return { ok: true, leadSlotId: conv.leadSlotId }
 }
 
-export function releaseConversation(conversationId: string): { ok: boolean } {
+function normalizeComputeSessionID(turnstileKey: string): string {
+  return turnstileKey.endsWith(":background_compaction")
+    ? turnstileKey.slice(0, -":background_compaction".length)
+    : turnstileKey
+}
+
+function incrementActiveCompute(turnstileKey: string, slot: number): void {
+  const baseId = normalizeComputeSessionID(turnstileKey)
+  const existing = activeComputeBySession.get(baseId)
+  if (existing) {
+    existing.count += 1
+    existing.slot = slot
+  } else {
+    activeComputeBySession.set(baseId, {
+      count: 1,
+      slot,
+      startedAt: Date.now(),
+    })
+  }
+}
+
+function decrementActiveCompute(turnstileKey: string): void {
+  const baseId = normalizeComputeSessionID(turnstileKey)
+  const existing = activeComputeBySession.get(baseId)
+  if (!existing) return
+  existing.count -= 1
+  if (existing.count <= 0) {
+    activeComputeBySession.delete(baseId)
+  }
+}
+
+export function hasActiveComputeScope(sessionID: string): boolean {
+  const baseId = normalizeComputeSessionID(sessionID)
+  const entry = activeComputeBySession.get(baseId)
+  if (entry && entry.count > 0) return true
+  return (
+    activeComputeSlotBySession.has(baseId) ||
+    activeComputeSlotBySession.has(`${baseId}:background_compaction`)
+  )
+}
+
+function collectConversationFamilySessions(conversationId: string, extraSessionID?: string): Set<string> {
+  const family = new Set<string>()
   const conv = conversations.get(conversationId)
-  if (!conv) return { ok: false }
+  if (conv?.rootSessionId) family.add(conv.rootSessionId)
+  if (extraSessionID) family.add(extraSessionID)
+  for (const [sessId, cId] of sessionConversationMap.entries()) {
+    if (cId === conversationId) family.add(sessId)
+  }
+  let added = true
+  while (added) {
+    added = false
+    for (const [childId, parentId] of childParentMap.entries()) {
+      if (!family.has(childId) && (family.has(parentId) || getConversationIdForSession(childId) === conversationId)) {
+        family.add(childId)
+        added = true
+      }
+    }
+  }
+  return family
+}
+
+function finalizeReleaseConversation(conversationId: string, purgeSessionID?: string): { ok: boolean } {
+  quarantinedConversations.delete(conversationId)
+  const conv = conversations.get(conversationId)
+  if (purgeSessionID) {
+    pendingDeferredReleaseSessions.delete(purgeSessionID)
+    const pinnedSlot = sessionSlotMap.get(purgeSessionID)
+    if (pinnedSlot !== undefined) {
+      activeSessionsBySlot[pinnedSlot].delete(purgeSessionID)
+      sessionSlotMap.delete(purgeSessionID)
+    }
+    sessionTierMap.delete(purgeSessionID)
+    sessionConversationMap.delete(purgeSessionID)
+    conversationBlockMap.delete(conversationId)
+  }
+  if (!conv) return { ok: Boolean(purgeSessionID) }
 
   const b = conv.leadBlockId
   blockMode[b] = "idle"
   blockOwner[b] = undefined
 
   if (conv.rootSessionId) {
+    pendingDeferredReleaseSessions.delete(conv.rootSessionId)
     activeSessionsBySlot[conv.leadSlotId].delete(conv.rootSessionId)
     sessionConversationMap.delete(conv.rootSessionId)
+    if (purgeSessionID) {
+      sessionSlotMap.delete(conv.rootSessionId)
+      sessionTierMap.delete(conv.rootSessionId)
+    }
   }
 
   for (let i = waiterQueue.length - 1; i >= 0; i--) {
@@ -431,10 +808,23 @@ export function releaseConversation(conversationId: string): { ok: boolean } {
 
   for (const [sessId, cId] of sessionConversationMap.entries()) {
     if (cId === conversationId) {
+      pendingDeferredReleaseSessions.delete(sessId)
       const slot = sessionSlotMap.get(sessId)
       if (slot !== undefined) {
         activeSessionsBySlot[slot].delete(sessId)
+        if (purgeSessionID) sessionSlotMap.delete(sessId)
       }
+      const bSess = slot !== undefined ? (Math.floor(slot / 3) as 0 | 1 | 2) : undefined
+      if (
+        bSess !== undefined &&
+        blockOwner[bSess] === undefined &&
+        activeSessionsBySlot[(bSess * 3) as PhysicalSlotID].size === 0 &&
+        activeSessionsBySlot[(bSess * 3 + 1) as PhysicalSlotID].size === 0 &&
+        activeSessionsBySlot[(bSess * 3 + 2) as PhysicalSlotID].size === 0
+      ) {
+        blockMode[bSess] = "idle"
+      }
+      if (purgeSessionID) sessionTierMap.delete(sessId)
       sessionConversationMap.delete(sessId)
     }
   }
@@ -444,6 +834,58 @@ export function releaseConversation(conversationId: string): { ok: boolean } {
 
   drainWaiters()
   return { ok: true }
+}
+
+export function releaseConversation(conversationId: string, purgeSessionID?: string): { ok: boolean } {
+  for (let i = waiterQueue.length - 1; i >= 0; i--) {
+    const w = waiterQueue[i]
+    if (
+      w.conversationId === conversationId ||
+      (w.parentSessionID !== undefined && sessionConversationMap.get(w.parentSessionID) === conversationId)
+    ) {
+      waiterQueue.splice(i, 1)
+    }
+  }
+
+  const familySessions = collectConversationFamilySessions(conversationId, purgeSessionID)
+  const activeFamilySessions = Array.from(familySessions).filter((sid) => hasActiveComputeScope(sid))
+
+  if (activeFamilySessions.length > 0) {
+    const conv = conversations.get(conversationId)
+    for (const sid of familySessions) {
+      removeWaitersForSession(sid)
+      if (hasActiveComputeScope(sid)) {
+        const computeSlot =
+          activeComputeBySession.get(sid)?.slot ??
+          activeComputeSlotBySession.get(sid) ??
+          activeComputeSlotBySession.get(`${sid}:background_compaction`) ??
+          sessionSlotMap.get(sid)
+        if (computeSlot !== undefined && computeSlot >= 0 && computeSlot <= 8) {
+          const phys = computeSlot as PhysicalSlotID
+          activeSessionsBySlot[phys].add(sid)
+          recordPin(sid, phys)
+        }
+        const prev = pendingDeferredReleaseSessions.get(sid)
+        pendingDeferredReleaseSessions.set(sid, {
+          purge: Boolean(prev?.purge || purgeSessionID !== undefined),
+        })
+      } else if (!conv || sid !== conv.rootSessionId) {
+        performImmediateRelease(sid, { purge: purgeSessionID !== undefined })
+      }
+    }
+    if (conv) {
+      conv.reservedSubagentQuanta = conv.activeSubagentQuanta
+    }
+    const prevQ = quarantinedConversations.get(conversationId)
+    quarantinedConversations.set(conversationId, {
+      purgeSessionID: purgeSessionID ?? prevQ?.purgeSessionID,
+    })
+    generation++
+    drainWaiters()
+    return { ok: true }
+  }
+
+  return finalizeReleaseConversation(conversationId, purgeSessionID)
 }
 
 function tryAcquireSubagentSync(input: {
@@ -511,7 +953,6 @@ function tryAcquireSubagentSync(input: {
       }
     }
 
-    const SUBAGENT_SLOT_PREFERENCE: ReadonlyArray<PhysicalSlotID> = [2, 5, 8, 1, 4, 7] as const
     const splitBlockSlots: PhysicalSlotID[] = []
     const idleBlockSlots: PhysicalSlotID[] = []
 
@@ -593,6 +1034,24 @@ function drainWaiters(): void {
   }
 }
 
+export function removeWaitersForSession(sessionID: string): number {
+  let removed = 0
+  for (let i = waiterQueue.length - 1; i >= 0; i--) {
+    if (waiterQueue[i].sessionID === sessionID) {
+      waiterQueue.splice(i, 1)
+      removed++
+    }
+  }
+  return removed
+}
+
+export function isActivelyHeld(sessionID: string): PhysicalSlotID | undefined {
+  for (const s of SLOTS) {
+    if (activeSessionsBySlot[s].has(sessionID)) return s
+  }
+  return undefined
+}
+
 export function acquireSubagentAsync(input: {
   sessionID: string
   parentSessionID?: string
@@ -622,7 +1081,13 @@ export function acquireSubagentAsync(input: {
         waiterQueue.splice(idx, 1)
       }
     })
-  })
+  }).pipe(
+    Effect.onInterrupt(() =>
+      Effect.sync(() => {
+        removeWaitersForSession(input.sessionID)
+      }),
+    ),
+  )
 }
 
 export function withTierLease<A, E, R>(
@@ -730,7 +1195,257 @@ export function acquire(sessionID: string, isSubagent?: boolean): SlotID {
   return -1
 }
 
-export function release(sessionID: string): void {
+export function resolveMaxComputeStreams(): number {
+  const raw = process.env.AQUANOX_MAX_COMPUTE_STREAMS
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number.parseInt(raw.trim(), 10)
+    if (Number.isFinite(parsed) && parsed >= 1) {
+      return Math.min(9, parsed)
+    }
+  }
+  return DEFAULT_STRIDE_ALIGNED_COMPUTE_STREAMS
+}
+
+function computeWaiterAffinityScore(w: ComputeWaiter): number {
+  if (activeComputeSlotBySession.size === 0) return 0
+  let strideMatches = 0
+  let splitBlockMatches = 0
+  const waiterBlock = Math.floor(w.slot / 3) as 0 | 1 | 2
+  const waiterMod3 = ((w.slot % 3) + 3) % 3
+
+  for (const [activeSessionID, activeSlot] of activeComputeSlotBySession.entries()) {
+    const activeMod3 = ((activeSlot % 3) + 3) % 3
+    if (waiterMod3 === activeMod3) {
+      strideMatches += 1
+    }
+
+    const activeBlock = Math.floor(activeSlot / 3) as 0 | 1 | 2
+    const activeTier = sessionTierMap.get(activeSessionID)
+    const isSplitSubagentBlock =
+      blockMode[activeBlock] !== "384k_locked" &&
+      activeTier !== "384k" &&
+      (blockMode[activeBlock] === "128k_split" ||
+        activeTier === "128k" ||
+        childParentMap.has(activeSessionID) ||
+        activeBlock >= 1 ||
+        activeSlot % 3 !== 0 ||
+        w.slot % 3 !== 0)
+
+    if (waiterBlock === activeBlock && isSplitSubagentBlock && w.tier !== "384k") {
+      splitBlockMatches += 1
+    }
+  }
+
+  const totalActive = activeComputeSlotBySession.size
+  if (strideMatches === totalActive) {
+    return 100 + strideMatches * 10 + splitBlockMatches
+  }
+  if (splitBlockMatches === totalActive) {
+    return 95 + splitBlockMatches * 10 + strideMatches
+  }
+  if (strideMatches > 0 || splitBlockMatches > 0) {
+    return Math.max(strideMatches, splitBlockMatches) * 10 + strideMatches + splitBlockMatches
+  }
+  return 0
+}
+
+function selectNextComputeWaiterIndex(): number {
+  if (computeWaiters.length === 0) return -1
+  if (computeWaiters.length === 1) return 0
+
+  const oldest = computeWaiters[0]!
+  const nowMs = Date.now()
+  if (
+    nowMs - oldest.enqueuedAtMs >= COMPUTE_STARVATION_THRESHOLD_MS ||
+    oldest.bypassedWaves >= COMPUTE_STARVATION_MAX_BYPASSED_WAVES
+  ) {
+    return 0
+  }
+
+  if (activeComputeSlotBySession.size === 0) {
+    return 0
+  }
+
+  let bestIdx = 0
+  let bestScore = computeWaiterAffinityScore(oldest)
+  for (let i = 1; i < computeWaiters.length; i++) {
+    const score = computeWaiterAffinityScore(computeWaiters[i]!)
+    if (score > bestScore) {
+      bestScore = score
+      bestIdx = i
+    }
+  }
+  return bestIdx
+}
+
+function drainComputeWaiters(): void {
+  while (
+    computeWaiters.length > 0 &&
+    activeComputeSlotBySession.size < resolveMaxComputeStreams()
+  ) {
+    const nextIdx = selectNextComputeWaiterIndex()
+    if (nextIdx < 0 || nextIdx >= computeWaiters.length) break
+    for (let i = 0; i < nextIdx; i++) {
+      computeWaiters[i]!.bypassedWaves += 1
+    }
+    const [chosen] = computeWaiters.splice(nextIdx, 1)
+    if (!chosen) break
+    activeComputeSlotBySession.set(chosen.sessionID, chosen.slot)
+    incrementActiveCompute(chosen.sessionID, chosen.slot)
+    chosen.grant()
+  }
+}
+
+export function removeComputeWaitersForSession(sessionID: string): number {
+  let removed = 0
+  for (let i = computeWaiters.length - 1; i >= 0; i--) {
+    if (computeWaiters[i]!.sessionID === sessionID) {
+      computeWaiters.splice(i, 1)
+      removed++
+    }
+  }
+  return removed
+}
+
+function completeDeferredReleasesIfIdle(baseSessionID: string): void {
+  if (hasActiveComputeScope(baseSessionID)) return
+
+  const deferred = pendingDeferredReleaseSessions.get(baseSessionID)
+  if (deferred) {
+    pendingDeferredReleaseSessions.delete(baseSessionID)
+    performImmediateRelease(baseSessionID, { purge: deferred.purge })
+  }
+
+  if (quarantinedConversations.size > 0) {
+    for (const [cId, qInfo] of Array.from(quarantinedConversations.entries())) {
+      const family = collectConversationFamilySessions(cId, qInfo.purgeSessionID)
+      const stillActive = Array.from(family).some((sid) => hasActiveComputeScope(sid))
+      if (!stillActive) {
+        finalizeReleaseConversation(cId, qInfo.purgeSessionID)
+      }
+    }
+  }
+}
+
+function releaseComputePermit(sessionID: string): void {
+  removeComputeWaitersForSession(sessionID)
+  const hadPermit = activeComputeSlotBySession.delete(sessionID)
+  if (hadPermit) {
+    decrementActiveCompute(sessionID)
+    drainComputeWaiters()
+  }
+  const baseId = normalizeComputeSessionID(sessionID)
+  completeDeferredReleasesIfIdle(baseId)
+}
+
+function acquireComputePermit(
+  sessionID: string,
+  slot: number,
+  options?: { enqueuedAtMs?: number },
+): Effect.Effect<void> {
+  return Effect.callback<void>((resume) => {
+    if (activeComputeSlotBySession.get(sessionID) !== undefined) {
+      resume(Effect.void)
+      return
+    }
+
+    const maxStreams = resolveMaxComputeStreams()
+    if (activeComputeSlotBySession.size < maxStreams && computeWaiters.length === 0) {
+      activeComputeSlotBySession.set(sessionID, slot)
+      incrementActiveCompute(sessionID, slot)
+      resume(Effect.void)
+      return
+    }
+
+    const waiterId = "cwait_" + sessionID + "_" + (++leaseClock)
+    const tier: LeaseTier =
+      sessionTierMap.get(sessionID) ?? (slot % 3 === 0 ? "384k" : "128k")
+    const waiter: ComputeWaiter = {
+      id: waiterId,
+      sessionID,
+      slot,
+      tier,
+      enqueuedAtMs: options?.enqueuedAtMs ?? Date.now(),
+      bypassedWaves: 0,
+      grant: () => {
+        resume(Effect.void)
+      },
+    }
+    computeWaiters.push(waiter)
+
+    return Effect.sync(() => {
+      const idx = computeWaiters.findIndex((w) => w.id === waiterId)
+      if (idx !== -1) {
+        computeWaiters.splice(idx, 1)
+      }
+    })
+  }).pipe(
+    Effect.onInterrupt(() =>
+      Effect.sync(() => {
+        removeComputeWaitersForSession(sessionID)
+      }),
+    ),
+  )
+}
+
+export function withComputeTurnstile<A, E, R>(
+  sessionID: string,
+  slot: number | undefined,
+  use: () => Effect.Effect<A, E, R>,
+  options?: { enqueuedAtMs?: number },
+): Effect.Effect<A, E, R> {
+  if (slot === undefined || slot < 0) {
+    return use()
+  }
+
+  return Effect.suspend(() => {
+    if (activeComputeSlotBySession.get(sessionID) !== undefined) {
+      incrementActiveCompute(sessionID, slot)
+      return use().pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            decrementActiveCompute(sessionID)
+            completeDeferredReleasesIfIdle(normalizeComputeSessionID(sessionID))
+          }),
+        ),
+      )
+    }
+
+    return acquireComputePermit(sessionID, slot, options).pipe(
+      Effect.andThen(() => use()),
+      Effect.ensuring(
+        Effect.sync(() => {
+          releaseComputePermit(sessionID)
+        }),
+      ),
+    )
+  })
+}
+
+export function getTelemetry(): ComputeTurnstileTelemetry {
+  return {
+    activeComputeStreamsCount: activeComputeSlotBySession.size,
+    queuedComputeWaitersCount: computeWaiters.length,
+    maxComputeStreams: resolveMaxComputeStreams(),
+    deferredReleaseSessions: pendingDeferredReleaseSessions.size,
+    deferredReleaseSessionIds: Array.from(pendingDeferredReleaseSessions.keys()),
+    quarantinedConversations: quarantinedConversations.size,
+    activeComputeSlots: Array.from(activeComputeSlotBySession.entries()).map(([sessionID, slot]) => ({
+      sessionID,
+      slot,
+    })),
+    queuedComputeWaiters: computeWaiters.map((w) => ({
+      sessionID: w.sessionID,
+      slot: w.slot,
+      tier: w.tier,
+      enqueuedAtMs: w.enqueuedAtMs,
+      bypassedWaves: w.bypassedWaves,
+    })),
+  }
+}
+
+function performImmediateRelease(sessionID: string, options?: { purge?: boolean }): void {
+  pendingDeferredReleaseSessions.delete(sessionID)
   let releasedSlot: PhysicalSlotID | undefined
   for (const s of SLOTS) {
     if (activeSessionsBySlot[s].has(sessionID)) {
@@ -768,6 +1483,70 @@ export function release(sessionID: string): void {
     generation++
     drainWaiters()
   }
+
+  if (options?.purge) {
+    sessionSlotMap.delete(sessionID)
+    sessionTierMap.delete(sessionID)
+    sessionConversationMap.delete(sessionID)
+    childParentMap.delete(sessionID)
+  }
+}
+
+export function release(sessionID: string): void {
+  const baseId = normalizeComputeSessionID(sessionID)
+  if (hasActiveComputeScope(baseId)) {
+    removeWaitersForSession(baseId)
+    const computeSlot =
+      activeComputeBySession.get(baseId)?.slot ??
+      activeComputeSlotBySession.get(baseId) ??
+      activeComputeSlotBySession.get(`${baseId}:background_compaction`) ??
+      sessionSlotMap.get(baseId)
+    if (computeSlot !== undefined && computeSlot >= 0 && computeSlot <= 8) {
+      const phys = computeSlot as PhysicalSlotID
+      activeSessionsBySlot[phys].add(baseId)
+      recordPin(baseId, phys)
+    }
+    const prev = pendingDeferredReleaseSessions.get(baseId)
+    pendingDeferredReleaseSessions.set(baseId, {
+      purge: Boolean(prev?.purge),
+    })
+    generation++
+    return
+  }
+
+  performImmediateRelease(baseId)
+}
+
+function performReleaseSubagentSession(sessionID: string, options?: { purge?: boolean }): void {
+  const baseId = normalizeComputeSessionID(sessionID)
+  removeWaitersForSession(baseId)
+  if (hasActiveComputeScope(baseId)) {
+    const computeSlot =
+      activeComputeBySession.get(baseId)?.slot ??
+      activeComputeSlotBySession.get(baseId) ??
+      activeComputeSlotBySession.get(`${baseId}:background_compaction`) ??
+      sessionSlotMap.get(baseId)
+    if (computeSlot !== undefined && computeSlot >= 0 && computeSlot <= 8) {
+      const phys = computeSlot as PhysicalSlotID
+      activeSessionsBySlot[phys].add(baseId)
+      recordPin(baseId, phys)
+    }
+    const prev = pendingDeferredReleaseSessions.get(baseId)
+    pendingDeferredReleaseSessions.set(baseId, {
+      purge: Boolean(prev?.purge || options?.purge),
+    })
+    generation++
+    return
+  }
+  performImmediateRelease(baseId, options)
+}
+
+export function releaseSubagentSession(
+  sessionID: string,
+  options?: { purge?: boolean },
+): Effect.Effect<void> {
+  performReleaseSubagentSession(sessionID, options)
+  return Effect.void
 }
 
 export function peek(sessionID: string, _isSubagent?: boolean): SlotID | undefined {
@@ -798,8 +1577,35 @@ export function reset(): void {
   conversations.clear()
   conversationBlockMap.clear()
   waiterQueue.length = 0
+  activeComputeSlotBySession.clear()
+  activeComputeBySession.clear()
+  pendingDeferredReleaseSessions.clear()
+  quarantinedConversations.clear()
+  computeWaiters.length = 0
   leaseClock = 0
   generation = 1
+  applyInitialBackendCapacities()
+}
+
+export function resetForTesting(): void {
+  reset()
+  if (!process.env.AQUANOX_BACKEND_CTX_SIZE) {
+    backendLeadBlockTokens = DEFAULT_LEAD_BLOCK_TOKENS
+    backendQuantumTokens = DEFAULT_QUANTUM_TOKENS
+    backendSlotCapacities = {}
+    backendReconciled = false
+    configuredModelContextTokens = undefined
+  }
+}
+
+export function withSubagentLease<A, E, R>(
+  sessionID: string,
+  use: (slot: SlotID) => Effect.Effect<A, E, R>,
+  options?: { parentSessionID?: string; tier?: LeaseTier },
+): Effect.Effect<A, E, R> {
+  const parentID = options?.parentSessionID ?? childParentMap.get(sessionID)
+  const tier = options?.tier ?? sessionTierMap.get(sessionID) ?? "128k"
+  return withTierLease({ sessionID, parentSessionID: parentID, tier }, use)
 }
 
 export function withLease<A, E, R>(
@@ -816,6 +1622,50 @@ export function withLease<A, E, R>(
     Effect.sync(() => acquire(sessionID, false)),
     (slot) => use(slot),
     () => Effect.sync(() => release(sessionID)),
+  )
+}
+
+export function withGpuToolSlotPolicy<A, E, R>(
+  sessionID: string,
+  use: () => Effect.Effect<A, E, R>,
+  options?: { suspendMode?: "keep_reserved" | "evict_and_reacquire" | "save_full_state" },
+): Effect.Effect<A, E, R> {
+  const rawMode = options?.suspendMode ?? "keep_reserved"
+  const suspendMode =
+    rawMode === "save_full_state" && process.env.AQUANOX_FULL_SLOT_STATE_SAVE !== "1"
+      ? "keep_reserved"
+      : rawMode
+
+  if (suspendMode !== "evict_and_reacquire") {
+    return use().pipe(
+      Effect.onInterrupt(() =>
+        Effect.sync(() => {
+          removeWaitersForSession(sessionID)
+        }),
+      ),
+    )
+  }
+
+  return Effect.gen(function* () {
+    const parentID = childParentMap.get(sessionID)
+    const tier = sessionTierMap.get(sessionID) ?? "128k"
+    release(sessionID)
+    sessionSlotMap.delete(sessionID)
+    const result = yield* use()
+    yield* acquireSubagentAsync({ sessionID, parentSessionID: parentID, tier }).pipe(
+      Effect.onInterrupt(() =>
+        Effect.sync(() => {
+          removeWaitersForSession(sessionID)
+        }),
+      ),
+    )
+    return result
+  }).pipe(
+    Effect.onInterrupt(() =>
+      Effect.sync(() => {
+        removeWaitersForSession(sessionID)
+      }),
+    ),
   )
 }
 
@@ -850,8 +1700,10 @@ export function getResourceSnapshot(query?: {
   const slots = SLOTS.map((s) => {
     const b = Math.floor(s / 3) as 0 | 1 | 2
     const lockedBy384k = blockMode[b] === "384k_locked" && s % 3 !== 0
-    const capacityTokens: 131072 | 393216 =
-      blockMode[b] === "384k_locked" && s % 3 === 0 ? 393216 : 131072
+    const capacityTokens: number =
+      blockMode[b] === "384k_locked" && s % 3 === 0
+        ? backendLeadBlockTokens
+        : (backendSlotCapacities[s] ?? backendQuantumTokens)
     const pinned = Array.from(sessionSlotMap.entries()).find(([_, slot]) => slot === s)?.[0]
     return {
       slotId: s,
@@ -906,6 +1758,8 @@ export function getResourceSnapshot(query?: {
     thisConversation = {
       conversationId: conv.conversationId,
       leadContextTier: "384k",
+      leadContextTokens: backendLeadBlockTokens,
+      subagentQuantumTokens: backendQuantumTokens,
       leadSlotId: conv.leadSlotId,
       reservedSubagents128k: conv.reservedSubagentQuanta,
       activeSubagents: conv.activeSubagentCount,
@@ -918,19 +1772,60 @@ export function getResourceSnapshot(query?: {
     }
   }
 
+  const lockedLeadBlocks = BUDDY_BLOCKS.filter((b) => blockMode[b] === "384k_locked").length
+  let standaloneLeads = 0
+  let standaloneSubagents = 0
+  for (const s of SLOTS) {
+    for (const sessId of activeSessionsBySlot[s]) {
+      if (!sessionConversationMap.has(sessId)) {
+        const isSub = childParentMap.has(sessId) || sessionTierMap.get(sessId) === "128k"
+        if (isSub) {
+          standaloneSubagents += 1
+        } else {
+          standaloneLeads += 1
+        }
+      }
+    }
+  }
+  const activeLeads = Math.max(conversations.size, lockedLeadBlocks, standaloneLeads)
+  const committedSubagentQuanta =
+    Array.from(conversations.values()).reduce(
+      (sum, c) => sum + Math.max(c.reservedSubagentQuanta, c.activeSubagentQuanta),
+      0,
+    ) + standaloneSubagents
+  const subagentCommitmentsMib = committedSubagentQuanta * 2048
+
+  const capacityMismatch =
+    configuredModelContextTokens !== undefined && configuredModelContextTokens !== backendLeadBlockTokens
+
   return {
+    protocolVersion: aquanox_slot_lease_v12_0,
     generation,
     totalQuanta128k: 9,
-    totalTokens: 1179648,
+    totalTokens: 9 * backendQuantumTokens,
     committedQuanta128k,
     activeQuanta128k: activeQuanta,
     unreservedFreeQuanta128k,
-    unreservedFreeTokens: unreservedFreeQuanta128k * 131072,
+    unreservedFreeTokens: unreservedFreeQuanta128k * backendQuantumTokens,
     freeFullBlocks384k,
     canAdmitNewLeadConversation,
+    activeLeads,
+    subagentCommitmentsMib,
+    active_leads: activeLeads,
+    subagent_commitments_mib: subagentCommitmentsMib,
+    backendReconciled,
+    backendLeadBlockTokens,
+    backendQuantumTokens,
+    ...(configuredModelContextTokens !== undefined ? { configuredContextTokens: configuredModelContextTokens } : {}),
+    capacityMismatch,
+    deferredReleaseSessions: pendingDeferredReleaseSessions.size,
+    deferredReleaseSessionIds: Array.from(pendingDeferredReleaseSessions.keys()),
+    quarantinedConversations: quarantinedConversations.size,
     blocks,
     slots,
     conversations: convList,
     thisConversation,
   }
 }
+
+export const snapshot = getResourceSnapshot

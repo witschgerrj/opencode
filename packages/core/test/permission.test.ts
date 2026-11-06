@@ -113,6 +113,22 @@ describe("Permission", () => {
     }),
   )
 
+  it.effect("defaults generate_image and godot_sandbox to allow without asking when unconfigured", () =>
+    Effect.gen(function* () {
+      yield* setup([])
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ action: "generate_image", resources: ["*"] }))).toEqual({
+        id: Permission.ID.create("per_test"),
+        effect: "allow",
+      })
+      expect(yield* service.ask(assertion({ action: "godot_sandbox", resources: ["*"] }))).toEqual({
+        id: Permission.ID.create("per_test"),
+        effect: "allow",
+      })
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("evaluates against an explicit agent", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])

@@ -1,20 +1,21 @@
 ---
 name: opencode-mcp-servers
-description: config auth integrate OpenCode MCP servers CLI OAuth stdio HTTP codemode
+description: Configure authenticate and sandbox OpenCode MCP servers stdio cgroup leaf units and environment scrubbing
 ---
 
 # OpenCode MCP Servers
 
-OpenCode V2 connects local (`stdio`) + remote (Streamable HTTP) Model Context Protocol servers. Exposes tools, prompts, resources, init instructions under session permissions + policies.
+OpenCode V2 connects local (`stdio`) and remote (Streamable HTTP) Model Context Protocol servers under session permissions, policy gates, and systemd cgroup leaf isolation.
 
 ## Scope & Boundaries
 
-- **Owns**: `mcp.servers`, `mcp.timeout` config, `opencode mcp` CLI (`add`, `list`, `auth`, `logout`), `/mcps`, OAuth registration modes (pre-registered, CIMD, DCR) vs `oauth: false`, `protocol` (`legacy`, `auto`, `2026-07-28`), `<server>_<tool>` + `/<server>:<prompt>` name normalization, `codemode` toggle, `list_mcp_resources` / `read_mcp_resource` rules, conditional `<mcp_instructions>`, mid-call elicitation, `_meta["ai.opencode/sessionID"]`, `@opencode/client` `mcp.*` wire endpoints.
+- **Owns**: `mcp.servers`, `mcp.timeout` config, `opencode mcp` CLI (`add`, `list`, `auth`, `logout`), `/mcps`, OAuth registration modes (pre-registered, CIMD, DCR) vs `oauth: false`, `stdio` cgroup leaf units (`cgroup-wrap.ts`), stdio environment scrubbing (`env-scrub.ts`), `:8080` bypass prevention, `codemode` toggle, `list_mcp_resources` / `read_mcp_resource` rules, conditional `<mcp_instructions>`, `_meta["ai.opencode/sessionID"]`.
 - **Sibling skills**:
-  - `opencode-tools` — built-in model tools, JS `execute` Code Mode sandbox.
+  - `opencode-tools` — built-in model tools, two-tier leaf cgroup specs, JS `execute` Code Mode sandbox.
+  - `opencode-agents` — agent definitions, Buddy slot leasing, GPU tool slot policies.
+  - `opencode-session-lifecycle` — session creation, `Session.remove`, unleased inference prevention.
   - `opencode-permissions` + `opencode-policies` — permission eval order, `integration.use` (`mcp:<server>`) hard blocks.
   - `opencode-human-input` — interactive form validation, reply/cancel wire contracts for elicitation forms.
-  - `opencode-plugins` — in-proc OpenCode TS/JS plugins.
 
 Read `references/mcp-config-oauth-wire.md` for schemas, OAuth tables, timeout defaults, REST/SDK endpoints.
 
@@ -28,11 +29,21 @@ Read `references/mcp-config-oauth-wire.md` for schemas, OAuth tables, timeout de
 2. **Choose auth mode (OAuth vs static headers) on remote servers**:
    - Remote Streamable HTTP defaults to OAuth PKCE + discovery + refresh. Login via `/mcps` or `opencode mcp auth [server]`; clear tokens via `opencode mcp logout <server>`.
    - Set `"oauth": false` ONLY for static headers (`{env:VAR}` substitution, never `$VAR`).
-   - Client registration priority: `oauth.client_id` (pre-registered, `snake_case` fields) → Client ID Metadata Document (CIMD, if auth server supports + `oauth.redirect_uri` omitted) → Dynamic Client Registration (DCR).
+   - Client registration priority: `oauth.client_id` (pre-registered) → Client ID Metadata Document (CIMD) → Dynamic Client Registration (DCR).
 3. **Control tool exposure (`codemode`), resources, permissions**:
    - Default (`"codemode": true`): MCP tools live inside `execute` at `tools.<normalized_server>.<normalized_tool>(...)` (saves tool-schema tokens).
    - Set `"codemode": false` if model reqs direct native tool defs or `execute` denied.
    - Gate tools via `<server>_<tool>` (`resource: "*"`). Gate resources via `opencode_list_mcp_resources` (`<server>`) + `opencode_read_mcp_resource` (`<server>:<uri>`).
+
+## Stdio MCP Cgroup Containment & Credential Scrubbing (`mcp/stdio.ts`)
+
+Every local stdio MCP server process spawned by `packages/core/src/mcp/stdio.ts` is sandboxed within a bounded systemd leaf unit:
+
+| Isolation Layer | Implementation | Security / Resource Contract |
+| :--- | :--- | :--- |
+| **Two-Tier Cgroup Wrap** | `buildSystemdLeafWrapCommand` | Stdio servers default to **`build_test`** (`BUILD_TEST_SPEC`) tier under `aquanox-subprocs.slice` (`MemoryHigh=6144M`, `MemoryMax=8192M`, `MemorySwapMax=0`, `OOMPolicy=kill`, `OOMScoreAdjust=300`, `AllowedCPUs=32-63`, `--nice=10`). Prevents rogue or leaking MCP servers from destabilizing host RAM or inference CPUs (`0-31`). |
+| **Credential Scrubbing** | `scrubChildEnvironment(options.environment)` | Strips `OPENCODE_SERVER_PASSWORD`, `AQUANOX_BROKER_SECRET`, `AQUANOX_LLM_API_KEY`, `AQUANOX_ADMIN_TOKEN`, `OPENCODE_CREDENTIAL_*`, `AQUANOX_SECRET_*` from MCP process environment. |
+| **Direct `:8080` Bypass Block** | Server-side bearer key + explicit slot check | `:8080` requires Bearer token (`--api-key-file /run/deepseek-flash-admin/inference.key`) held only in dump-disabled `MainPID` memory. Rejects missing/negative `id_slot` with `HTTP 400 Bad Request`. MCP child processes cannot hijack inference slots. |
 
 ## Key Invariants & Gotchas
 

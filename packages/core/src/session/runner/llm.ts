@@ -283,6 +283,25 @@ export const computeCausalReasoningBudget = (input: {
   return budget
 }
 
+export const capLiveReconciledReasoningBudget = (
+  budget: number,
+  input: {
+    readonly isSubagent: boolean
+    readonly isTurnEntry: boolean
+    readonly isSynthesizing: boolean
+    readonly hasErrorOrDiagnostic: boolean
+  },
+): number => {
+  if (budget <= 0) return 0
+  if (input.isSubagent) {
+    return Math.min(budget, 384)
+  }
+  if (input.isTurnEntry || input.hasErrorOrDiagnostic) {
+    return Math.min(budget, 512)
+  }
+  return Math.min(budget, 256)
+}
+
 export const resolveStepRouting = (input: {
   readonly session: SessionSchema.Info
   readonly agent: { readonly id: Agent.ID; readonly info: Agent.Info }
@@ -312,6 +331,9 @@ export const resolveStepRouting = (input: {
   }
 
   const id_slot = SessionSlotLease.acquire(input.session.id, isSubagent)
+  if (id_slot < 0) {
+    throw new Error(`ERR_SLOT_LEASE_REQUIRED: No leased slot available for session ${input.session.id}`)
+  }
   const defaultBody = input.model.model.route.defaults.http?.body
   const rawBudget =
     defaultBody !== undefined && typeof defaultBody === "object" && defaultBody !== null
@@ -322,7 +344,7 @@ export const resolveStepRouting = (input: {
   const isExplore =
     String(input.agent.id).toLowerCase() === "explore" || String(input.agent.info.name).toLowerCase() === "explore"
 
-  const reasoning_budget_tokens = computeCausalReasoningBudget({
+  const rawComputedBudget = computeCausalReasoningBudget({
     messages: input.messages,
     variant,
     configuredBudget,
@@ -333,6 +355,19 @@ export const resolveStepRouting = (input: {
   })
 
   const analysis = analyzeCausalStep(input.messages)
+  const isLiveReconciledRuntime =
+    SessionSlotLease.isBackendReconciled() &&
+    !process.env.BUN_TEST &&
+    process.env.NODE_ENV !== "test" &&
+    !process.argv.some((arg) => arg.includes(".test.") || arg === "test")
+  const reasoning_budget_tokens = isLiveReconciledRuntime
+    ? capLiveReconciledReasoningBudget(rawComputedBudget, {
+        isSubagent,
+        isTurnEntry: analysis.isTurnEntry,
+        isSynthesizing,
+        hasErrorOrDiagnostic: analysis.hasErrorOrDiagnostic,
+      })
+    : rawComputedBudget
 
   return {
     toolChoice,
@@ -396,6 +431,7 @@ const layer = Layer.effect(
         hasMetrics: boolean
       }
       let activeTurn: ActiveTurnTrace | null = null
+      let isSubagentSession = false
 
       const ensureTurnStarted = Effect.fnUntraced(function* (
         session: SessionSchema.Info,
@@ -634,17 +670,32 @@ const layer = Layer.effect(
         while (true) {
           const next = yield* advanceToStep()
           if (next._tag !== "Ready") {
-            SessionSlotLease.release(sessionID)
+            if (isSubagentSession) {
+              SessionSlotLease.releaseSubagentSession(sessionID, { purge: false })
+            } else {
+              SessionSlotLease.release(sessionID)
+            }
             yield* finishActiveTurn("ok")
             return next
           }
+          isSubagentSession = Boolean(next.context.session.parentID)
           if (next.context.session.parentID && supportsLocalSlotAndReasoningBudget(next.context.model)) {
-            SessionSlotLease.acquire(next.context.session.id, true)
+            const tier = SessionSlotLease.getSessionTier(next.context.session.id) ?? "128k"
+            yield* SessionSlotLease.acquireSubagentAsync({
+              sessionID: next.context.session.id,
+              parentSessionID: next.context.session.parentID,
+              tier,
+            })
           }
           yield* ensureTurnStarted(next.context.session, next.context.agent.id, next.context.model.ref)
           continuing = yield* runStep(next.context, step, recordTurnMetrics)
           if (!continuing) {
-            SessionSlotLease.release(sessionID)
+            yield* compaction.interruptPrecompute(sessionID)
+            if (isSubagentSession) {
+              SessionSlotLease.releaseSubagentSession(sessionID, { purge: false })
+            } else {
+              SessionSlotLease.release(sessionID)
+            }
             yield* finishActiveTurn("ok")
           }
           step++
@@ -652,12 +703,19 @@ const layer = Layer.effect(
           entering = false
         }
       }).pipe(
-        Effect.onExit((exit) => {
-          SessionSlotLease.release(sessionID)
-          return finishActiveTurn(
-            Exit.isFailure(exit) ? (Exit.hasInterrupts(exit) ? "cancelled" : "error") : "ok",
-          )
-        }),
+        Effect.onExit((exit) =>
+          Effect.gen(function* () {
+            yield* compaction.interruptPrecompute(sessionID)
+            if (isSubagentSession || activeTurn?.corr.isSubagent) {
+              SessionSlotLease.releaseSubagentSession(sessionID, { purge: false })
+            } else {
+              SessionSlotLease.release(sessionID)
+            }
+            return yield* finishActiveTurn(
+              Exit.isFailure(exit) ? (Exit.hasInterrupts(exit) ? "cancelled" : "error") : "ok",
+            )
+          }),
+        ),
       )
     })
 
@@ -688,8 +746,43 @@ const layer = Layer.effect(
       let recoverContinuation = true
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
-        const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
+        const rawLoaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
+        const isLocalBudgeted = supportsLocalSlotAndReasoningBudget(rawLoaded.model)
+        if (
+          isLocalBudgeted &&
+          !SessionSlotLease.isBackendReconciled() &&
+          process.env.NODE_ENV !== "test" &&
+          !process.env.BUN_TEST
+        ) {
+          yield* Effect.promise(() =>
+            SessionSlotLease.reconcileBackendSlotCapacities(rawLoaded.model.model.route.endpoint.baseURL, {
+              configuredContextTokens: rawLoaded.model.limit.context,
+            }).catch(() => false),
+          )
+        }
+        const isSubagentStep = Boolean(rawLoaded.session.parentID)
+        const stepTier: SessionSlotLease.LeaseTier = isSubagentStep
+          ? (SessionSlotLease.getSessionTier(rawLoaded.session.id) ?? "128k")
+          : "384k"
+        const preSlot = isLocalBudgeted ? SessionSlotLease.peek(rawLoaded.session.id, isSubagentStep) : undefined
+        const loaded =
+          isLocalBudgeted && SessionSlotLease.isBackendReconciled()
+            ? {
+                ...rawLoaded,
+                model: {
+                  ...rawLoaded.model,
+                  limit: {
+                    ...rawLoaded.model.limit,
+                    context: SessionSlotLease.getEffectiveSlotContextLimit(
+                      preSlot,
+                      stepTier,
+                      rawLoaded.model.limit.context,
+                    ),
+                  },
+                },
+              }
+            : rawLoaded
         const estimate = SessionCompaction.estimatePrompt(loaded)
         const compacted = yield* compaction.compact({ reason: "auto", context: loaded, estimate })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
@@ -719,11 +812,25 @@ const layer = Layer.effect(
           messages: loaded.messages,
           stepLimitReached,
         })
+        const stepModel =
+          isLocalBudgeted && SessionSlotLease.isBackendReconciled() && routing.httpBody?.id_slot !== undefined
+            ? {
+                ...loaded.model,
+                limit: {
+                  ...loaded.model.limit,
+                  context: SessionSlotLease.getEffectiveSlotContextLimit(
+                    routing.httpBody.id_slot,
+                    stepTier,
+                    loaded.model.limit.context,
+                  ),
+                },
+              }
+            : loaded.model
         const prepared = yield* context.request
           .primary({
             session: loaded.session,
             agent: loaded.agent.id,
-            model: loaded.model,
+            model: stepModel,
             tools: loaded.tools,
             system: transcript.system,
             messages: stepLimitReached
@@ -756,50 +863,56 @@ const layer = Layer.effect(
               executeTool: prepared.executeTool,
             })),
           )
-        const outcome = yield* steps.attempt({
-          isLocationClosed: lifecycle.isClosed,
+        yield* compaction.interruptPrecompute(sessionID)
+        const outcome = yield* SessionSlotLease.withComputeTurnstile(
           sessionID,
-          assistantMessageID,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          prepared: {
-            ...prepared,
-            // A tool call can arrive during a reload; its permission check reads the session's agent.
-            executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
-          },
-          retry: (cause, error, proposed) =>
-            retry.decide({
-              cause,
-              error,
+          routing.httpBody?.id_slot,
+          () =>
+            steps.attempt({
+              isLocationClosed: lifecycle.isClosed,
+              sessionID,
+              assistantMessageID,
               agent: loaded.agent.id,
-              model: loaded.model.ref,
-              hook: prepared.retry,
-              retry: proposed,
+              model: loaded.model,
+              prepared: {
+                ...prepared,
+                // A tool call can arrive during a reload; its permission check reads the session's agent.
+                executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
+              },
+              retry: (cause, error, proposed) =>
+                retry.decide({
+                  cause,
+                  error,
+                  agent: loaded.agent.id,
+                  model: loaded.model.ref,
+                  hook: prepared.retry,
+                  retry: proposed,
+                }),
+              recoverContinuation,
+              recoverOverflow: Effect.suspend(() =>
+                recoverOverflow
+                  ? compaction
+                      .compact({ reason: "overflow", context: loaded, estimate })
+                      .pipe(Effect.map((result) => result.status === "completed"))
+                  : Effect.succeed(false),
+              ),
+              ...(stepCorr && stepSpanId
+                ? {
+                    aquanox: {
+                      stepSpanId,
+                      parentSpanId: AquanoxTrace.getActiveTurnSpan(sessionID) ?? stepCorr.parentTurnSpanId,
+                      conversationId: stepCorr.conversationId,
+                      rootSessionId: stepCorr.rootSessionId,
+                      parentSessionId: stepCorr.parentSessionId,
+                      isSubagent: stepCorr.isSubagent,
+                      thinkingMode: stepThinkingMode,
+                      stepNumber: step,
+                      onMetrics: (metrics) => onTurnMetrics?.(metrics, stepModelLabel, stepThinkingMode),
+                    },
+                  }
+                : {}),
             }),
-          recoverContinuation,
-          recoverOverflow: Effect.suspend(() =>
-            recoverOverflow
-              ? compaction
-                  .compact({ reason: "overflow", context: loaded, estimate })
-                  .pipe(Effect.map((result) => result.status === "completed"))
-              : Effect.succeed(false),
-          ),
-          ...(stepCorr && stepSpanId
-            ? {
-                aquanox: {
-                  stepSpanId,
-                  parentSpanId: AquanoxTrace.getActiveTurnSpan(sessionID) ?? stepCorr.parentTurnSpanId,
-                  conversationId: stepCorr.conversationId,
-                  rootSessionId: stepCorr.rootSessionId,
-                  parentSessionId: stepCorr.parentSessionId,
-                  isSubagent: stepCorr.isSubagent,
-                  thinkingMode: stepThinkingMode,
-                  stepNumber: step,
-                  onMetrics: (metrics) => onTurnMetrics?.(metrics, stepModelLabel, stepThinkingMode),
-                },
-              }
-            : {}),
-        })
+        )
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           Completed: Effect.fnUntraced(function* (outcome) {
             // The Session is about to go idle, which leaves the background summary time to finish.

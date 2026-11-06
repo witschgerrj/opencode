@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { DateTime, Effect, Layer } from "effect"
+import { DateTime, Effect, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Global } from "@opencode/util/global"
@@ -14,14 +14,19 @@ import { Job } from "@opencode/core/job"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
+import { SessionEvent } from "@opencode/core/session/event"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunnerLLM } from "@opencode/core/session/runner/llm"
+import { SessionSlotLease } from "@opencode/core/session/slot-lease"
 import { SessionStore } from "@opencode/core/session/store"
+import { Shell } from "@opencode/core/shell"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Permission } from "@opencode/core/permission"
+import { AquanoxTrace } from "@opencode/core/session/aquanox-trace"
+import { ScheduleTool } from "@opencode/core/tool/plugin/schedule"
 import { SendMessageTool } from "@opencode/core/tool/plugin/send-message"
 import { Tool } from "@opencode/core/tool"
 import { tmpdir } from "./fixture/tmpdir"
@@ -60,9 +65,11 @@ const sendMessagePluginSupervisor = makeLocationNode({
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
       yield* registerToolPlugin(SendMessageTool.Plugin, {}, (name, callback) => hooks.register("tool", name, callback))
+      yield* registerToolPlugin(ScheduleTool.Plugin, {}, (name, callback) => hooks.register("tool", name, callback))
     }),
   ),
   deps: [
+    Global.node,
     Agent.node,
     Config.node,
     Model.node,
@@ -113,6 +120,7 @@ const setupLocation = (location: Location.Ref) =>
           agent.permissions.push(
             { action: "*", resource: "*", effect: "deny" },
             { action: "send_message", resource: "*", effect: "allow" },
+            { action: "send_message", resource: "delete:*", effect: "deny" },
           )
         })
       }),
@@ -136,6 +144,24 @@ const callSendMessage = (
           type: "tool-call",
           id: "call-send-msg-" + Math.random().toString(36).slice(2),
           name: "send_message",
+          input,
+        },
+      }),
+    ).pipe(Effect.provide(locations.get(location)))
+  })
+
+const callSchedule = (location: Location.Ref, sessionID: Session.ID, input: Record<string, unknown>) =>
+  Effect.gen(function* () {
+    const locations = yield* LocationServiceMap.Service
+    return yield* Tool.Service.use((registry) =>
+      executeTool(registry, {
+        sessionID,
+        agent: toolIdentity.agent,
+        messageID: toolIdentity.messageID,
+        call: {
+          type: "tool-call",
+          id: "call-sched-" + Math.random().toString(36).slice(2),
+          name: "schedule",
           input,
         },
       }),
@@ -419,6 +445,299 @@ describe("SendMessageTool — intra-conversation and cross-conversation agent me
       })
       expect(selfErr.status).toBe("error")
       expect(selfErr.error?.message).toContain("Cannot send an agent message to yourself")
+    }),
+  )
+
+  it.live("enforces Propose -> Approve flow, owner isolation, and safety exclusions for action='delete'", () =>
+    Effect.gen(function* () {
+      const dir = yield* Effect.promise(() => tmpdir())
+      const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+      yield* setupLocation(location)
+
+      const locations = yield* LocationServiceMap.Service
+      const sessions = yield* Session.Service
+
+      const callerRoot = yield* sessions.create({
+        location,
+        title: "Active Caller Conversation",
+        metadata: { aquanoxConversationId: "task_caller", aquanoxOwnerUserId: "user_alice" },
+      })
+      const deletableA = yield* sessions.create({
+        location,
+        title: "Old Idle Conversation A",
+        metadata: { aquanoxConversationId: "task_del_a", aquanoxOwnerUserId: "user_alice" },
+      })
+      const deletableB = yield* sessions.create({
+        location,
+        title: "Old Idle Conversation B",
+        metadata: { aquanoxConversationId: "task_del_b", aquanoxOwnerUserId: "user_alice" },
+      })
+      const otherOwnerConv = yield* sessions.create({
+        location,
+        title: "Bob Private Conversation",
+        metadata: { aquanoxConversationId: "task_bob", aquanoxOwnerUserId: "user_bob" },
+      })
+      const unconfirmedStopConv = yield* sessions.create({
+        location,
+        title: "Unconfirmed Stop Conversation",
+        metadata: {
+          aquanoxConversationId: "task_unconfirmed",
+          aquanoxOwnerUserId: "user_alice",
+          aquanoxWorkerStopUnconfirmed: true,
+        },
+      })
+      const recoveryConv = yield* sessions.create({
+        location,
+        title: "Recovery Required Conversation",
+        metadata: {
+          aquanoxConversationId: "task_recovery",
+          aquanoxOwnerUserId: "user_alice",
+          aquanoxRecoveryRequired: true,
+        },
+      })
+      const revertIntentConv = yield* sessions.create({
+        location,
+        title: "Staged Revert Conversation",
+        metadata: {
+          aquanoxConversationId: "task_revert",
+          aquanoxOwnerUserId: "user_alice",
+        },
+      })
+      const bus = yield* Bus.Service
+      yield* bus.publish(SessionEvent.RevertEvent.Staged, {
+        sessionID: revertIntentConv.id,
+        revert: {
+          messageID: SessionMessage.ID.create(),
+          files: [],
+        },
+      })
+      const pendingInboxConv = yield* sessions.create({
+        location,
+        title: "Pending Inbox Conversation",
+        metadata: {
+          aquanoxConversationId: "task_inbox",
+          aquanoxOwnerUserId: "user_alice",
+        },
+      })
+      yield* sessions.synthetic({
+        sessionID: pendingInboxConv.id,
+        text: "Queued follow-up message",
+        delivery: "queue",
+        resume: false,
+      })
+
+      // 0. AquanoxTrace.mergeHeaderMetadata extracts x-aquanox-owner-user-id -> aquanoxOwnerUserId
+      const mergedMeta = AquanoxTrace.mergeHeaderMetadata(
+        {
+          "x-aquanox-conversation-id": "task_hdr_1",
+          "x-aquanox-owner-user-id": "user_alice",
+        },
+        undefined,
+      )
+      expect(mergedMeta).toEqual({
+        aquanoxConversationId: "task_hdr_1",
+        aquanoxOwnerUserId: "user_alice",
+      })
+
+      // 0b. Cross-owner isolation blocks Alice from reading or sending to Bob's session/conversation
+      const crossReadBySes = yield* callSendMessage(location, callerRoot.id, {
+        action: "read",
+        recipient: otherOwnerConv.id,
+      })
+      expect(crossReadBySes.status).toBe("error")
+      expect(crossReadBySes.error?.message).toContain("belongs to another account")
+
+      const crossSendByTask = yield* callSendMessage(location, callerRoot.id, {
+        action: "send",
+        recipient: "task_bob",
+        message: "Attempt cross-owner send",
+      })
+      expect(crossSendByTask.status).toBe("error")
+      expect(crossSendByTask.error?.message).toContain("Could not resolve recipient")
+
+      // 1. Read-only explore agent is denied delete:* before any proposal is staged
+      const exploreBlocked = yield* callSendMessage(
+        location,
+        callerRoot.id,
+        { action: "delete", recipient: "task_del_a" },
+        Agent.ID.make("explore"),
+      )
+      expect(exploreBlocked.status).toBe("error")
+      expect(exploreBlocked.error?.message).toContain("Permission denied")
+
+      // 2. Self-deletion, invalid 'before' timestamp, and explicit targeting of stopping conversation are rejected immediately
+      const selfDelete = yield* callSendMessage(location, callerRoot.id, {
+        action: "delete",
+        recipient: "task_caller",
+      })
+      expect(selfDelete.status).toBe("error")
+      expect(selfDelete.error?.message).toContain("Cannot delete the currently running conversation")
+
+      const badBefore = yield* callSendMessage(location, callerRoot.id, {
+        action: "delete",
+        before: "not-a-timestamp",
+      })
+      expect(badBefore.status).toBe("error")
+      expect(badBefore.error?.message).toContain("Invalid ISO timestamp for 'before'")
+
+      const explicitStopping = yield* callSendMessage(location, callerRoot.id, {
+        action: "delete",
+        recipient: "task_unconfirmed",
+      })
+      expect(explicitStopping.status).toBe("error")
+      expect(explicitStopping.error?.message).toContain("currently active or stopping and cannot be deleted")
+
+      // Schedule a timer on deletableB to verify session.deleted automatically cancels it
+      const createTimerRes = yield* callSchedule(location, deletableB.id, {
+        action: "create_timer",
+        delaySeconds: 300,
+        prompt: "Delayed follow-up on deletableB",
+      })
+      expect(createTimerRes.status).toBe("completed")
+      const timerBeforeDelete = (createTimerRes.output as { schedule?: { id: string } }).schedule?.id
+      expect(timerBeforeDelete).toBeDefined()
+
+      // 2b. Rejecting a delete proposal leaves the conversation intact
+      const rejectFiber = yield* Effect.forkChild(
+        callSendMessage(location, callerRoot.id, {
+          action: "delete",
+          recipient: "task_del_a",
+        }),
+      )
+      let rejectReq: Permission.Request | undefined
+      for (let i = 0; i < 100 && !rejectReq; i++) {
+        const list = yield* Permission.Service.use((p) => p.forSession(callerRoot.id)).pipe(
+          Effect.provide(locations.get(location)),
+        )
+        rejectReq = list[0]
+        if (!rejectReq) yield* Effect.promise(() => Bun.sleep(5))
+      }
+      expect(rejectReq).toBeDefined()
+      yield* Permission.Service.use((p) =>
+        p.reply({
+          requestID: rejectReq!.id,
+          reply: "reject",
+          message: "Keep Old Idle Conversation A",
+        }),
+      ).pipe(Effect.provide(locations.get(location)))
+      const rejectedResult = yield* Fiber.join(rejectFiber)
+      expect(rejectedResult.status).toBe("error")
+      expect(rejectedResult.error?.message).toContain("Keep Old Idle Conversation A")
+      expect((yield* sessions.get(deletableA.id).pipe(Effect.option))._tag).toBe("Some")
+
+      // Bind a slot lease and background shell to deletableA to verify Session.remove purges both
+      SessionSlotLease.admitConversation({
+        conversationId: "task_del_a",
+        agentId: "general",
+        reservedSubagentQuanta: 0,
+      })
+      SessionSlotLease.bindConversationSession({ conversationId: "task_del_a", sessionID: deletableA.id })
+      expect(SessionSlotLease.getConversationIdForSession(deletableA.id)).toBe("task_del_a")
+
+      const shellDelA = yield* Shell.Service.use((sh) =>
+        sh.create({
+          command: "sleep 30",
+          metadata: { sessionID: deletableA.id },
+        }),
+      ).pipe(Effect.provide(locations.get(location)))
+      const shellCaller = yield* Shell.Service.use((sh) =>
+        sh.create({
+          command: "sleep 30",
+          metadata: { sessionID: callerRoot.id },
+        }),
+      ).pipe(Effect.provide(locations.get(location)))
+
+      // 2c. Filter matching 0 conversations returns clear diagnostic without staging a permission request
+      const emptyFilterRes = yield* callSendMessage(location, callerRoot.id, {
+        action: "delete",
+        olderThanHours: 999999,
+      })
+      expect(emptyFilterRes.status).toBe("error")
+      expect(emptyFilterRes.error?.message).toContain(
+        "No matching idle conversations associated with your account were found to delete",
+      )
+
+      // 3. Batch filter (olderThanHours: 0) stages an approval request with save=undefined ("Always allow" disabled),
+      //    includes only Alice's safe idle conversations (task_del_a, task_del_b), and excludes Bob's, active, and recovery/stopping ones
+      const deleteFiber = yield* Effect.forkChild(
+        callSendMessage(location, callerRoot.id, {
+          action: "delete",
+          olderThanHours: 0,
+        }),
+      )
+
+      // Poll until the permission request appears on callerRoot
+      let pendingReq: Permission.Request | undefined
+      for (let i = 0; i < 100 && !pendingReq; i++) {
+        const list = yield* Permission.Service.use((p) => p.forSession(callerRoot.id)).pipe(
+          Effect.provide(locations.get(location)),
+        )
+        pendingReq = list[0]
+        if (!pendingReq) yield* Effect.promise(() => Bun.sleep(5))
+      }
+
+      expect(pendingReq).toBeDefined()
+      expect(pendingReq?.action).toBe("send_message")
+      expect(pendingReq?.save).toBeUndefined()
+      expect(pendingReq?.metadata?.kind).toBe("conversation_delete_proposal")
+      expect(pendingReq?.resources).toHaveLength(2)
+      expect(pendingReq?.resources.some((r) => r.startsWith("delete:task_del_a"))).toBe(true)
+      expect(pendingReq?.resources.some((r) => r.startsWith("delete:task_del_b"))).toBe(true)
+      expect(pendingReq?.resources.some((r) => r.includes("task_bob"))).toBe(false)
+      expect(pendingReq?.resources.some((r) => r.includes("task_unconfirmed"))).toBe(false)
+      expect(pendingReq?.resources.some((r) => r.includes("task_recovery"))).toBe(false)
+      expect(pendingReq?.resources.some((r) => r.includes("task_revert"))).toBe(false)
+      expect(pendingReq?.resources.some((r) => r.includes("task_inbox"))).toBe(false)
+
+      // Simulate Aquanox Harness respondToInteraction deleting deletableA via DELETE /api/session/:id
+      // right before forwarding the "once" permission reply to OpenCode
+      yield* sessions.remove(deletableA.id)
+      expect(SessionSlotLease.getConversationIdForSession(deletableA.id)).toBeUndefined()
+      const runningShellsAfterRemove = yield* Shell.Service.use((sh) => sh.list()).pipe(
+        Effect.provide(locations.get(location)),
+      )
+      expect(runningShellsAfterRemove.some((s) => s.id === shellDelA.id)).toBe(false)
+      expect(runningShellsAfterRemove.some((s) => s.id === shellCaller.id)).toBe(true)
+      yield* Shell.Service.use((sh) => sh.remove(shellCaller.id)).pipe(
+        Effect.provide(locations.get(location)),
+        Effect.ignore,
+      )
+
+      // Approve once ("once")
+      yield* Permission.Service.use((p) =>
+        p.reply({
+          requestID: pendingReq!.id,
+          reply: "once",
+        }),
+      ).pipe(Effect.provide(locations.get(location)))
+
+      const deleteResult = yield* Fiber.join(deleteFiber)
+      expect(deleteResult.status).toBe("completed")
+      const deleteOut = deleteResult.output as SendMessageTool.Output
+      expect(deleteOut.action).toBe("delete")
+      expect(deleteOut.deleted?.map((d) => d.conversationID)).toEqual(
+        expect.arrayContaining(["task_del_a", "task_del_b"]),
+      )
+
+      // Deleted sessions are gone, while excluded sessions remain intact
+      const delACheck = yield* sessions.get(deletableA.id).pipe(Effect.option)
+      const delBCheck = yield* sessions.get(deletableB.id).pipe(Effect.option)
+      const bobCheck = yield* sessions.get(otherOwnerConv.id).pipe(Effect.option)
+      const unconfirmedCheck = yield* sessions.get(unconfirmedStopConv.id).pipe(Effect.option)
+      const recoveryCheck = yield* sessions.get(recoveryConv.id).pipe(Effect.option)
+      expect(delACheck._tag).toBe("None")
+      expect(delBCheck._tag).toBe("None")
+      expect(bobCheck._tag).toBe("Some")
+      expect(unconfirmedCheck._tag).toBe("Some")
+      expect(recoveryCheck._tag).toBe("Some")
+
+      // Scheduled timer targeting deletableB was automatically cancelled on session.deleted
+      const listTimersAfter = yield* callSchedule(location, callerRoot.id, {
+        action: "list",
+      })
+      expect(listTimersAfter.status).toBe("completed")
+      const remainingSchedules = (listTimersAfter.output as { schedules: Array<{ id: string; status: string }> }).schedules
+      expect(remainingSchedules.find((s) => s.id === timerBeforeDelete)?.status).toBe("cancelled")
     }),
   )
 

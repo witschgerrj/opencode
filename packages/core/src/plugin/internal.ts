@@ -78,6 +78,8 @@ import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
 import { RequestSynthesisTool } from "../tool/plugin/request-synthesis.js"
 import { SystemResourcesTool } from "../tool/plugin/system-resources.js"
+import { GenerateImageTool } from "../tool/plugin/generate-image.js"
+import { GodotSandboxTool } from "../tool/plugin/godot-sandbox.js"
 import { ArtifactTool } from "../tool/plugin/artifact.js"
 import { HeadlessBrowserTool } from "../tool/plugin/headless-browser.js"
 import { LspTool } from "../tool/plugin/lsp.js"
@@ -250,6 +252,8 @@ const pre = [
   ReadTool.Plugin,
   RequestSynthesisTool.Plugin,
   SystemResourcesTool.Plugin,
+  GenerateImageTool.Plugin,
+  GodotSandboxTool.Plugin,
   ArtifactTool.Plugin,
   HeadlessBrowserTool.Plugin,
   LspTool.Plugin,

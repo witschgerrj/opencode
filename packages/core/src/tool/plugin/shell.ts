@@ -19,10 +19,71 @@ import { shellParserWasm } from "#shell-parser-wasm"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
+import { GpuBrokerClient } from "../../util/gpu-broker-client.js"
+
+export const activeSubprocUnits = GpuBrokerClient.activeSubprocUnits
+
+export function registerActiveSubprocUnit(unitName: string): void {
+  activeSubprocUnits.add(unitName)
+}
+
+export function unregisterActiveSubprocUnit(unitName: string): void {
+  activeSubprocUnits.delete(unitName)
+}
+
+export function isSubprocActive(unitName: string): boolean {
+  return activeSubprocUnits.has(unitName)
+}
+
+export async function releaseSubproc(unitName: string): Promise<Record<string, unknown>> {
+  try {
+    return await GpuBrokerClient.releaseSubproc(unitName)
+  } finally {
+    activeSubprocUnits.delete(unitName)
+  }
+}
+
+export async function cleanupActiveSubprocUnits(): Promise<void> {
+  const units = Array.from(activeSubprocUnits)
+  for (const unit of units) {
+    try {
+      await GpuBrokerClient.releaseSubproc(unit)
+    } catch {
+      // ignore errors during emergency exit cleanup
+    } finally {
+      activeSubprocUnits.delete(unit)
+    }
+  }
+}
+
+let exitHooksRegistered = false
+export function registerSubprocExitHooks(): void {
+  if (exitHooksRegistered) return
+  exitHooksRegistered = true
+
+  const cleanupSync = () => {
+    if (activeSubprocUnits.size > 0) {
+      cleanupActiveSubprocUnits().catch(() => {})
+    }
+  }
+
+  process.once("beforeExit", cleanupSync)
+  process.once("SIGINT", () => {
+    cleanupActiveSubprocUnits().finally(() => {
+      process.exit(130)
+    })
+  })
+  process.once("SIGTERM", () => {
+    cleanupActiveSubprocUnits().finally(() => {
+      process.exit(143)
+    })
+  })
+}
+
+registerSubprocExitHooks()
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000
-export const MAX_TIMEOUT_MS = 10 * 60 * 1_000
 
 const BACKGROUND_INSTRUCTION =
   "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes."

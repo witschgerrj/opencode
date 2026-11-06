@@ -6,6 +6,7 @@ import type { LayerNode } from "@opencode/util/effect/layer-node"
 import { Job } from "../job.js"
 import { Session } from "../session.js"
 import { SubagentCompletion } from "./subagent-completion.js"
+import { SessionSlotLease } from "./slot-lease.js"
 
 type Recovery = Extract<Job.Recovery, { kind: "subagent" }>
 
@@ -58,7 +59,13 @@ const make: Effect.Effect<Interface, never, Session.Service | Job.Service | Scop
                 message.type === "assistant" && message.time.completed !== undefined && message.error === undefined,
             )
             return SubagentCompletion.text(assistant)
-          }),
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                void SessionSlotLease.releaseSubagentSession(recovery.childSessionID)
+              }),
+            ),
+          ),
         })
         .pipe(Effect.setContext(context)),
     background: Effect.fn("SubagentJob.background")(function* (recovery: Recovery) {

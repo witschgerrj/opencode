@@ -549,6 +549,27 @@ describe("Durable Epoch-Frozen Prefix & Append-Only Tail Deltas", () => {
       expect(epochsBefore.length).toBeGreaterThan(0)
       expect(remindersBefore.length).toBeGreaterThan(0)
 
+      // Verify getSubagentReminder reports available subagent slots when subagent tool is present
+      const loadedWithAlpha = yield* fx.context.load(yield* fx.context.select(fx.sessionID))
+      expect(SessionEpochPrefix.getSubagentReminder(fx.sessionID, loadedWithAlpha.tools, true, true)).toBe("")
+      yield* fx.registry.transform((editor) => {
+        editor.add({
+          name: "subagent",
+          description: "Spawn a child subagent",
+          input: Schema.Struct({ prompt: Schema.String }),
+          output: Schema.String,
+          options: { codemode: false },
+          execute: () => Effect.succeed({ output: "ok" }),
+        })
+      })
+      const selWithSubagent = yield* fx.context.select(fx.sessionID)
+      const reminderText = SessionEpochPrefix.getSubagentReminder(fx.sessionID, selWithSubagent.tools, true, true)
+      expect(reminderText).toContain("concurrent 128k subagent slots available")
+      expect(reminderText).toContain(
+        "If this task can be split up and resources are available, do so and invoke subagents to help.",
+      )
+      expect(SessionEpochPrefix.getSubagentReminder(fx.sessionID, selWithSubagent.tools, false, true)).toBe("")
+
       // Deleting the session cascades to both session_epoch_prefix and session_turn_reminder
       yield* fx.db.delete(SessionTable).where(eq(SessionTable.id, fx.sessionID)).run().pipe(Effect.orDie)
 

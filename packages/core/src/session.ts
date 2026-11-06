@@ -58,6 +58,8 @@ import { SessionModelTransport } from "./session/model-transport.js"
 import { llmClient } from "./effect/app-node-platform.js"
 import { Snapshot } from "./snapshot.js"
 import { AquanoxTrace } from "./session/aquanox-trace.js"
+import { SessionSlotLease } from "./session/slot-lease.js"
+import { Shell } from "./shell.js"
 import { Session } from "./session/session.js"
 import { SessionDiff, TurnRangeError } from "./session/diff.js"
 import { LocationServiceMap } from "./location-service-map.js"
@@ -400,12 +402,40 @@ const layer = Layer.effect(
       }),
       view: (input) => sessions.forSession(input.sessionID).view(input),
       remove: Effect.fn("Session.remove")(function* (sessionID) {
-        yield* result.get(sessionID)
+        const info = yield* result.get(sessionID)
         yield* execution.interrupt(sessionID)
         yield* execution.awaitIdle(sessionID)
         yield* transport.close(sessionID)
         const children = yield* store.list({ parentID: sessionID })
         yield* Effect.forEach(children, (child) => result.remove(child.id), { concurrency: 1, discard: true })
+        yield* Effect.serviceOption(Shell.Service).pipe(
+          Effect.flatMap((opt) =>
+            Option.isSome(opt)
+              ? opt.value.list().pipe(
+                  Effect.flatMap((running) =>
+                    Effect.forEach(
+                      running.filter((s) => (s.metadata as { sessionID?: string } | undefined)?.sessionID === sessionID),
+                      (s) => opt.value.remove(s.id).pipe(Effect.ignore),
+                      { concurrency: 4, discard: true },
+                    ),
+                  ),
+                  Effect.ignore,
+                )
+              : Effect.void,
+          ),
+          Effect.provide(locations.get(info.location)),
+          Effect.ignore,
+        )
+        if (info.parentID) {
+          yield* SessionSlotLease.releaseSubagentSession(sessionID, { purge: true })
+        } else {
+          const boundConvId =
+            SessionSlotLease.getConversationIdForSession(sessionID) ??
+            (typeof info.metadata?.aquanoxConversationId === "string"
+              ? info.metadata.aquanoxConversationId
+              : `conv_${sessionID}`)
+          SessionSlotLease.releaseConversation(boundConvId, sessionID)
+        }
         yield* environments.clear(sessionID)
         yield* bus.publish(SessionEvent.Deleted, { sessionID })
         yield* bus.remove(sessionID)
