@@ -78,7 +78,10 @@ const layer = Layer.effect(
     const image = yield* Image.Service
 
     type NormalizedItem = Tool.Content | "decode" | "size"
-    const normalizeImages = Effect.fnUntraced(function* (content: ReadonlyArray<Tool.Content>) {
+    const normalizeImages = Effect.fnUntraced(function* (content: ReadonlyArray<Tool.Content>, toolName?: string) {
+      if (toolName === "render_artifact" || toolName === "generate_image" || toolName === "godot_sandbox") {
+        return [...content]
+      }
       const normalized = yield* Effect.forEach(content, (item): Effect.Effect<NormalizedItem> => {
         if (item.type !== "file" || !item.mime.startsWith("image/")) return Effect.succeed(item)
         const base64 = /^data:[^,]*;base64,(.*)$/s.exec(item.uri)?.[1]
@@ -154,7 +157,7 @@ const layer = Layer.effect(
         },
       }
       yield* hooks.trigger("tool", "execute.after", afterEvent)
-      const afterContent = yield* normalizeImages(normalizeContent(afterEvent.result.content, afterEvent.result.output))
+      const afterContent = yield* normalizeImages(normalizeContent(afterEvent.result.content, afterEvent.result.output), name)
       return {
         ...(afterEvent.result.output === undefined ? {} : { output: afterEvent.result.output }),
         content: afterContent,

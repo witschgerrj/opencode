@@ -133,13 +133,18 @@ const StructuredOutput = Schema.Struct({
 const Output = Schema.Struct({
   ...StructuredOutput.fields,
   output: Schema.String,
-  status: Schema.optionalKey(Schema.Literals(["completed", "running"])),
+  status: Schema.optionalKey(Schema.Literals(["completed", "running", "cancelled"])),
 })
 
 type Output = typeof Output.Type
 
 const resultMessages = (output: Output) => {
-  const notice = output.status === "running" ? BACKGROUND_INSTRUCTION : ShellResult.notice(output)
+  const notice =
+    output.status === "running"
+      ? BACKGROUND_INSTRUCTION
+      : output.status === "cancelled"
+        ? (ShellResult.notice(output) ?? "Cancelled")
+        : ShellResult.notice(output)
   return [...(output.output ? [output.output] : []), ...(notice ? [notice] : [])]
 }
 
@@ -321,6 +326,8 @@ export const Plugin = {
         const info = (yield* jobs.wait({ id })).info
         if (!info || info.status === "running") return
         const output = info.status === "completed" ? yield* Deferred.await(settled) : undefined
+        const state: "completed" | "cancelled" | "error" =
+          output?.status === "cancelled" ? "cancelled" : info.status
         const text = output
           ? resultMessages(output).join("\n\n")
           : info.status === "error"
@@ -334,7 +341,7 @@ export const Plugin = {
             jobID: id,
             shellID,
             command,
-            state: info.status,
+            state,
             text,
             output,
           }),
@@ -379,15 +386,26 @@ export const Plugin = {
               const settled = yield* Deferred.make<Output>()
               const run = Effect.gen(function* () {
                 const result = yield* shell.result(info)
-                if (!result.capture) return yield* new Shell.NotFoundError({ id: info.id })
-                const output = ShellResult.output(result)
+                if (!result.capture && result.info.status !== "killed") {
+                  return yield* new Shell.NotFoundError({ id: info.id })
+                }
+                const output: ReturnType<typeof ShellResult.output> = result.capture
+                  ? ShellResult.output(result)
+                  : {
+                      output: "(no output)",
+                      truncated: false,
+                      ...(result.info.exit !== undefined ? { exit: result.info.exit } : {}),
+                      ...(result.info.signal !== undefined ? { signal: result.info.signal } : {}),
+                      ...(result.info.status === "timeout" ? { timeout: true } : {}),
+                    }
                 const text = output.timeout
                   ? `${output.output}\n\nCommand exceeded timeout of ${finalTimeout} ms. Retry with a larger timeout if the command is expected to take longer.`
                   : output.output
+                const isCancelled = result.info.status === "killed"
                 return {
                   ...output,
-                  output: foldPassingTapOutput(text, output.exit),
-                  status: "completed" as const,
+                  output: isCancelled ? text : foldPassingTapOutput(text, output.exit),
+                  status: isCancelled ? ("cancelled" as const) : ("completed" as const),
                 }
               }).pipe(
                 Effect.tap((output) => Deferred.succeed(settled, output)),
@@ -427,7 +445,9 @@ export const Plugin = {
                 return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
               if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
 
-              return yield* Deferred.await(settled)
+              const settledOutput = yield* Deferred.await(settled)
+              if (settledOutput.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
+              return settledOutput
             }).pipe(
               Effect.map(toolResult),
               Effect.mapError(

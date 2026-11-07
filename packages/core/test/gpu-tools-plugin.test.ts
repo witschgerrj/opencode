@@ -1796,4 +1796,93 @@ describe("Aquanox v12.0 GPU Broker Client & Tool Plugins over Unix Domain Socket
     expect(retriedAttemptEnv.nonce).not.toBe(firstAttemptEnv.nonce)
     expect(retriedAttemptEnv.signature).not.toBe(firstAttemptEnv.signature)
   })
+
+  test("GPU-035 & GPU-045: Omitted output_path on /home/rjwits isolates worktree_root under /home/rjwits/artifacts/<isolated>, and bootstrapOrRekey(false) auto-recovers on 409 ERR_EPOCH_KEY_ALREADY_CONFIRMED", async () => {
+    const fs = await import("node:fs")
+    const valA = GenerateImageTool.validateGenerateImageInput(
+      {
+        prompt: "A studio teapot on blue linen",
+        tier: "tier1_klein4b_q4",
+        width: 1024,
+        height: 1024,
+      },
+      { defaultBaseDir: "/home/rjwits", sessionID: "ses_gpu035_iso_a" },
+    )
+    const valB = GenerateImageTool.validateGenerateImageInput(
+      {
+        prompt: "A studio teapot on blue linen",
+        tier: "tier1_klein4b_q4",
+        width: 1024,
+        height: 1024,
+      },
+      { defaultBaseDir: "/var/lib/aquanox-runner", sessionID: "ses_gpu035_iso_b" },
+    )
+
+    try {
+      expect(valA.worktree_root).not.toBe("/home/rjwits")
+      expect(valA.worktree_root.startsWith("/home/rjwits/artifacts/ses_gpu035_iso_a_")).toBe(true)
+      expect(valA.output_path).toBe(`${valA.worktree_root}/generated_image.png`)
+      expect(valB.worktree_root).not.toBe("/var/lib/aquanox-runner")
+      expect(valB.worktree_root.startsWith("/home/rjwits/artifacts/ses_gpu035_iso_b_")).toBe(true)
+      expect(valA.output_path).not.toBe(valB.output_path)
+    } finally {
+      try {
+        fs.rmSync(valA.worktree_root, { recursive: true, force: true })
+        fs.rmSync(valB.worktree_root, { recursive: true, force: true })
+      } catch {}
+    }
+  })
+  test("GPU-014 / GPU-040 / GPU-050: ancestor project.godot worktree resolution, conflicting action/mode rejection, and actionable failure propagation", async () => {
+    const tempWt = fs.mkdtempSync("/tmp/opencode-godot-wt-")
+    try {
+      fs.writeFileSync(`${tempWt}/project.godot`, 'config_version=5\n[application]\nconfig/name="Test"\n')
+      const nestedOut = `${tempWt}/artifacts/S11-import`
+
+      // 1. Absolute output_dir-only inside a Godot checkout resolves worktree_root to ancestor with project.godot
+      const validated = GodotSandboxTool.validateGodotSandboxInput({
+        action: "import",
+        output_dir: nestedOut,
+      })
+      expect(validated.action).toBe("import")
+      expect(validated.mode).toBe("import")
+      expect(validated.worktree_root).toBe(tempWt)
+      expect(validated.output_dir).toBe(nestedOut)
+
+      // 2. Conflicting action and mode throws ERR_INVALID_ACTION
+      expect(() =>
+        GodotSandboxTool.validateGodotSandboxInput({
+          action: "test",
+          mode: "capture",
+          worktree_root: tempWt,
+        }),
+      ).toThrow(/ERR_INVALID_ACTION/)
+
+      // 3. Broker failure with responseBody.failures propagates failure details into ToolFailure
+      const failingClient = {
+        runGodotSandbox: async () => {
+          throw new GpuBrokerClient.GpuBrokerError(
+            "ERR_WORKER_EXECUTION_FAILED",
+            500,
+            "ERR_WORKER_EXECUTION_FAILED",
+            {
+              error: "ERR_WORKER_EXECUTION_FAILED",
+              failures: ["import failed with exit code 1: Permission denied: '/run/aquanox-broker/locks/godot-phase.lock'"],
+            },
+          )
+        },
+      } as unknown as GpuBrokerClient.Client
+
+      const exit = await Effect.runPromiseExit(
+        GodotSandboxTool.executeGodotSandbox(
+          { action: "import", output_dir: nestedOut },
+          "ses_gpu050_err",
+          failingClient,
+        ),
+      )
+      expect(exit._tag).toBe("Failure")
+      expect(JSON.stringify(exit)).toContain("godot-phase.lock")
+    } finally {
+      fs.rmSync(tempWt, { recursive: true, force: true })
+    }
+  })
 })

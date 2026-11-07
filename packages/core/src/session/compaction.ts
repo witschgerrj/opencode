@@ -761,6 +761,28 @@ export const layer = Layer.effect(
       const compactStartUs = traceEnabled ? AquanoxTrace.nowUs() : 0
       const compactModelLabel = `${selected.context.model.ref.providerID}/${selected.context.model.ref.id}`
       const compactThinkingMode = selected.context.model.ref.variant ?? compactCorr?.thinkingMode ?? null
+      const compactLeasedSlot =
+        SessionSlotLease.isActivelyHeld(context.session.id) ??
+        SessionSlotLease.getResourceSnapshot({ sessionId: context.session.id }).thisConversation?.leadSlotId ??
+        null
+      const compactEffectiveCtxLimit = SessionSlotLease.getEffectiveSlotContextLimit(
+        compactLeasedSlot ?? undefined,
+        context.session.parentID ? "128k" : "384k",
+      )
+      const compactWindowLimit =
+        compactEffectiveCtxLimit > 0
+          ? compactEffectiveCtxLimit
+          : selected.context.model.limit.context > 0
+            ? selected.context.model.limit.context
+            : null
+      const compactLeaseAttributes = {
+        reason: trigger.reason,
+        native,
+        leasedSlot: compactLeasedSlot,
+        turnstileKey: `${context.session.id}:background_compaction`,
+        completeStreamLeaseBound: true,
+        effectiveSlotContextLimit: compactWindowLimit,
+      }
       if (compactCorr && compactSpanId) {
         AquanoxTrace.setActiveCompactSpan(context.session.id, compactSpanId)
         yield* AquanoxTrace.postTraceIngest({
@@ -780,8 +802,8 @@ export const layer = Layer.effect(
             thinkingMode: compactThinkingMode,
             agentName: selected.context.agent.id,
             isSubagent: compactCorr.isSubagent,
-            contextWindowLimit: selected.context.model.limit.context > 0 ? selected.context.model.limit.context : null,
-            attributes: { reason: trigger.reason, native },
+            contextWindowLimit: compactWindowLimit,
+            attributes: compactLeaseAttributes,
           },
         })
       }
@@ -791,9 +813,12 @@ export const layer = Layer.effect(
           AquanoxTrace.setActiveCompactSpan(context.session.id, null)
         }
         const compactEndUs = AquanoxTrace.nowUs()
+        const settledSlot =
+          SessionSlotLease.isActivelyHeld(context.session.id) ??
+          compactLeasedSlot
         const metrics = AquanoxTrace.usageMetrics(
           spent.get(context.session.id)?.tokens,
-          selected.context.model.limit.context,
+          compactWindowLimit ?? selected.context.model.limit.context,
         )
         return AquanoxTrace.postTraceIngest({
           span: {
@@ -815,7 +840,10 @@ export const layer = Layer.effect(
             agentName: selected.context.agent.id,
             isSubagent: compactCorr.isSubagent,
             ...metrics,
-            attributes: { reason: trigger.reason, native },
+            attributes: {
+              ...compactLeaseAttributes,
+              leasedSlot: settledSlot,
+            },
           },
         })
       }

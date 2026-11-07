@@ -40,6 +40,16 @@ export function isAquanoxLeafCgroupHostAvailable(probe?: {
     return true
   }
 
+  if (
+    !probe?.existsSync &&
+    (process.env.NODE_ENV === "test" ||
+      process.env.BUN_ENV === "test" ||
+      env.NODE_ENV === "test" ||
+      env.BUN_ENV === "test")
+  ) {
+    return false
+  }
+
   const hasSlice =
     existsSync("/sys/fs/cgroup/aquanox.slice/aquanox-subprocs.slice") ||
     existsSync("/sys/fs/cgroup/aquanox-subprocs.slice")
@@ -594,3 +604,120 @@ export function buildSystemdLeafWrapCommand(
 
 export const wrapCommandInLeafCgroup = buildSystemdLeafWrapCommand
 export const wrapCommandWithLeafCgroup = buildSystemdLeafWrapCommand
+
+export function resolveWrappedLeafCgroupPath(unitName: string): string {
+  const fullUnit = unitName.endsWith(".service") ? unitName : `${unitName}.service`
+  try {
+    if (fs.existsSync(`/sys/fs/cgroup/aquanox.slice/${AQUANOX_SUBPROCS_SLICE}`)) {
+      return `/sys/fs/cgroup/aquanox.slice/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}`
+    }
+  } catch {
+    // ignore
+  }
+  return `/sys/fs/cgroup/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}`
+}
+
+export function readProcStarttimeTicks(pid: number): number {
+  if (!Number.isFinite(pid) || pid <= 0) return 0
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+    const rparen = raw.lastIndexOf(")")
+    if (rparen === -1) return 0
+    const fields = raw.slice(rparen + 2).trim().split(/\s+/)
+    if (fields.length >= 20) {
+      const ticks = Number.parseInt(fields[19]!, 10)
+      return Number.isFinite(ticks) && ticks > 0 ? ticks : 0
+    }
+  } catch {
+    // ignore
+  }
+  return 0
+}
+
+export function resolveWrappedLeafProcessInfo(
+  unitName: string,
+  fallbackPid?: number,
+): { pid?: number; starttimeTicks?: number; cgroupPath: string } {
+  const fullUnit = unitName.endsWith(".service") ? unitName : `${unitName}.service`
+  const candidates = [
+    `/sys/fs/cgroup/aquanox.slice/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}`,
+    `/sys/fs/cgroup/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}`,
+  ]
+  for (const cgDir of candidates) {
+    try {
+      const procsFile = `${cgDir}/cgroup.procs`
+      if (fs.existsSync(procsFile)) {
+        const content = fs.readFileSync(procsFile, "utf8").trim()
+        if (content) {
+          const pids = content
+            .split(/\s+/)
+            .map((line) => Number.parseInt(line.trim(), 10))
+            .filter((n) => Number.isFinite(n) && n > 0)
+          if (pids.length > 0) {
+            const pid = pids[0]!
+            const starttimeTicks = readProcStarttimeTicks(pid)
+            return {
+              pid,
+              ...(starttimeTicks > 0 ? { starttimeTicks } : {}),
+              cgroupPath: cgDir,
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  const cgroupPath = resolveWrappedLeafCgroupPath(unitName)
+  if (fallbackPid !== undefined && fallbackPid > 0) {
+    const starttimeTicks = readProcStarttimeTicks(fallbackPid)
+    return {
+      pid: fallbackPid,
+      ...(starttimeTicks > 0 ? { starttimeTicks } : {}),
+      cgroupPath,
+    }
+  }
+  return { cgroupPath }
+}
+
+export function killWrappedLeafCgroupProcesses(
+  unitName: string,
+  signal: NodeJS.Signals = "SIGTERM",
+): void {
+  const fullUnit = unitName.endsWith(".service") ? unitName : `${unitName}.service`
+  const candidates = [
+    `/sys/fs/cgroup/aquanox.slice/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}/cgroup.procs`,
+    `/sys/fs/cgroup/${AQUANOX_SUBPROCS_SLICE}/${fullUnit}/cgroup.procs`,
+  ]
+  const signalCgroupPids = (sig: NodeJS.Signals) => {
+    for (const procsFile of candidates) {
+      try {
+        if (!fs.existsSync(procsFile)) continue
+        const content = fs.readFileSync(procsFile, "utf8").trim()
+        if (!content) continue
+        const pids = content
+          .split(/\s+/)
+          .map((line) => Number.parseInt(line.trim(), 10))
+          .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid)
+        for (const pid of pids) {
+          try {
+            process.kill(pid, sig)
+          } catch {
+            // ignore ESRCH / EPERM
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  signalCgroupPids(signal)
+  if (signal !== "SIGKILL") {
+    const timer = setTimeout(() => {
+      signalCgroupPids("SIGKILL")
+    }, 250)
+    if (typeof timer.unref === "function") {
+      timer.unref()
+    }
+  }
+}

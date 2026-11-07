@@ -5,6 +5,7 @@ import path from "node:path"
 import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect, Schema } from "effect"
+import { Location } from "../../location.js"
 import { Permission } from "../../permission.js"
 import { SessionSlotLease } from "../../session/slot-lease.js"
 import { GpuBrokerClient } from "../../util/gpu-broker-client.js"
@@ -60,7 +61,8 @@ export const DESCRIPTION = [
   "Generate high-resolution photorealistic images, concept art, textures, or visual keyframes on Dedicated GPU 3 via the Aquanox GPU Broker using Qwen-Image-2512 20B (Q5_K_M, Apache-2.0) at maximum quality.",
   "There is only one unified max-quality model tier — do NOT specify or compare tiers. Default steps is 28 for maximum sharpness and photorealism.",
   "Allowed dimensions: (512, 512), (768, 768), (1024, 1024), (1280, 800), or (800, 1280). Prompt must be <= 4096 UTF-8 bytes.",
-  "Omit output_path and worktree_root to save to '/home/rjwits/artifacts/generated_image.png', or specify '/home/rjwits/artifacts/<name>.png'. Never write directly to '/home/rjwits/<name>.png'.",
+  "Omit output_path and worktree_root to save to an isolated directory under '/home/rjwits/artifacts/' (or the active session workspace's 'artifacts/' directory), or specify '/home/rjwits/artifacts/<subdir>/<name>.png'. Never write directly to '/home/rjwits/<name>.png'.",
+  "When summarizing a completed image, reply in the same language as the user's request, do not emit relative or duplicate markdown image tags (the UI automatically renders the preview card with Open and Download controls from Output path), and state only the requested subject and tool-verified metadata without inventing unverified visual traits.",
   "While waiting for GPU generation, the caller session's Buddy Slot remains reserved (keep_reserved policy).",
 ].join(" ")
 
@@ -97,7 +99,7 @@ export interface ValidatedGenerateImageEnvelope {
 
 export function validateGenerateImageInput(
   input: Input,
-  options?: { defaultBaseDir?: string } | string,
+  options?: { defaultBaseDir?: string; sessionID?: string } | string,
 ): ValidatedGenerateImageEnvelope {
   if (typeof input.prompt !== "string" || input.prompt.trim().length === 0) {
     throw new Error("ERR_INVALID_PROMPT: prompt must be a non-empty string")
@@ -146,12 +148,26 @@ export function validateGenerateImageInput(
         ? options.defaultBaseDir.trim()
         : undefined
 
-  const baseDir = path.resolve(explicitWorktreeRoot ?? defaultBaseDir ?? process.cwd())
+  const rawBaseDir = path.resolve(explicitWorktreeRoot ?? defaultBaseDir ?? process.cwd())
+  const isInaccessibleRunnerBase =
+    explicitWorktreeRoot === undefined &&
+    (rawBaseDir === "/var/lib/aquanox-runner" || rawBaseDir.startsWith("/var/lib/aquanox-runner/"))
+  const baseDir = isInaccessibleRunnerBase ? "/home/rjwits" : rawBaseDir
 
-  const rawOutputPath =
-    typeof input.output_path === "string" && input.output_path.trim().length > 0
-      ? input.output_path.trim()
-      : "artifacts/generated_image.png"
+  const hasExplicitOutputPath = typeof input.output_path === "string" && input.output_path.trim().length > 0
+  const sessionSlug =
+    typeof options === "object" &&
+    options !== null &&
+    typeof options.sessionID === "string" &&
+    options.sessionID.trim().length > 0
+      ? options.sessionID.trim().replace(/[^A-Za-z0-9_-]/g, "_")
+      : undefined
+  const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const isolatedDirName = sessionSlug ? `${sessionSlug}_${uniqueSuffix}` : `gen_${uniqueSuffix}`
+
+  const rawOutputPath = hasExplicitOutputPath
+    ? input.output_path!.trim()
+    : path.join("artifacts", isolatedDirName, "generated_image.png")
 
   let worktree_root: string
   let output_path: string
@@ -192,6 +208,9 @@ export function validateGenerateImageInput(
         output_path = resolvedOut
       }
     }
+  } else if (!hasExplicitOutputPath && explicitWorktreeRoot === undefined && baseDir === "/home/rjwits") {
+    worktree_root = path.join("/home/rjwits/artifacts", isolatedDirName)
+    output_path = path.join(worktree_root, "generated_image.png")
   } else {
     worktree_root = baseDir
     output_path = path.resolve(worktree_root, rawOutputPath)
@@ -248,8 +267,8 @@ export function validateGenerateImageInput(
 export function executeGenerateImage(
   input: Input,
   sessionID: string,
-  clientOrOptions?: GpuBrokerClient.Client | { defaultBaseDir?: string } | string,
-  options?: { defaultBaseDir?: string } | string,
+  clientOrOptions?: GpuBrokerClient.Client | { defaultBaseDir?: string; sessionID?: string } | string,
+  options?: { defaultBaseDir?: string; sessionID?: string } | string,
 ) {
   const isClient =
     clientOrOptions !== undefined &&
@@ -260,11 +279,15 @@ export function executeGenerateImage(
   const client = isClient ? (clientOrOptions as GpuBrokerClient.Client) : GpuBrokerClient.getDefaultClient()
   const resolvedOptions = isClient
     ? options
-    : (clientOrOptions as { defaultBaseDir?: string } | string | undefined) ?? options
+    : (clientOrOptions as { defaultBaseDir?: string; sessionID?: string } | string | undefined) ?? options
+  const validateOptions =
+    typeof resolvedOptions === "string"
+      ? { defaultBaseDir: resolvedOptions, sessionID }
+      : { ...(resolvedOptions ?? {}), sessionID: resolvedOptions?.sessionID ?? sessionID }
 
   return Effect.gen(function* () {
     const validated = yield* Effect.try({
-      try: () => validateGenerateImageInput(input, resolvedOptions),
+      try: () => validateGenerateImageInput(input, validateOptions),
       catch: (err) =>
         new ToolFailure({
           message: err instanceof Error ? err.message : String(err),
@@ -484,10 +507,14 @@ export function executeGenerateImage(
       (typeof response.broker_state === "string" ? response.broker_state : undefined) ??
       (typeof manifestObj?.state === "string" ? manifestObj.state : undefined)
 
+    const resolvedSteps = typeof response.steps === "number" ? response.steps : validated.steps
+    const resolvedSeed = typeof response.seed === "number" ? response.seed : validated.seed
     const summaryLines = [
       `Generated image (${response.width ?? validated.width}x${response.height ?? validated.height}, model=Qwen-Image-2512-20B-Q5_K_M)`,
       `Output path: ${response.output_path}`,
       `Manifest path: ${manifestPath}`,
+      ...(resolvedSteps !== undefined ? [`Steps: ${resolvedSteps}`] : []),
+      ...(resolvedSeed !== undefined ? [`Seed: ${resolvedSeed}`] : []),
       `Elapsed: ${response.elapsed_ms ?? 0} ms`,
       ...(leaseId !== undefined ? [`Lease ID: ${leaseId}`] : []),
       ...(vramPeakMib !== undefined ? [`VRAM peak: ${vramPeakMib} MiB`] : []),
@@ -502,6 +529,7 @@ export function executeGenerateImage(
       ...(sha256 !== undefined ? [`SHA-256: ${sha256}`] : []),
       ...(brokerState !== undefined ? [`Broker state: ${brokerState}`] : []),
       ...(deliveredFiles.length > 0 ? [`Delivered files: ${deliveredFiles.join(", ")}`] : []),
+      `Presentation note: The UI automatically renders the image preview card with Open and Download controls from Output path. Reply in the same language as the user's request (do not insert foreign-language terms unless requested), do not emit relative or duplicate markdown image tags, and report only the requested subject and tool-verified metadata above without inventing unverified visual details.`,
     ]
     const summary = summaryLines.join("\n")
 
@@ -512,6 +540,8 @@ export function executeGenerateImage(
         tier: response.tier ?? validated.tier,
         width: response.width ?? validated.width,
         height: response.height ?? validated.height,
+        ...(resolvedSteps !== undefined ? { steps: resolvedSteps } : {}),
+        ...(resolvedSeed !== undefined ? { seed: resolvedSeed } : {}),
         output_path: response.output_path,
         manifest_path: manifestPath,
         delivered_files: deliveredFiles,
@@ -537,6 +567,7 @@ export const Plugin = {
   id: "opencode.tool.generate_image",
   effect: Effect.fn("GenerateImageTool.Plugin")(function* (ctx: Context) {
     const permission = yield* Permission.Service
+    const location = yield* Location.Service
 
     yield* ctx.tool
       .transform((editor) => {
@@ -559,6 +590,9 @@ export const Plugin = {
                 : undefined) ??
               (typeof (ctx as any)?.worktree === "string" && (ctx as any).worktree.trim().length > 0
                 ? (ctx as any).worktree.trim()
+                : undefined) ??
+              (typeof location?.directory === "string" && location.directory.trim().length > 0
+                ? location.directory.trim()
                 : undefined)
             return permission
               .assert({
@@ -574,6 +608,7 @@ export const Plugin = {
                 Effect.flatMap(() =>
                   executeGenerateImage(input, context.sessionID, undefined, {
                     ...(defaultBaseDir ? { defaultBaseDir } : {}),
+                    sessionID: context.sessionID,
                   }),
                 ),
               )

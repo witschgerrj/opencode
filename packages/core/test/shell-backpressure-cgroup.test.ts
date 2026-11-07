@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import * as http from "node:http"
 import * as path from "node:path"
 import { Writable } from "node:stream"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Location } from "@opencode/core/location"
 import { Global } from "@opencode/util/global"
@@ -1315,5 +1315,49 @@ describe("shell.ts backpressure, output truncation, and secret isolation", () =>
         })
       })
     }
+  })
+
+  test("GPU-051: cancelling a running background shell via remove preserves captured START output and never fails with Shell.NotFoundError", async () => {
+    const layer = AppNodeBuilder.build(Shell.node, [
+      Location.node.replace(tempLocationLayer),
+      Global.node.replace(tempGlobalLayer),
+      Config.node.replace(Config.testLayer()),
+    ])
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const shell = yield* Shell.Service
+
+          const started = yield* shell.create({
+            command: 'printf \'{"event":"START","pid":%d}\\n\' "$$"; sleep 30',
+            timeout: 0,
+          })
+
+          // Fork result waiter (exactly as ShellTool background job does)
+          const resultFiber = yield* Effect.forkScoped(shell.result(started))
+
+          // Wait until START output has been flushed to the output file
+          let sawStart = false
+          for (let i = 0; i < 50; i++) {
+            const out = yield* shell.output(started.id)
+            if (out.output.includes('"event":"START"')) {
+              sawStart = true
+              break
+            }
+            yield* Effect.sleep("20 millis")
+          }
+          expect(sawStart).toBe(true)
+
+          // Cancel the running background shell via shell.remove (as manage_task(action="kill") does)
+          yield* shell.remove(started.id)
+
+          const res = yield* Fiber.join(resultFiber)
+          expect(res.info.status).toBe("killed")
+          expect(res.capture).toBeDefined()
+          expect(res.capture?.output).toContain('"event":"START"')
+        }).pipe(Effect.provide(layer)),
+      ),
+    )
   })
 })

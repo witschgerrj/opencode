@@ -23,7 +23,13 @@ import { Config } from "./config.js"
 import { ToolOutput } from "./tool-output.js"
 import { ShellResult } from "./shell/result.js"
 import { scrubChildEnvironment } from "./util/env-scrub.js"
-import { buildSystemdLeafWrapCommand, type SystemdLeafWrapResult } from "./util/cgroup-wrap.js"
+import {
+  buildSystemdLeafWrapCommand,
+  resolveWrappedLeafCgroupPath,
+  resolveWrappedLeafProcessInfo,
+  killWrappedLeafCgroupProcesses,
+  type SystemdLeafWrapResult,
+} from "./util/cgroup-wrap.js"
 import { GpuBrokerClient } from "./util/gpu-broker-client.js"
 import { SessionSlotLease } from "./session/slot-lease.js"
 import { registerActiveSubprocUnit, unregisterActiveSubprocUnit, isSubprocActive, activeSubprocUnits } from "./tool/plugin/shell.js"
@@ -45,6 +51,7 @@ export async function registerWrappedSubprocWithBroker(
     ...(conversation_id ? { conversation_id } : {}),
     ...(sessionID ? { owner_session_id: sessionID } : {}),
     memory_max_mib: wrap.tierSpec.memoryMaxMib,
+    control_group: resolveWrappedLeafCgroupPath(wrap.unitName),
   })
   if (regResult.admitted === false || regResult.ok === false) {
     const reason = regResult.reason || "ERR_SUBPROC_MEM_FLOOR_VIOLATION"
@@ -54,6 +61,39 @@ export async function registerWrappedSubprocWithBroker(
   }
   registerActiveSubprocUnit(wrap.unitName)
   return true
+}
+
+
+export async function reAdoptWrappedSubprocWithBroker(
+  wrap: SystemdLeafWrapResult,
+  options?: { sessionID?: string; shellId?: string; fallbackPid?: number },
+  client: GpuBrokerClient.Client = GpuBrokerClient.getDefaultClient(),
+): Promise<boolean> {
+  if (!client.isBrokerConfiguredOrAvailable()) {
+    return false
+  }
+  try {
+    const conversation_id = options?.sessionID
+      ? SessionSlotLease.getConversationIdForSession(options.sessionID)
+      : undefined
+    const procInfo = resolveWrappedLeafProcessInfo(wrap.unitName, options?.fallbackPid)
+    await client.registerSubproc({
+      request_id: wrap.unitName,
+      unit_name: `${wrap.unitName}.service`,
+      ...(conversation_id ? { conversation_id } : {}),
+      ...(options?.sessionID ? { owner_session_id: options.sessionID } : {}),
+      ...(options?.shellId ? { shell_id: options.shellId } : {}),
+      memory_max_mib: wrap.tierSpec.memoryMaxMib,
+      control_group: procInfo.cgroupPath,
+      ...(procInfo.pid ? { pid: procInfo.pid } : {}),
+      ...(procInfo.starttimeTicks ? { starttime_ticks: procInfo.starttimeTicks } : {}),
+      re_adopt: true,
+      active_state: "active",
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function releaseWrappedSubprocWithBroker(
@@ -101,6 +141,10 @@ type Active = {
   // Resolves with the terminal Info once the command exits, times out, or is killed. A wait
   // started after termination resolves immediately from the already-completed deferred.
   done: Deferred.Deferred<Info, NotFoundError>
+  outputDone?: Latch.Latch
+  removing?: boolean
+  capturedBeforeRemove?: { output: string; truncated: boolean }
+  releaseSubproc?: () => Effect.Effect<void>
   timeoutFiber?: Fiber.Fiber<void>
   timeout?: (duration: number) => Effect.Effect<void>
   kill?: () => Effect.Effect<void>
@@ -219,50 +263,7 @@ const layer = () =>
         return command
       })
 
-      const removeCommand = Effect.fnUntraced(function* (id: Shell.ID) {
-        const command = commands.get(id)
-        const index = exitOrder.indexOf(id)
-        if (index !== -1) exitOrder.splice(index, 1)
-        if (!command) return
-        commands.delete(id)
-        if (command.timeoutFiber) yield* Fiber.interrupt(command.timeoutFiber)
-        if (command.kill) yield* command.kill()
-        // Unblock any wait still pending when the command is removed before it terminated.
-        yield* Deferred.fail(command.done, new NotFoundError({ id }))
-        yield* Effect.promise(() => unlink(command.file).catch(() => {}))
-        // Every shell reports exactly one exit; removing a running one ends it as killed.
-        if (command.info.status === "running") yield* bus.publish(Shell.Event.Exited, { id, status: "killed" })
-        yield* bus.publish(Shell.Event.Deleted, { id })
-      })
-
-      const remove = Effect.fn("Shell.remove")(function* (id: Shell.ID) {
-        yield* require(id)
-        yield* removeCommand(id)
-      })
-
-      const list = Effect.fn("Shell.list")(function* () {
-        return Array.from(commands.values())
-          .filter((command) => command.info.status === "running")
-          .map((command) => command.info)
-      })
-
-      const get = Effect.fn("Shell.get")(function* (id: Shell.ID) {
-        return (yield* require(id)).info
-      })
-
-      const wait = Effect.fn("Shell.wait")(function* (id: Shell.ID) {
-        return yield* Deferred.await((yield* require(id)).done)
-      })
-
-      const timeout = Effect.fn("Shell.timeout")(function* (id: Shell.ID, duration: number) {
-        const command = yield* require(id)
-        if (command.info.status !== "running" || !command.timeout) return command.info
-        yield* command.timeout(duration)
-        return command.info
-      })
-
-      const output = Effect.fnUntraced(function* (id: Shell.ID, input?: Shell.OutputInput) {
-        const command = yield* require(id)
+      const readCommandSlice = Effect.fnUntraced(function* (command: Active, input?: Shell.OutputInput) {
         const cursor = input?.cursor ?? 0
         const limit = input?.limit ?? 65536
         if (cursor >= command.size) return { output: "", cursor: command.size, size: command.size, truncated: false }
@@ -291,28 +292,97 @@ const layer = () =>
         }
       })
 
+      const captureCommandOutput = Effect.fnUntraced(function* (command: Active) {
+        const limits = Config.latest(yield* config.entries(), "tool_output")
+        const maxLines = limits?.max_lines ?? ToolOutput.MAX_LINES
+        const maxBytes = limits?.max_bytes ?? ToolOutput.MAX_BYTES
+        const latest = yield* readCommandSlice(command, { cursor: Number.MAX_SAFE_INTEGER })
+        const page = yield* readCommandSlice(command, { cursor: Math.max(0, latest.size - maxBytes), limit: maxBytes })
+        const lines = page.output.split("\n")
+        if (page.output.endsWith("\n")) lines.pop()
+        const truncated = latest.size > maxBytes || lines.length > maxLines
+        const text = lines.length > maxLines ? lines.slice(-maxLines).join("\n") : page.output
+        const total = command.newlines + (page.output.endsWith("\n") ? 0 : 1)
+        const shown = Math.min(lines.length, maxLines)
+        const notice = truncated
+          ? `\n\n[showing lines ${total - shown + 1}-${total} of ${total}; full output saved to ${command.info.file}]`
+          : ""
+        return { output: `${text || "(no output)"}${notice}`, truncated }
+      })
+
+      const removeCommand = Effect.fnUntraced(function* (id: Shell.ID) {
+        const command = commands.get(id)
+        const index = exitOrder.indexOf(id)
+        if (index !== -1) exitOrder.splice(index, 1)
+        if (!command) return
+        const wasRunning = command.info.status === "running" && !command.removing
+        command.removing = true
+        if (command.timeoutFiber) yield* Fiber.interrupt(command.timeoutFiber)
+        if (wasRunning) {
+          if (command.kill) yield* command.kill()
+          if (command.outputDone) {
+            yield* command.outputDone.await.pipe(
+              Effect.timeoutOption(Duration.seconds(2)),
+              Effect.catch(() => Effect.void),
+            )
+          }
+          command.capturedBeforeRemove = yield* captureCommandOutput(command).pipe(
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+        }
+        commands.delete(id)
+        if (command.releaseSubproc) yield* command.releaseSubproc()
+        // Unblock any wait still pending when the command is removed before it terminated.
+        yield* Deferred.fail(command.done, new NotFoundError({ id }))
+        yield* Effect.promise(() => unlink(command.file).catch(() => {}))
+        // Every shell reports exactly one exit; removing a running one ends it as killed.
+        if (wasRunning) yield* bus.publish(Shell.Event.Exited, { id, status: "killed" })
+        yield* bus.publish(Shell.Event.Deleted, { id })
+      })
+
+      const remove = Effect.fn("Shell.remove")(function* (id: Shell.ID) {
+        yield* require(id)
+        yield* removeCommand(id)
+      })
+
+      const list = Effect.fn("Shell.list")(function* () {
+        return Array.from(commands.values())
+          .filter((command) => command.info.status === "running" && !command.removing)
+          .map((command) => command.info)
+      })
+
+      const get = Effect.fn("Shell.get")(function* (id: Shell.ID) {
+        return (yield* require(id)).info
+      })
+
+      const wait = Effect.fn("Shell.wait")(function* (id: Shell.ID) {
+        return yield* Deferred.await((yield* require(id)).done)
+      })
+
+      const timeout = Effect.fn("Shell.timeout")(function* (id: Shell.ID, duration: number) {
+        const command = yield* require(id)
+        if (command.info.status !== "running" || !command.timeout) return command.info
+        yield* command.timeout(duration)
+        return command.info
+      })
+
+      const output = Effect.fnUntraced(function* (id: Shell.ID, input?: Shell.OutputInput) {
+        const command = yield* require(id)
+        return yield* readCommandSlice(command, input)
+      })
+
       const result = Effect.fn("Shell.result")(function* (started: Shell.Info) {
+        const tracked = commands.get(started.id)
         const info = yield* wait(started.id).pipe(
           Effect.catchTag("Shell.NotFoundError", () =>
             Effect.succeed({ ...started, status: "killed" as const, time: { ...started.time, completed: Date.now() } }),
           ),
         )
         const capture = yield* Effect.gen(function* () {
-          const limits = Config.latest(yield* config.entries(), "tool_output")
-          const maxLines = limits?.max_lines ?? ToolOutput.MAX_LINES
-          const maxBytes = limits?.max_bytes ?? ToolOutput.MAX_BYTES
-          const latest = yield* output(info.id, { cursor: Number.MAX_SAFE_INTEGER })
-          const page = yield* output(info.id, { cursor: Math.max(0, latest.size - maxBytes), limit: maxBytes })
-          const lines = page.output.split("\n")
-          if (page.output.endsWith("\n")) lines.pop()
-          const truncated = latest.size > maxBytes || lines.length > maxLines
-          const text = lines.length > maxLines ? lines.slice(-maxLines).join("\n") : page.output
-          const total = (yield* require(info.id)).newlines + (page.output.endsWith("\n") ? 0 : 1)
-          const shown = Math.min(lines.length, maxLines)
-          const notice = truncated
-            ? `\n\n[showing lines ${total - shown + 1}-${total} of ${total}; full output saved to ${info.file}]`
-            : ""
-          return { output: `${text || "(no output)"}${notice}`, truncated }
+          const current = commands.get(info.id)
+          if (current) return yield* captureCommandOutput(current)
+          if (tracked?.capturedBeforeRemove) return tracked.capturedBeforeRemove
+          return yield* Effect.fail(new NotFoundError({ id: info.id }))
         }).pipe(Effect.catchTag("Shell.NotFoundError", () => Effect.succeed(undefined)))
         return { info, capture }
       })
@@ -345,13 +415,14 @@ const layer = () =>
         const rawArgs = ShellSelect.args(invocation.shell, invocation.command)
         const file = path.join(outputDir, `${id}.out`)
 
+        const spawnEnv = scrubChildEnvironment(invocation.env)
         const wrap = buildSystemdLeafWrapCommand(invocation.shell, rawArgs, {
           requestId: id,
           cwd: invocation.cwd,
+          env: spawnEnv,
         })
         const spawnCommand = wrap.command
         const spawnArgs = wrap.args
-        const spawnEnv = scrubChildEnvironment(invocation.env)
 
         const info: Info = {
           id,
@@ -409,6 +480,14 @@ const layer = () =>
                 .pipe(
                   Effect.mapError((cause) => new AppProcess.AppProcessError({ command: invocation.command, cause })),
                 )
+              const outputDone = Latch.makeUnsafe()
+              const killCommandProcess = (forceKillAfter: Duration.Input) =>
+                Effect.gen(function* () {
+                  if (wrap.wrapped) {
+                    killWrappedLeafCgroupProcesses(wrap.unitName, "SIGTERM")
+                  }
+                  yield* handle.kill({ forceKillAfter }).pipe(Effect.catch(() => Effect.void))
+                })
               const command: Active = {
                 info: produce(info, (draft) => {
                   draft.pid = handle.pid
@@ -417,13 +496,31 @@ const layer = () =>
                 size: 0,
                 newlines: 0,
                 done: Deferred.makeUnsafe<Info, NotFoundError>(),
-                kill: () => handle.kill({ forceKillAfter: Duration.seconds(1) }).pipe(Effect.catch(() => Effect.void)),
+                outputDone,
+                releaseSubproc: releaseSubprocOnce,
+                kill: () => killCommandProcess(Duration.seconds(1)),
               }
               commands.set(id, command)
+              if (subprocRegistered) {
+                runFork(
+                  Effect.gen(function* () {
+                    yield* Effect.sleep(Duration.seconds(8))
+                    while (!command.removing && command.info.status === "running" && !subprocReleased) {
+                      yield* Effect.promise(() =>
+                        reAdoptWrappedSubprocWithBroker(wrap, {
+                          sessionID: typeof sessionID === "string" ? sessionID : undefined,
+                          shellId: id,
+                          fallbackPid: handle.pid,
+                        }),
+                      )
+                      yield* Effect.sleep(Duration.seconds(10))
+                    }
+                  }).pipe(Effect.catch(() => Effect.void)),
+                )
+              }
 
               const maxOutputBytes = input.maxOutputBytes ?? MAX_SHELL_OUTPUT_BYTES
               const stream = createWriteStream(file)
-              const outputDone = Latch.makeUnsafe()
               let truncated = false
 
               const writeChunk = (data: Uint8Array): Effect.Effect<void> =>
@@ -478,7 +575,7 @@ const layer = () =>
                         command.newlines++
 
                       runFork(
-                        handle.kill({ forceKillAfter: Duration.seconds(1) }).pipe(Effect.catch(() => Effect.void)),
+                        killCommandProcess(Duration.seconds(1)),
                       )
                       return yield* Effect.fail("truncated")
                     }
@@ -530,7 +627,7 @@ const layer = () =>
                         Effect.gen(function* () {
                           if (!(yield* end({ status: "timeout" }))) return
                           runFork(
-                            handle.kill({ forceKillAfter: Duration.seconds(3) }).pipe(Effect.catch(() => Effect.void)),
+                            killCommandProcess(Duration.seconds(3)),
                           )
                         }).pipe(Effect.uninterruptible),
                       ),
@@ -558,7 +655,7 @@ const layer = () =>
                   // sees it never reads a partial file.
                   yield* outputDone.await
                   // A removed command already failed its waiters and published its exit and deletion.
-                  if (commands.get(id) !== command) {
+                  if (command.removing || commands.get(id) !== command) {
                     yield* releaseSubprocOnce()
                     return
                   }

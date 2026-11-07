@@ -71,16 +71,68 @@ export interface ValidatedGodotSandboxInput {
   resident: boolean
 }
 
+const STOP_ANCESTOR_DIRS = new Set([
+  "/",
+  "/home",
+  "/home/rjwits",
+  "/home/rjwits/work",
+  "/home/rjwits/github",
+  "/home/rjwits/worktrees",
+  "/tmp",
+  "/var",
+  "/var/tmp",
+  "/opt",
+])
+
+function findAncestorGodotProjectRoot(startDir: string): string | undefined {
+  let curr = path.resolve(startDir)
+  while (!STOP_ANCESTOR_DIRS.has(curr)) {
+    const isAllowed = ALLOWED_WORKTREE_PREFIXES.some(
+      (prefix) => curr === prefix || curr.startsWith(prefix + "/"),
+    )
+    if (!isAllowed) break
+    try {
+      if (fs.existsSync(path.join(curr, "project.godot"))) {
+        return curr
+      }
+    } catch {}
+    const parent = path.dirname(curr)
+    if (parent === curr) break
+    curr = parent
+  }
+  return undefined
+}
+
 export function validateGodotSandboxInput(
   input: Input,
   options?: { defaultBaseDir?: string } | string,
 ): ValidatedGodotSandboxInput {
-  const action = (input.action ?? input.mode ?? "capture") as GodotSandboxAction
+  const rawAction = input.action
+  const rawMode = input.mode
+  if (
+    rawAction !== undefined &&
+    rawMode !== undefined &&
+    rawAction !== rawMode &&
+    rawAction !== "sandbox" &&
+    rawMode !== "sandbox"
+  ) {
+    throw new Error(
+      `ERR_INVALID_ACTION: conflicting godot_sandbox action '${rawAction}' and mode '${rawMode}'`,
+    )
+  }
+  const action = (rawAction ?? rawMode ?? "capture") as GodotSandboxAction
   if (!(VALID_GODOT_ACTIONS as readonly string[]).includes(action)) {
     throw new Error(
       `ERR_INVALID_ACTION: unknown godot_sandbox action '${action}'. Must be one of ${VALID_GODOT_ACTIONS.join(", ")}`,
     )
   }
+  const resolvedMode = (
+    action === "sandbox"
+      ? rawMode && rawMode !== "sandbox"
+        ? rawMode
+        : "capture"
+      : action
+  ) as GodotSandboxAction
 
   const timeoutSeconds = input.timeout_seconds ?? input.timeout_s ?? input.timeout ?? 60
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 5 || timeoutSeconds > 600) {
@@ -127,7 +179,8 @@ export function validateGodotSandboxInput(
       (prefix) => resolvedOut === prefix || resolvedOut.startsWith(prefix + "/"),
     )
     if (isAllowed) {
-      worktree_root = resolvedOut
+      const ancestorProject = findAncestorGodotProjectRoot(resolvedOut)
+      worktree_root = ancestorProject ?? resolvedOut
       output_dir = resolvedOut
     } else {
       throw new Error(
@@ -169,7 +222,7 @@ export function validateGodotSandboxInput(
 
   return {
     action,
-    mode: action,
+    mode: resolvedMode,
     ...(input.seed !== undefined ? { seed: input.seed } : {}),
     timeout_seconds: timeoutSeconds,
     timeout_s: timeoutSeconds,
@@ -268,11 +321,24 @@ export function executeGodotSandbox(
             }
             return res
           },
-          catch: (err) =>
-            new ToolFailure({
-              message: `godot_sandbox (${validated.action}) Broker call failed: ${err instanceof Error ? err.message : String(err)}`,
+          catch: (err) => {
+            const respBody = (err as any)?.responseBody as Record<string, unknown> | undefined
+            const failuresArr = Array.isArray(respBody?.failures)
+              ? (respBody!.failures as unknown[]).map(String)
+              : []
+            const stderrTail = typeof respBody?.stderr_tail === "string" ? respBody.stderr_tail : ""
+            const baseMsg = err instanceof Error ? err.message : String(err)
+            const extraDetail =
+              failuresArr.length > 0 && !baseMsg.includes(failuresArr[0]!)
+                ? ` | failures: ${failuresArr.join("; ")}`
+                : stderrTail && !baseMsg.includes(stderrTail.slice(-200))
+                  ? ` | stderr: ${stderrTail.slice(-500)}`
+                  : ""
+            return new ToolFailure({
+              message: `godot_sandbox (${validated.action}) Broker call failed: ${baseMsg}${extraDetail}`,
               error: err,
-            }),
+            })
+          },
         }).pipe(
           Effect.onInterrupt(() =>
             Effect.sync(() => {
@@ -381,7 +447,21 @@ export function executeGodotSandbox(
       (typeof manifestObj?.source_tree_sha256 === "string" ? manifestObj.source_tree_sha256 : undefined)
     const resolvedSourceRoot =
       (typeof rawRes.resolved_source_root === "string" ? rawRes.resolved_source_root : undefined) ??
-      (typeof manifestObj?.resolved_source_root === "string" ? manifestObj.resolved_source_root : undefined)
+      (typeof rawRes.selected_source_root === "string" ? rawRes.selected_source_root : undefined) ??
+      (typeof rawRes.source_root === "string" ? rawRes.source_root : undefined) ??
+      (typeof manifestObj?.resolved_source_root === "string" ? manifestObj.resolved_source_root : undefined) ??
+      (typeof manifestObj?.selected_source_root === "string" ? manifestObj.selected_source_root : undefined) ??
+      (typeof manifestObj?.source_root === "string" ? manifestObj.source_root : undefined)
+    const argvList = Array.isArray(rawRes.argv)
+      ? (rawRes.argv as string[])
+      : Array.isArray(manifestObj?.argv)
+        ? (manifestObj.argv as string[])
+        : undefined
+    const engineArgvList = Array.isArray(rawRes.engine_argv)
+      ? (rawRes.engine_argv as string[][])
+      : Array.isArray(manifestObj?.engine_argv)
+        ? (manifestObj.engine_argv as string[][])
+        : undefined
     const calibrationValid =
       typeof resourceAudit?.calibration_valid === "boolean"
         ? resourceAudit.calibration_valid
@@ -401,7 +481,7 @@ export function executeGodotSandbox(
     const deviceVramPeakMib =
       typeof resourceAudit?.device_vram_peak_mib === "number" ? resourceAudit.device_vram_peak_mib : undefined
     const summaryText = typeof rawRes.summary === "string" ? rawRes.summary : undefined
-    const reportObj = rawRes.report !== undefined ? rawRes.report : undefined
+    const reportObj = rawRes.report !== undefined ? rawRes.report : manifestObj?.report
 
     const contentLines = [
       `Godot Sandbox [${validated.action}]: status=${(result as any).status ?? ((result as any).ok ? "ok" : "done")}`,
@@ -433,7 +513,8 @@ export function executeGodotSandbox(
         ...(artifactsList ?? []),
       ].filter((p) => typeof p === "string" && p.toLowerCase().endsWith(".png"))
       const uniquePngs = Array.from(new Set(candidatePngs)).slice(0, 4)
-      for (const pngPath of uniquePngs) {
+      for (const rawPngPath of uniquePngs) {
+        const pngPath = path.isAbsolute(rawPngPath) ? rawPngPath : path.join(outputDir, rawPngPath)
         if (fs.existsSync(pngPath) && fs.statSync(pngPath).isFile()) {
           const b64 = fs.readFileSync(pngPath).toString("base64")
           fileContentParts.push({
@@ -472,6 +553,8 @@ export function executeGodotSandbox(
           ? { compute_process_vram_peak_mib: computeProcessVramPeakMib }
           : {}),
         ...(deviceVramPeakMib !== undefined ? { device_vram_peak_mib: deviceVramPeakMib } : {}),
+        ...(argvList !== undefined ? { argv: argvList } : {}),
+        ...(engineArgvList !== undefined ? { engine_argv: engineArgvList } : {}),
         ...(summaryText !== undefined ? { summary: summaryText } : {}),
         ...(reportObj !== undefined ? { report: reportObj } : {}),
       },

@@ -129,6 +129,15 @@ export interface RegisterSubprocBrokerRequest {
   owner_session_id?: string
   memory_max_mib: number
   cpu_quota_pct?: number
+  control_group?: string
+  shell_id?: string
+  pid?: number
+  starttime_ticks?: number
+  re_adopt?: boolean
+  active_state?: string
+  u_nonreclaim_mib?: number
+  active_leads?: number
+  subagent_commitments_mib?: number
 }
 
 export interface RegisterSubprocBrokerResult {
@@ -535,7 +544,7 @@ export class Client {
 
     const run = async (): Promise<BrokerEpochState> => {
       const transport = this.resolveTransport()
-      const res = await this.sendRawPost(
+      let res = await this.sendRawPost(
         "/v1/auth/bootstrap_or_rekey",
         {
           client_id: transport.clientId,
@@ -546,6 +555,25 @@ export class Client {
         undefined,
         signal,
       )
+
+      if (
+        !force &&
+        (res.statusCode === 409 ||
+          res.body.error === "ERR_EPOCH_KEY_ALREADY_CONFIRMED" ||
+          (res.statusCode === 403 && res.body.error === "ERR_PEER_PID_DENIED"))
+      ) {
+        res = await this.sendRawPost(
+          "/v1/auth/bootstrap_or_rekey",
+          {
+            client_id: transport.clientId,
+            pid: process.pid,
+            force_rekey: true,
+          },
+          {},
+          undefined,
+          signal,
+        )
+      }
 
       if (res.statusCode < 200 || res.statusCode >= 300) {
         const errCode = typeof res.body.error === "string" ? res.body.error : "ERR_BROKER_BOOTSTRAP_FAILED"
@@ -643,11 +671,19 @@ export class Client {
 
     let res = await attemptSignedPost(this.epochState!)
 
+    const rekeyableErrors = new Set([
+      "ERR_BROKER_EPOCH_MISMATCH",
+      "ERR_INVALID_SIGNATURE",
+      "ERR_PEER_PID_DENIED",
+      "ERR_NONCE_REPLAY",
+      "ERR_ENVELOPE_EXPIRED",
+      "ERR_EPOCH_KEY_ALREADY_CONFIRMED",
+    ])
     if (
-      (res.statusCode === 401 && res.body.error === "ERR_BROKER_EPOCH_MISMATCH") ||
-      (res.statusCode === 403 && res.body.error === "ERR_INVALID_SIGNATURE")
+      (res.statusCode === 401 || res.statusCode === 403 || res.statusCode === 409) &&
+      rekeyableErrors.has(String(res.body.error ?? ""))
     ) {
-      const forceRekey = res.statusCode === 403
+      const forceRekey = res.statusCode !== 401
       const newState = await this.bootstrapOrRekey(forceRekey, signal)
       res = await attemptSignedPost(newState)
     }
@@ -692,6 +728,14 @@ export class Client {
       }
     }
 
+    const snapshot = SessionSlotLease.getResourceSnapshot({
+      conversationId: input.conversation_id,
+      sessionId: input.owner_session_id,
+    })
+    const active_leads = input.active_leads ?? snapshot.active_leads ?? snapshot.activeLeads ?? 0
+    const subagent_commitments_mib =
+      input.subagent_commitments_mib ?? snapshot.subagent_commitments_mib ?? snapshot.subagentCommitmentsMib ?? 0
+
     try {
       const res = await this.sendRawPost("/v1/subproc/register", {
         request_id: input.request_id,
@@ -700,6 +744,15 @@ export class Client {
         ...(input.owner_session_id !== undefined ? { owner_session_id: input.owner_session_id } : {}),
         memory_max_mib: input.memory_max_mib,
         ...(input.cpu_quota_pct !== undefined ? { cpu_quota_pct: input.cpu_quota_pct } : {}),
+        ...(input.control_group !== undefined ? { control_group: input.control_group } : {}),
+        ...(input.shell_id !== undefined ? { shell_id: input.shell_id } : {}),
+        ...(input.pid !== undefined ? { pid: input.pid } : {}),
+        ...(input.starttime_ticks !== undefined ? { starttime_ticks: input.starttime_ticks } : {}),
+        ...(input.re_adopt !== undefined ? { re_adopt: input.re_adopt } : {}),
+        ...(input.active_state !== undefined ? { active_state: input.active_state } : {}),
+        ...(input.u_nonreclaim_mib !== undefined ? { u_nonreclaim_mib: input.u_nonreclaim_mib } : {}),
+        active_leads,
+        subagent_commitments_mib,
       })
 
       const isAdmissionDenied =
